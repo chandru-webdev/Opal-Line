@@ -6,8 +6,14 @@
 // All HTTP via node fetch (correct UTF-8). Never prints secrets.
 import { readFileSync, readdirSync } from 'node:fs'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// Was hardcoded to the original dev machine's ~/Downloads/Opal_project copy.
+// Default to THIS repo's backend/ — override with OPAL_BACKEND_DIR=... if the
+// dev stack genuinely lives elsewhere.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const BACKEND_DIR = process.env.OPAL_BACKEND_DIR ?? join(repoRoot, 'backend')
 
 const BASE = 'http://localhost:47191'
 const results = []
@@ -59,7 +65,7 @@ jar = mergeJar(jar, loginRes.headers.getSetCookie?.() ?? [])
 console.log('logged in')
 
 // ── 1. upload two real local images ───────────────────────────────────
-const uploadDir = join(homedir(), 'Downloads', 'Opal_project', 'backend', 'uploads')
+const uploadDir = join(BACKEND_DIR, 'uploads')
 const pngs = readdirSync(uploadDir).filter((f) => f.endsWith('.png')).slice(0, 2)
 if (pngs.length < 2) { console.error('need 2 test pngs'); process.exit(1) }
 const dataUrls = pngs.map((f) => `data:image/png;base64,${readFileSync(join(uploadDir, f)).toString('base64')}`)
@@ -138,8 +144,8 @@ const del = await api(`/db/products/${localId}`, { method: 'DELETE' }, jar, csrf
 check('Cleanup: local product deleted', del.status === 200 || del.status === 204, `status ${del.status}`)
 if (/^\d+$/.test(shopifyId)) {
   try {
-    const devEnv = readFileSync(join(homedir(), 'Downloads', 'Opal_project', 'backend', '.env'), 'utf8')
-    const devKey = readFileSync(join(homedir(), 'Downloads', 'Opal_project', 'backend', '.encryption-key'), 'utf8')
+    const devEnv = readFileSync(join(BACKEND_DIR, '.env'), 'utf8')
+    const devKey = readFileSync(join(BACKEND_DIR, '.encryption-key'), 'utf8')
     const ivLen = 16, tagLen = 16
     const dec = (v) => {
       const buf = Buffer.from(v.slice(6), 'base64')
