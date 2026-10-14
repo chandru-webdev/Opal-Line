@@ -160,7 +160,7 @@ jobs:
           } elseif ($signer.Subject -eq $signer.Issuer) {
             $banner = @(
               '==========================================================',
-              'SMARTSCREED WILL BLOCK THIS INSTALLER FOR END USERS',
+              'SMARTSCREEN WILL BLOCK THIS INSTALLER FOR END USERS',
               '',
               'The signing certificate is SELF-SIGNED (subject == issuer).',
               'Microsoft treats that exactly like an unsigned app, so every',
