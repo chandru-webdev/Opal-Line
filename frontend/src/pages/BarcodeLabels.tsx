@@ -11,8 +11,12 @@ import { dbApi, backupApi } from '@/lib/api'
 import type { Product } from '@/types'
 
 const LABEL_PRESETS = [
-  { key: 'zlabel-50x30', label: '50×30mm (Standard)', desc: '4 columns × 7 rows' },
-  { key: 'zlabel-40x25', label: '40×25mm (Compact)', desc: '4 columns × 8 rows' },
+  { key: 'label-50x25', label: '50 × 25 mm', desc: '4 columns × 11 rows' },
+  { key: 'label-50x22', label: '50 × 22 mm', desc: '4 columns × 13 rows' },
+  { key: 'label-35x22', label: '35 × 22 mm', desc: '5 columns × 13 rows' },
+  { key: 'label-50x10', label: '50 × 10 mm', desc: '4 columns × 28 rows' },
+  { key: 'zlabel-50x30', label: '50 × 30 mm (Standard)', desc: '4 columns × 7 rows' },
+  { key: 'zlabel-40x25', label: '40 × 25 mm (Compact)', desc: '4 columns × 8 rows' },
   { key: 'avery-5160', label: 'Avery 5160', desc: '3 columns × 10 rows' },
   { key: 'avery-8160', label: 'Avery 8160', desc: '4 columns × 12 rows' },
   { key: 'dymo-30256', label: 'DYMO 30256', desc: '3 columns × 8 rows' },
@@ -59,14 +63,15 @@ export default function BarcodeLabelsPage() {
   const printLabels = () => {
     setGenerating(true)
     try {
-      if (selected.size === 0) {
-        backupApi.downloadAllLabels({ preset, showPrice, showWeight, showQR })
-      } else {
-        const params = new URLSearchParams({ preset, price: String(showPrice), weight: String(showWeight), qr: String(showQR) })
-        // For selected products, open with IDs
-        const url = `/api/v1/db/products/labels?${params.toString()}`
-        window.open(url, '_blank', 'noopener')
-      }
+      backupApi.downloadAllLabels({
+        preset,
+        showPrice,
+        showWeight,
+        showQR,
+        // Pass the selected products so the chosen size applies to exactly the
+        // labels the button promises ("Print N Labels"); no selection = all.
+        ...(selected.size > 0 ? { ids: [...selected] } : {}),
+      })
     } finally {
       setTimeout(() => setGenerating(false), 1000)
     }
