@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ArrowDownToLine, RefreshCw, X } from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, RefreshCw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import type { UpdateStatusInfo } from '@/types'
 
@@ -19,9 +19,21 @@ interface DesktopBridge {
 const desktop: DesktopBridge | undefined = (window as unknown as { electronAPI?: DesktopBridge }).electronAPI
 
 /** Slim full-width banner rendered above <main> in the app shell. */
-function Banner({ children, onDismiss }: { children: React.ReactNode; onDismiss: () => void }) {
+function Banner({
+  children,
+  onDismiss,
+  tone = 'amber',
+}: {
+  children: React.ReactNode
+  onDismiss: () => void
+  tone?: 'amber' | 'danger'
+}) {
+  const skin =
+    tone === 'danger'
+      ? 'bg-red-50 text-red-900 dark:bg-red-950/40 dark:text-red-200'
+      : 'bg-amber-50 text-amber-900 dark:bg-amber-950/40 dark:text-amber-200'
   return (
-    <div className="flex items-center justify-between gap-3 border-b bg-amber-50 px-4 py-2 text-sm text-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+    <div className={`flex items-center justify-between gap-3 border-b px-4 py-2 text-sm ${skin}`}>
       <div className="flex min-w-0 items-center gap-3">{children}</div>
       <button
         type="button"
@@ -60,7 +72,25 @@ export function UpdateBanner() {
     return () => clearInterval(t)
   }, [update?.phase])
 
-  if (!desktop || dismissed || !showBanner || !update) return null
+  if (!desktop || dismissed || !update) return null
+
+  // A failed automatic install must stay visible until the user acts on it.
+  // Deliberately ignores the showBanner preference: that toggle governs
+  // update-availability nagging, not errors, and the failure marker is only
+  // removed from System → App Updates (an informed, explicit action).
+  if (update.lastFailure) {
+    return (
+      <Banner tone="danger" onDismiss={() => setDismissed(true)}>
+        <AlertTriangle className="h-4 w-4 shrink-0" />
+        <span className="truncate">
+          The last update was not installed — {update.lastFailure.reason} Open System → App Updates
+          to retry.
+        </span>
+      </Banner>
+    )
+  }
+
+  if (!showBanner) return null
 
   if (update.phase === 'available') {
     return (
