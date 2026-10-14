@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell, dialog, ipcMain } from 'electron'
 import { join, resolve } from 'node:path'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, openSync, closeSync, readSync, statSync, createWriteStream, rmSync } from 'node:fs'
+import { isNewerVersion, sweepDownloads } from './updatesweep'
 import { execSync } from 'node:child_process'
 import { randomBytes, createHash } from 'node:crypto'
 import { pruneLogIfTooBig } from './logrotate'
@@ -945,15 +946,7 @@ function verifyInstallerSignature(file: string): void {
   execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore', timeout: 60000, windowsHide: true })
 }
 
-function isNewerVersion(current: string, latest: string): boolean {
-  const pa = current.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0)
-  const pb = latest.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0)
-  for (let i = 0; i < 3; i++) {
-    const diff = (pb[i] ?? 0) - (pa[i] ?? 0)
-    if (diff !== 0) return diff > 0
-  }
-  return false
-}
+
 
 /**
  * Fetch the latest-release metadata with limited retry/backoff. Transient
@@ -1224,6 +1217,13 @@ async function main() {
     // Auto-update: first check shortly after launch, then every 6 hours.
     if (app.isPackaged) {
       loadUpdatePrefs()
+      // Remove installers left behind by past update cycles before anything
+      // else touches the temp folder (see electron/updatesweep.ts).
+      try {
+        sweepDownloads(app.getPath('temp'), app.getVersion()).forEach(
+          (name) => logLine('update', `swept stale download ${name}`),
+        )
+      } catch { /* best effort — temp cleanup must never block startup */ }
       // Tell the user straight away if the last automatic install gave up.
       const failure = readUpdateFailure()
       if (failure) {
