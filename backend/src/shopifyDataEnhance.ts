@@ -52,9 +52,18 @@ async function graphqlRequest<T>(query: string, variables?: Record<string, any>)
 
     const json: GraphQLResponse<T> = await res.json()
     if (json.errors?.length) {
+      // Plan-gated Customer PII (Shopify/Advanced/Plus only for unapproved
+      // apps) is not a fault and not a token/scope problem: the token works
+      // for orders, products and the rest of the sync. Latch the flag, warn
+      // ONCE per process, and skip the payload quietly — logging it at ERROR
+      // made every boot look like a broken integration when it is an
+      // expected plan limitation that only the Shopify admin can lift.
       if (json.errors.some((e) => (e as any)?.extensions?.code === 'ACCESS_DENIED' && /Customer object|personally identifiable/i.test(e.message))) {
-        piiAccessDenied = true
-        logger.warn('Shopify PII access denied (plan-gated) — enrichment paused until access is approved in the Shopify admin')
+        if (!piiAccessDenied) {
+          piiAccessDenied = true
+          logger.warn('Shopify PII access denied (plan-gated) — customer/order enrichment paused until access is approved in the Shopify admin. Orders and products sync normally.')
+        }
+        return null
       }
       logger.error({ errors: json.errors }, 'Shopify GraphQL errors')
       return null
