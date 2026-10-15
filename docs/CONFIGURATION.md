@@ -50,7 +50,7 @@ DATABASE_URL=postgresql://user:pass@ep-cool-name.eu-central-1.aws.neon.tech/neon
 |---|---|---|
 | `ENCRYPTION_KEY` | 64-char hex | AES-256-GCM key encrypting secrets stored in DB (Shopify token, SMTP, WhatsApp). **Leave empty on first run** — auto-generated to `.encryption-key`. Set the same value on every server sharing one database. |
 | `CSRF_SECRET` | random hex | HMAC key for CSRF tokens. Auto-generated to `.csrf-secret` when empty. |
-| `SEED_ADMIN_PASSWORD` | `Opal@2026` | Password for the seeded admin (seed run only). |
+| `SEED_ADMIN_PASSWORD` | `Opal@2026` | Password for the superadmin created on a fresh install (bootstrap), by `npm run db:seed`, and by `npm run auth:reset`. Default `Opal@2026`; fresh installs still force a password change at first sign-in. |
 | `TRUST_PROXY` | `1` / `loopback` / `"10.0.0.1,10.0.0.2"` | Trust Express `X-Forwarded-*` headers (needed behind nginx/Cloudflare for correct rate-limit keys and `req.ip`). **Never enable when directly exposed** — it lets clients spoof IPs. |
 
 ```env
@@ -419,6 +419,16 @@ approval and rejection is written to the activity log with the actor's name.
   DELETE FROM rate_limit_hits;
   DELETE FROM login_attempts;
   ```
+- **Cannot log in with the documented `admin` / `Opal@2026`?** The known
+  credential is only seeded on a *fresh* (empty) database — a database
+  created earlier keeps its original admin password. Reset it without
+  touching any data (also clears that account's lockout counters):
+  ```bash
+  npm run auth:reset                    # admin / Opal@2026
+  SEED_ADMIN_PASSWORD=Other#1 npm run auth:reset
+  npm run auth:reset -- someusername    # a different account
+  ```
+  Do **not** use `npm run db:seed` for this — it truncates every table.
 - E2E tests abort with a clear 429 message when the login budget is exhausted.
 
 ## 14. Quick-reference: full example `backend/.env`
