@@ -237,7 +237,10 @@ const emailSendLimiter = rateLimit({
   message: { error: 'Too many email requests, please try again later' },
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => `${req.userId ?? req.ip ?? 'unknown'}`,
+  // The IP fallback must go through ipKeyGenerator (IPv6 users would otherwise
+  // get a /128 key that rotates per address and bypasses the limit —
+  // express-rate-limit ERR_ERL_KEY_GEN_IPV6 fired on every boot).
+  keyGenerator: (req) => (req.userId != null ? String(req.userId) : ipKeyGenerator(req.ip ?? 'unknown')),
 })
 app.use('/api/v1/backup/email', emailSendLimiter)
 app.use('/api/v1/backup/email-separate', emailSendLimiter)
