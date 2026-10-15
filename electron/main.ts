@@ -387,6 +387,16 @@ function preflightPorts(): boolean {
     }
 
     const name = processNameForPid(pid)
+    // PostgreSQL already listening on the bundled-database port is NOT a
+    // conflict: it can be our own leftover cluster, or the dev stack
+    // (scripts/dev.mjs via npm run dev / electron:dev) deliberately sharing
+    // this data directory — and ensurePostgres() reuses a running server
+    // rather than starting a second one. Only a non-PostgreSQL program on
+    // 47193 is a real collision worth blocking startup for.
+    if (port === PG_PORT && /^postgres(?:\.exe)?$/i.test(name.trim())) {
+      logLine('startup', `port ${port} already served by ${name} (pid ${pid}) — reusing`)
+      continue
+    }
     if (/opal line billing/i.test(name)) {
       logLine('startup', `port ${port} held by another Opal Line instance (pid ${pid})`)
       dialog.showMessageBox({

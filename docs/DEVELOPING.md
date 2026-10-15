@@ -10,18 +10,22 @@ npm ci
 npm run dev          # backend + frontend together
 ```
 
-Requires Node 26. The desktop app bundles its own PostgreSQL, so nothing
-external is needed for day-to-day work.
+Requires Node 26. On its first run `npm run dev` provisions the local
+PostgreSQL (same cluster the desktop app uses, port 47193) and writes
+`backend/.env`, so nothing external is needed for day-to-day work. The desktop
+app bundles its own PostgreSQL too.
 
 Useful scripts:
 
 | Command | What it does |
 |---|---|
-| `npm run dev` | backend + frontend with hot reload |
-| `npm test` | 192 backend unit tests |
+| `npm run dev` | backend + frontend with hot reload (first run provisions PostgreSQL + `backend/.env`) |
+| `npm test` | backend unit tests (237 passing as of v1.0.21) |
 | `npm run typecheck` | backend `tsc --noEmit` |
 | `npm run lint` | frontend oxlint |
 | `npm run build` | frontend production build |
+| `npm run electron:dev` | desktop window (Electron) on top of the dev stack — backend + Vite + app in one command |
+| `npm run electron:build` | NSIS installer → `dist-electron/` (what end users install) |
 | `npm run scan:secrets` | **run this before every push** |
 | `npm run test:e2e` | Playwright against a running app |
 
