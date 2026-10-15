@@ -39,7 +39,16 @@ interface DataTableProps<TData extends RowData> {
   onSelectionChange?: (selectedRows: TData[]) => void
 }
 
-export function DataTable<TData extends RowData>({
+/**
+ * Memoized on purpose: pages re-render for many small reasons (dialog state,
+ * pollers, toasts). Without the memo the whole table — headers plus every
+ * rendered cell — is rebuilt on each of those renders, which measured as a
+ * ~370 ms main-thread stall when opening a dialog on data-heavy pages (the
+ * "dialog opens with a lag" report). Rendering is now skipped unless the
+ * props actually changed, so pages should pass stable callbacks
+ * (useCallback / setState) for the memo to hold.
+ */
+function DataTableInner<TData extends RowData>({
   columns,
   data,
   loading,
@@ -223,3 +232,8 @@ export function DataTable<TData extends RowData>({
     </div>
   )
 }
+
+// React.memo erases the component's generic parameter (it would be inferred
+// as RowData, breaking pages that pass typed ColumnDef arrays), so the memo
+// result is re-cast to the original generic signature.
+export const DataTable = React.memo(DataTableInner) as typeof DataTableInner
