@@ -95,12 +95,15 @@ export default function ProductsPage() {
       return {}
     }
   })
-  const handleColVis = (v: Record<string, boolean>) => {
+  const handleColVis = useCallback((v: Record<string, boolean>) => {
     setColVis(v)
     try {
       localStorage.setItem('product-cols', JSON.stringify(v))
     } catch { /* ignore */ }
-  }
+  }, [])
+  // Stable callbacks for the memoized DataTable — inline arrows here would
+  // defeat the memo and bring the dialog-open lag back.
+  const openProduct = useCallback((p: Product) => navigate(`/inventory/products/${p.id}`), [navigate])
   const [category, setCategory] = useState('')
   const [purity, setPurity] = useState('')
   const [stockStatus, setStockStatus] = useState('')
@@ -645,8 +648,8 @@ export default function ProductsPage() {
           </div>
 
           <DataTable
-            onRowDoubleClick={(p) => navigate(`/inventory/products/${p.id}`)}
-            onRowClick={(p) => setViewProduct(p)}
+            onRowDoubleClick={openProduct}
+            onRowClick={setViewProduct}
             onSelectionChange={setSelectedProducts}
             columns={columns}
             data={filtered}
