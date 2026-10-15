@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { envFileValue, upsertEnvValue, parseDbUrl, appDataDir } from './dev.mjs'
 
@@ -53,8 +53,17 @@ test('upsertEnvValue adds and replaces without disturbing the rest of the file',
   }
 })
 
-test('appDataDir matches the desktop app data folder for this platform', () => {
-  const dir = appDataDir()
-  assert.ok(dir.endsWith('Opal Line Billing'), `got ${dir}`)
-  assert.ok(existsSync(dir), `${dir} should exist after provisioning`)
+test('appDataDir resolves to the desktop app data folder for this platform', () => {
+  // Pin the path contract — the same location Electron's
+  // app.getPath('appData') + "Opal Line Billing" resolves to. Deliberately no
+  // existsSync(): on a CI runner nothing has provisioned that folder yet, and
+  // "a directory exists" is a side effect of running dev.mjs, not of this
+  // function.
+  const expected =
+    process.platform === 'win32'
+      ? join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Opal Line Billing')
+      : process.platform === 'darwin'
+        ? join(homedir(), 'Library', 'Application Support', 'Opal Line Billing')
+        : join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'Opal Line Billing')
+  assert.equal(appDataDir(), expected)
 })
