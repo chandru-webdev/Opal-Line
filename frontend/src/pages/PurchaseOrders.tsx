@@ -22,6 +22,7 @@ import {
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
 import type { Product, PurchaseOrder, PurchaseOrderReceipt, Supplier } from '@/types'
+import { SupplierPicker } from '@/components/ui/supplier-picker'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
 
 /** One editable line on the new-PO form. */
@@ -65,7 +66,7 @@ export default function PurchaseOrdersPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ supplier: '' })
+  const [form, setForm] = useState({ supplier: '', supplierId: '' })
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
   const [viewPo, setViewPo] = useState<PurchaseOrder | null>(null)
   const [receipt, setReceipt] = useState<PurchaseOrderReceipt | null>(null)
@@ -103,7 +104,7 @@ export default function PurchaseOrdersPage() {
   }, [])
 
   const openDialog = () => {
-    setForm({ supplier: '' })
+    setForm({ supplier: '', supplierId: '' })
     setLines([emptyLine()])
     setError('')
     setDialogOpen(true)
@@ -152,9 +153,10 @@ export default function PurchaseOrdersPage() {
     setError('')
     try {
       const count = orders.length + 1
-      const created = await dbApi.create<PurchaseOrder>('purchase-orders', {
+      const created =       await dbApi.create<PurchaseOrder>('purchase-orders', {
         number: `PO-${new Date().getFullYear()}-${String(count + 17).padStart(4, '0')}`,
-        supplier: form.supplier,
+        supplier: form.supplier || (suppliers.find((s) => s.id === form.supplierId)?.name ?? ''),
+        supplierId: form.supplierId || null,
         items: lineTotals.count,
         qty: lineTotals.qty,
         weight: lineTotals.weight,
@@ -480,13 +482,17 @@ export default function PurchaseOrdersPage() {
           </DialogHeader>
           <div className="grid gap-4">
             <Field label="Supplier">
-              <Select
-                options={[
-                  { value: '', label: 'Select supplier...' },
-                  ...suppliers.map((s) => ({ value: s.name, label: s.name })),
-                ]}
-                value={form.supplier}
-                onValueChange={(v) => setForm((f) => ({ ...f, supplier: v }))}
+              <SupplierPicker
+                suppliers={suppliers}
+                value={form.supplierId}
+                onValueChange={(id) => {
+                  const s = suppliers.find((x) => x.id === id)
+                  setForm((f) => ({ ...f, supplierId: id, supplier: s?.name ?? '' }))
+                }}
+                onCreateSupplier={(s) => setSuppliers((prev) => [s, ...prev])}
+                placeholder="Select supplier…"
+                searchPlaceholder="Search suppliers by name, contact, phone or city"
+                emptyText="No supplier found"
                 className="w-full"
               />
             </Field>

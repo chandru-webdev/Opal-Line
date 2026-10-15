@@ -14,9 +14,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
-import type { Product } from '@/types'
+import type { Product, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
 import { todayIST } from '@/lib/format'
+import { SupplierPicker } from '@/components/ui/supplier-picker'
 
 const API_ORIGIN = (import.meta.env.VITE_API_BASE ?? '').replace(/\/api\/v1$/, '') || ''
 
@@ -144,7 +145,7 @@ function computePrice(form: ProductForm): number {
   return Math.round((rate + making) * net * (1 + gst / 100) * 100) / 100
 }
 
-function buildBody(form: ProductForm, silverRate: number, sellingPrice: number) {
+function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, supplierIdVal?: string) {
   return {
     name: form.name.trim(),
     description: form.description.trim() || null,
@@ -155,6 +156,7 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number) 
     collection: form.collection.trim() || null,
     purity: parseFloat(form.purity) || null,
     supplier: form.supplier.trim() || null,
+    supplierId: supplierIdVal || null,
     grossWeight: parseFloat(form.grossWeight) || null,
     stoneWeight: parseFloat(form.stoneWeight) || null,
     netWeight: parseFloat(form.netWeight) || null,
@@ -198,6 +200,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [uploading, setUploading] = useState(false)
+  const [suppliers, setSuppliers] = useState<Supplier[]>([])
+  const [supplierId, setSupplierId] = useState<string>('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
@@ -210,8 +214,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setForm(initial)
+      setSupplierId(product?.supplierId ?? '')
       setError('')
     })
+    dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
@@ -309,7 +315,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
     setSaving(true)
     setError('')
     try {
-      const body = buildBody(form, silverRate, sellingPrice)
+      const body = buildBody(form, silverRate, sellingPrice, supplierId)
       let saved: Product
       if (mode === 'edit' && product) {
         // Stock is owned by the ledger now. Sending it would be rejected, and
@@ -419,9 +425,18 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
               <Field label="Purity %">
                 <Input type="number" step="0.1" value={form.purity} onChange={(e) => set('purity', e.target.value)} />
               </Field>
-              <Field label="Supplier">
-                <Input value={form.supplier} onChange={(e) => set('supplier', e.target.value)} placeholder="e.g. Goyal Silver House" />
-              </Field>
+                <Field label="Supplier">
+                  <SupplierPicker
+                    suppliers={suppliers}
+                    value={supplierId}
+                    onValueChange={setSupplierId}
+                    onCreateSupplier={(s) => setSuppliers((prev) => [s, ...prev])}
+                    placeholder="Select supplier…"
+                    searchPlaceholder="Search suppliers by name, contact, phone or city"
+                    emptyText="No supplier found"
+                    className="w-full"
+                  />
+                </Field>
             </div>
           </div>
 

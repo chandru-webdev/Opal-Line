@@ -1,6 +1,48 @@
 import { z } from 'zod'
 import type { Request, Response, NextFunction } from 'express'
 
+// GSTIN: 2-digit state code, 10-char PAN (5 letters, 4 digits, 1 letter),
+// entity code, the literal 'Z', then a checksum character.
+const GSTIN_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+/** Trims and upper-cases a GSTIN. Empty stays empty. */
+export function normalizeGstin(value: unknown): string {
+  return String(value ?? '').trim().toUpperCase()
+}
+
+/** True when the value is empty (allowed) or a well-formed 15-character GSTIN. */
+export function isValidGstin(value: unknown): boolean {
+  const v = normalizeGstin(value)
+  return v === '' || GSTIN_REGEX.test(v)
+}
+
+/** Trims an email address. Empty stays empty. */
+export function normalizeEmail(value: unknown): string {
+  return String(value ?? '').trim()
+}
+
+/** True when the value is empty (allowed) or a plausible email address. */
+export function isValidEmail(value: unknown): boolean {
+  const v = normalizeEmail(value)
+  return v === '' || (v.length <= 255 && EMAIL_REGEX.test(v))
+}
+
+/**
+ * Validation shared by the supplier create/update routes. Name is the only
+ * required field; email and GSTIN are optional but must be well-formed when
+ * present. Returns an error message, or null when the payload is acceptable.
+ */
+export function validateSupplierInput(
+  input: { name?: unknown; email?: unknown; gstin?: unknown },
+  opts: { requireName?: boolean } = {},
+): string | null {
+  if (opts.requireName !== false && !String(input.name ?? '').trim()) return 'Supplier name is required'
+  if (!isValidEmail(input.email)) return 'Enter a valid email address'
+  if (!isValidGstin(input.gstin)) return 'Enter a valid 15-character GSTIN'
+  return null
+}
+
 const strongPassword = z
   .string()
   .min(8, 'Password must be at least 8 characters')

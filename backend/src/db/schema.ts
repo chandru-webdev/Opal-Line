@@ -49,7 +49,10 @@ export const products = pgTable('products', {
   makingCharge: numericNumber('making_charge'),
   gst: numericNumber('gst'),
   hsn: text('hsn'),
+  /** Free-text supplier name kept for legacy rows and display. */
   supplier: text('supplier'),
+  /** FK to suppliers.id when the product was linked to a supplier record. */
+  supplierId: text('supplier_id'),
   silverRate: numericNumber('silver_rate'),
   sellingPrice: numericNumber('selling_price'),
   compareAtPrice: numericNumber('compare_at_price'),
@@ -80,6 +83,7 @@ export const products = pgTable('products', {
   categoryIdx: index('products_category_idx').on(table.category),
   statusIdx: index('products_status_idx').on(table.status),
   shopifyStatusIdx: index('products_shopify_status_idx').on(table.shopifyStatus),
+  supplierIdIdx: index('products_supplier_id_idx').on(table.supplierId),
   nameSearchIdx: index('products_name_search_idx').using('gin', sql`to_tsvector('english', ${table.name})`),
 }))
 
@@ -108,7 +112,13 @@ export const suppliers = pgTable('suppliers', {
   name: text('name').notNull(),
   contact: text('contact'),
   phone: text('phone'),
+  /** Second contact number, kept alongside the primary in case the main line is busy. */
+  alternatePhone: text('alternate_phone'),
+  email: text('email'),
+  /** 15-character GSTIN, stored upper-cased. Unique when present. */
+  gstin: text('gstin'),
   city: text('city'),
+  address: text('address'),
   status: text('status'),
   outstanding: numericNumber('outstanding'),
 }, (table) => ({
@@ -215,6 +225,8 @@ export const purchaseOrders = pgTable('purchase_orders', {
   id: text('id').primaryKey(),
   number: text('number').notNull().unique(),
   supplier: text('supplier'),
+  /** FK to suppliers.id when the order was raised from the supplier picker. */
+  supplierId: text('supplier_id'),
   items: integer('items'),
   qty: integer('qty'),
   weight: numericNumber('weight'),

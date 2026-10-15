@@ -262,6 +262,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         gst numeric,
         hsn text,
         supplier text,
+        supplier_id text,
         silver_rate numeric,
         selling_price numeric,
         compare_at_price numeric,
@@ -287,6 +288,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_category_idx ON products (category)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_status_idx ON products (status)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_shopify_status_idx ON products (shopify_status)`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_supplier_id_idx ON products (supplier_id)`)
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_name_search_idx ON products USING gin (to_tsvector('english', name))`)
 
     await tx.unsafe(`
@@ -315,11 +317,18 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         name text NOT NULL,
         contact text,
         phone text,
+        alternate_phone text,
+        email text,
+        gstin text,
         city text,
+        address text,
         status text,
         outstanding numeric
       )`)
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS suppliers_name_idx ON suppliers (name)`)
+    // A GSTIN identifies one taxpayer, so it may not be reused across suppliers.
+    // Partial so the many legacy rows that carry no GSTIN stay valid.
+    await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS suppliers_gstin_idx ON suppliers (lower(gstin)) WHERE gstin IS NOT NULL AND gstin <> ''`)
 
     await tx.unsafe(`
       CREATE TABLE IF NOT EXISTS inventory_locations (
@@ -490,6 +499,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         id text PRIMARY KEY,
         number text NOT NULL,
         supplier text,
+        supplier_id text,
         items integer,
         qty integer,
         weight numeric,
@@ -1116,6 +1126,9 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
       await applyUpgrades(sql)
       const drizzleDb = drizzle(sql, { schema })
       const seeded = await seedDefaults(drizzleDb)
+      await import('../supplierLinking')
+        .then((m) => m.linkProductsToSuppliersSafe(sql))
+        .catch(() => undefined)
       return { ran: true, tablesCreated: true, adminPassword: seeded.adminPassword }
     }
 
@@ -1543,11 +1556,76 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       )`,
       `CREATE INDEX IF NOT EXISTS supplier_payment_allocations_payment_id_idx ON supplier_payment_allocations (payment_id)`,
       `CREATE INDEX IF NOT EXISTS supplier_payment_allocations_invoice_id_idx ON supplier_payment_allocations (invoice_id)`,
+      // Supplier contact/GST details. These tables predate the columns, so an
+      // existing install only gets them from here (createSchema is fresh-only).
+      `ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS alternate_phone text`,
+      `ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS email text`,
+      `ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS gstin text`,
+      `ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS address text`,
+      // Linking products / purchase orders to a real supplier record.
+      `ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_id text`,
+      `CREATE INDEX IF NOT EXISTS products_supplier_id_idx ON products (supplier_id)`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS supplier_id text`,
     ]
     for (const stmt of upgrades) {
       await sql.unsafe(stmt).catch(() => undefined)
     }
+    await ensureSupplierUniqueIndexes(sql)
     await sql.unsafe(`ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS customer_shopify_id text`).catch(() => undefined)
     await sql.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_customer_shopify_id_idx ON sales_orders (customer_shopify_id)`).catch(() => undefined)
     await sql.unsafe(`CREATE INDEX IF NOT EXISTS sales_orders_customer_email_idx ON sales_orders (customer_email)`).catch(() => undefined)
+}
+
+/**
+ * Create the unique supplier indexes (name, GSTIN) without ever failing the
+ * boot. Legacy installs may already hold duplicate supplier names or GSTINs
+ * from the days when both were free text: a unique index would then error and,
+ * if unchecked, could stop the server from starting. Instead we detect the
+ * duplicates first, log exactly which values collide, and skip only the index
+ * that cannot be built. Nothing is deleted, merged or rewritten — the operator
+ * resolves the duplicates and the index is created on a later boot.
+ */
+async function ensureSupplierUniqueIndexes(sql: postgres.Sql): Promise<void> {
+  // suppliers_name_idx is a case-sensitive unique index on name, so look for
+  // exact duplicates — the same comparison the index itself enforces.
+  const duplicateNames = await sql<{ name: string; count: number }[]>`
+    SELECT name, count(*)::int AS count
+      FROM suppliers
+     WHERE name IS NOT NULL AND btrim(name) <> ''
+     GROUP BY name
+    HAVING count(*) > 1`
+    .catch(() => [] as { name: string; count: number }[])
+
+  if (duplicateNames.length > 0) {
+    logger.warn(
+      { duplicates: duplicateNames.map((d) => `${d.name} (x${d.count})`) },
+      'Bootstrap: duplicate supplier names found — skipping suppliers_name_idx',
+    )
+  } else {
+    await sql
+      .unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS suppliers_name_idx ON suppliers (name)`)
+      .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: could not create suppliers_name_idx'))
+  }
+
+  const duplicateGstins = await sql<{ gstin: string; count: number }[]>`
+    SELECT lower(gstin) AS gstin, count(*)::int AS count
+      FROM suppliers
+     WHERE gstin IS NOT NULL AND btrim(gstin) <> ''
+     GROUP BY lower(gstin)
+    HAVING count(*) > 1`
+    .catch(() => [] as { gstin: string; count: number }[])
+
+  if (duplicateGstins.length > 0) {
+    logger.warn(
+      { duplicates: duplicateGstins.map((d) => `${d.gstin} (x${d.count})`) },
+      'Bootstrap: duplicate supplier GSTINs found — skipping suppliers_gstin_idx',
+    )
+    return
+  }
+
+  await sql
+    .unsafe(
+      `CREATE UNIQUE INDEX IF NOT EXISTS suppliers_gstin_idx ON suppliers (lower(gstin)) WHERE gstin IS NOT NULL AND btrim(gstin) <> ''`,
+    )
+    .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: could not create suppliers_gstin_idx'))
 }
