@@ -2,12 +2,12 @@ import { toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Building2, CheckCircle2, History, Loader2, MapPin, Phone, Plus, Search, ShoppingCart, User, UserRoundPen, Wallet, XCircle } from 'lucide-react'
+import { Building2, CheckCircle2, History, MapPin, Phone, Plus, Search, ShoppingCart, User, UserRoundPen, Wallet, XCircle } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
+
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -25,6 +25,7 @@ import { exportTable } from '@/lib/export'
 import type { Supplier } from '@/types'
 import { formatCurrency } from '@/lib/format'
 import { initials } from '@/lib/utils'
+import { SupplierDialog, type SupplierFormPayload } from '@/components/supplier-dialog'
 
 export default function SuppliersPage() {
   const navigate = useNavigate()
@@ -35,7 +36,7 @@ export default function SuppliersPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ name: '', contact: '', phone: '', city: '' })
+  const [editing, setEditing] = useState<Supplier | null>(null)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -60,31 +61,36 @@ export default function SuppliersPage() {
   const totalOutstanding = suppliers.reduce((a, s) => a + s.outstanding, 0)
 
   const openDialog = () => {
-    setForm({ name: '', contact: '', phone: '', city: '' })
+    setEditing(null)
     setError('')
     setDialogOpen(true)
   }
 
-  const submit = async () => {
-    if (!form.name.trim()) {
-      setError('Supplier name is required')
-      return
-    }
+  const submit = async (payload: SupplierFormPayload) => {
     setSaving(true)
     setError('')
     try {
-      await dbApi.create('suppliers', {
-        name: form.name.trim(),
-        contact: form.contact.trim(),
-        phone: form.phone.trim(),
-        city: form.city.trim() || 'Mumbai',
-        status: 'active',
-        outstanding: 0,
-      })
+      const body = {
+        name: payload.name.trim(),
+        contact: payload.contact.trim() || null,
+        phone: payload.phone.trim() || null,
+        alternatePhone: payload.alternatePhone.trim() || null,
+        email: payload.email.trim() || null,
+        gstin: payload.gstin.trim().toUpperCase() || null,
+        city: payload.city.trim() || null,
+        address: payload.address.trim() || null,
+        status: payload.status,
+      }
+      if (editing) {
+        await dbApi.update('suppliers', editing.id, body)
+      } else {
+        await dbApi.create('suppliers', { ...body, outstanding: 0, status: body.status || 'active' })
+      }
       setDialogOpen(false)
+      setEditing(null)
       load()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to add supplier')
+      setError(e instanceof Error ? e.message : editing ? 'Failed to update supplier' : 'Failed to add supplier')
     } finally {
       setSaving(false)
     }
@@ -168,9 +174,17 @@ export default function SuppliersPage() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" onClick={() => setViewSupplier(row.original)}>
-                    <UserRoundPen className="h-3.5 w-3.5" />
-                  </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      onClick={() => {
+                        setEditing(row.original)
+                        setError('')
+                        setDialogOpen(true)
+                      }}
+                    >
+                      <UserRoundPen className="h-3.5 w-3.5" />
+                    </Button>
                 </TooltipTrigger>
                 <TooltipContent>View supplier</TooltipContent>
               </Tooltip>
@@ -294,66 +308,26 @@ export default function SuppliersPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add Supplier</DialogTitle>
-            <DialogDescription>Register a new silver supplier.</DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <Field label="Supplier Name">
-              <Input
-                placeholder="e.g. Goyal Silver House"
-                value={form.name}
-                onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              />
-            </Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Contact Person">
-                <Input
-                  placeholder="e.g. Ramesh Goyal"
-                  value={form.contact}
-                  onChange={(e) => setForm((f) => ({ ...f, contact: e.target.value }))}
-                />
-              </Field>
-              <Field label="Phone">
-                <Input
-                  placeholder="+91 ..."
-                  value={form.phone}
-                  onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
-                />
-              </Field>
-            </div>
-            <Field label="City">
-              <Input
-                placeholder="e.g. Mumbai"
-                value={form.city}
-                onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))}
-              />
-            </Field>
-            {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add Supplier
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <SupplierDialog
+        open={dialogOpen}
+        onOpenChange={(o) => {
+          setDialogOpen(o)
+          if (!o) {
+            setEditing(null)
+            setError('')
+          }
+        }}
+        mode={editing ? 'edit' : 'add'}
+        supplier={editing}
+        onSubmit={submit}
+        saving={saving}
+        error={error}
+      />
     </div>
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-1.5">
-      <Label className="text-xs text-muted-foreground">{label}</Label>
-      {children}
-    </div>
-  )
-}
+
 
 function MiniCard({ icon: Icon, label, value, sub, tint }: { icon: React.ComponentType<{ className?: string }>; label: string; value: string; sub?: string; tint: string }) {
   return (

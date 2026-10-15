@@ -5,7 +5,13 @@ import { desc, eq, ilike, inArray, or, sql, and, gte, lte } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import { applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, requirePermission } from '../rbac'
-import { validate, recoveryPasswordSchema } from '../validation'
+import {
+  validate,
+  recoveryPasswordSchema,
+  normalizeGstin,
+  normalizeEmail,
+  validateSupplierInput,
+} from '../validation'
 import { clearRecoveryPassword, getRecoveryPasswordSource, isRecoveryRole, RECOVERY_PASSWORD_HASH_KEY, RECOVERY_PASSWORD_KEY, setRecoveryPassword } from '../recoveryPassword'
 import { actorFromRequest,  recordActivity } from '../activity'
 import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
@@ -104,6 +110,57 @@ async function prepareUserBody(body: Record<string, unknown>, isUpdate = false):
   }
   if (isUpdate && password == null) delete cleaned.passwordHash
   delete cleaned.password
+  return cleaned
+}
+
+/**
+ * Validation and normalisation shared by the supplier create/update routes.
+ *
+ * Name is required (on create, and on update when it is being changed); email
+ * and GSTIN are optional but must be well-formed, and a GSTIN or name may not
+ * be reused by another supplier. Throws with a user-facing message, which the
+ * generic handlers surface for the supplier resource.
+ */
+async function prepareSupplierBody(
+  body: Record<string, unknown>,
+  opts: { isUpdate?: boolean; id?: string } = {},
+): Promise<Record<string, unknown>> {
+  const cleaned = sanitize(body, schema.suppliers)
+  const text = (value: unknown): string | null => {
+    const s = String(value ?? '').trim()
+    return s === '' ? null : s
+  }
+  for (const key of ['name', 'contact', 'phone', 'alternatePhone', 'city', 'address'] as const) {
+    if (key in cleaned) cleaned[key] = text(cleaned[key])
+  }
+  if ('email' in cleaned) cleaned.email = normalizeEmail(cleaned.email) || null
+  if ('gstin' in cleaned) cleaned.gstin = normalizeGstin(cleaned.gstin) || null
+
+  const nameProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'name')
+  const invalid = validateSupplierInput(
+    { name: cleaned.name, email: cleaned.email, gstin: cleaned.gstin },
+    { requireName: !opts.isUpdate || nameProvided },
+  )
+  if (invalid) throw new Error(invalid)
+
+  if (db) {
+    if (cleaned.name) {
+      const [clash] = await db
+        .select({ id: schema.suppliers.id })
+        .from(schema.suppliers)
+        .where(eq(schema.suppliers.name, String(cleaned.name)))
+        .limit(1)
+      if (clash && clash.id !== opts.id) throw new Error('A supplier with that name already exists')
+    }
+    if (cleaned.gstin) {
+      const [clash] = await db
+        .select({ id: schema.suppliers.id })
+        .from(schema.suppliers)
+        .where(eq(schema.suppliers.gstin, String(cleaned.gstin)))
+        .limit(1)
+      if (clash && clash.id !== opts.id) throw new Error('A supplier with that GSTIN already exists')
+    }
+  }
   return cleaned
 }
 
@@ -388,6 +445,34 @@ dbRouter.get('/customers', listOf(s.customers, s.customers.name))
 dbRouter.get('/customers/:id', oneOf(s.customers, s.customers.id))
 
 dbRouter.get('/suppliers', listOf(s.suppliers, s.suppliers.name))
+dbRouter.get('/suppliers/unmatched-products', requirePermission('purchase', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { unmatchedSupplierNames } = await import('../supplierLinking')
+    const { getRawClient } = await import('../db/client')
+    const client = getRawClient()
+    if (!client) return res.status(503).json({ error: 'Database not configured' })
+    const names = await unmatchedSupplierNames(client)
+    res.json({ data: names })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Failed to fetch unmatched supplier names'
+    res.status(500).json({ error: msg })
+  }
+})
+dbRouter.post('/products/link-suppliers', requirePermission('purchase', 'edit'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { linkProductsToSuppliers } = await import('../supplierLinking')
+    const { getRawClient } = await import('../db/client')
+    const client = getRawClient()
+    if (!client) return res.status(503).json({ error: 'Database not configured' })
+    const result = await linkProductsToSuppliers(client)
+    res.json(result)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Failed to link suppliers'
+    res.status(500).json({ error: msg })
+  }
+})
 dbRouter.get('/suppliers/:id', oneOf(s.suppliers, s.suppliers.id))
 
 dbRouter.get('/invoices', listOf(s.salesInvoices, s.salesInvoices.date))
@@ -3266,7 +3351,12 @@ for (const [name, table] of Object.entries(resources)) {
     try {
       const isUser = name === 'users'
       const isBankAccount = name === 'bank-accounts'
-      let body = isUser ? await prepareUserBody(req.body ?? {}) : sanitize(req.body ?? {}, table)
+      const isSupplier = name === 'suppliers'
+      let body = isSupplier
+        ? await prepareSupplierBody(req.body ?? {})
+        : isUser
+          ? await prepareUserBody(req.body ?? {})
+          : sanitize(req.body ?? {}, table)
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber
@@ -3278,7 +3368,7 @@ for (const [name, table] of Object.entries(resources)) {
       res.status(201).json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
-      if (msg.includes('password') || msg.includes('Password')) {
+      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
         res.status(400).json({ error: msg })
       } else {
         res.status(400).json({ error: 'Failed to create resource' })
@@ -3294,7 +3384,12 @@ for (const [name, table] of Object.entries(resources)) {
         return res.status(403).json({ error: 'Cannot modify your own account' })
       }
       const isBankAccount = name === 'bank-accounts'
-      let body = isUser ? await prepareUserBody(req.body ?? {}, true) : sanitize(req.body ?? {}, table)
+      const isSupplier = name === 'suppliers'
+      let body = isSupplier
+        ? await prepareSupplierBody(req.body ?? {}, { isUpdate: true, id: routeParam(req.params.id) })
+        : isUser
+          ? await prepareUserBody(req.body ?? {}, true)
+          : sanitize(req.body ?? {}, table)
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber
@@ -3307,7 +3402,7 @@ for (const [name, table] of Object.entries(resources)) {
       res.json(stripHash(row))
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
-      if (msg.includes('password') || msg.includes('Password')) {
+      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
         res.status(400).json({ error: msg })
       } else {
         res.status(400).json({ error: 'Failed to update resource' })

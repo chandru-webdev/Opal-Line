@@ -371,6 +371,8 @@ export interface Product {
   gst: number
   hsn: string
   supplier: string
+  /** Id of the linked supplier record, when the product was linked to one. */
+  supplierId?: string | null
   silverRate: number
   sellingPrice: number
   /** Weighted-average unit cost, maintained from purchase invoices. */
@@ -572,7 +574,12 @@ export interface Supplier {
   name: string
   contact: string
   phone: string
+  alternatePhone?: string | null
+  email?: string | null
+  /** 15-character GSTIN, upper-cased. Null when the supplier is unregistered. */
+  gstin?: string | null
   city: string
+  address?: string | null
   status: 'active' | 'inactive'
   outstanding: number
 }
@@ -739,6 +746,7 @@ export interface PurchaseOrder {
   id: string
   number: string
   supplier: string
+  supplierId?: string | null
   items: number
   qty: number
   weight: number
