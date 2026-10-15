@@ -28,6 +28,7 @@
     "db:push": "npm run db:push -w backend",
     "db:generate": "npm run db:generate -w backend",
     "db:seed": "npm run db:seed -w backend",
+    "auth:reset": "npm run auth:reset -w backend",
     "start:server": "npm run start -w backend",
     "electron:dev": "node scripts/dev.mjs && npm run electron:compile && concurrently -k -n server,web,app -c yellow,cyan,magenta \"npm run dev -w backend\" \"npm run dev -w frontend\" \"node scripts/wait-http.mjs http://127.0.0.1:47191/api/v1/health http://127.0.0.1:47195 && electron .\"",
     "electron:compile": "cd electron && npx tsc",
