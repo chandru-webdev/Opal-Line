@@ -1266,13 +1266,13 @@ async function main() {
           const creds = JSON.parse(readFileSync(credFile, 'utf8')) as { username?: string; password?: string }
           if (creds.password) {
             const username = creds.username ?? 'admin'
-            detail = `Username: ${username}\nPassword: ${creds.password}\n\nStore this now — it is shown only once.`
+            detail = `Username: ${username}\nPassword: ${creds.password}\n\nThis is the built-in superadmin account. On the first sign-in the app asks you to set a new password — that is expected. Save these somewhere safe.`
             // Persist a plain-text copy the user can open and copy from at any
             // time. Written BEFORE the dialog: headless sessions may never show
             // the dialog, so this file — not the dialog — is the durable copy.
             try {
               credTxtPath = join(APP_DATA, 'Opal-First-Run-Credentials.txt')
-              writeFileSync(credTxtPath, `Opal Line Billing - first-run credentials\r\n==============================================\r\n\r\nUsername:  ${username}\r\nPassword:  ${creds.password}\r\n\r\nThis file is written once, on first install. Move it somewhere safe\r\n(or delete it) after saving the password in a password manager.\r\n`)
+              writeFileSync(credTxtPath, `Opal Line Billing - first-run credentials\r\n==============================================\r\n\r\nUsername:  ${username}\r\nPassword:  ${creds.password}\r\n\r\nThis is the built-in superadmin account. On the first sign-in the app\r\nasks you to set a new password — that is expected.\r\n\r\nThis file is written once, on first install. Move it somewhere safe\r\n(or delete it) after saving the password in a password manager.\r\n`)
             } catch { /* best effort */ }
           }
         } catch { /* no credentials file (existing install) */ }
