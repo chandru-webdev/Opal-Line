@@ -108,6 +108,7 @@ export default function ProductsPage() {
   const [purity, setPurity] = useState('')
   const [stockStatus, setStockStatus] = useState('')
   const [addOpen, setAddOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState<Product | null>(null)
   const [bulkMode, setBulkMode] = useState<'csv' | 'images' | null>(null)
   const [selectedProducts, setSelectedProducts] = useState<Product[]>([])
   const [viewProduct, setViewProduct] = useState<Product | null>(null)
@@ -477,10 +478,30 @@ export default function ProductsPage() {
         open={addOpen}
         onOpenChange={setAddOpen}
         mode="add"
+        products={products}
+        onEditProduct={(p) => {
+          setAddOpen(false)
+          setEditTarget(p)
+        }}
         onSaved={(product, pushed) => {
           setPushMessage(pushed
             ? { ok: true, text: `Created "${product.name}" and pushed to Shopify.` }
             : { ok: true, text: `Created "${product.name}".` })
+          load()
+        }}
+      />
+
+      <ProductDialog
+        open={editTarget !== null}
+        onOpenChange={(o) => { if (!o) setEditTarget(null) }}
+        mode="edit"
+        product={editTarget}
+        products={products}
+        onSaved={(product, pushed) => {
+          setEditTarget(null)
+          setPushMessage(pushed
+            ? { ok: true, text: `Updated "${product.name}" and pushed to Shopify.` }
+            : { ok: true, text: `Updated "${product.name}".` })
           load()
         }}
       />

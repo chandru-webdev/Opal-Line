@@ -14,6 +14,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
+import { findDuplicateProduct, generateBarcode, generateSku, type DuplicateMatch } from '@/lib/productCodes'
 import type { Product, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
 import { todayIST } from '@/lib/format'
@@ -27,6 +28,10 @@ export interface ProductDialogProps {
   mode: 'add' | 'edit'
   product?: Product | null
   onSaved: (product: Product, pushed: boolean) => void
+  /** Already-loaded catalogue (Products page) — avoids a full re-fetch on open. */
+  products?: Product[]
+  /** Opens the duplicate panel's "Edit existing product" target. */
+  onEditProduct?: (product: Product) => void
 }
 
 interface ProductForm {
@@ -39,7 +44,6 @@ interface ProductForm {
   collection: string
   purity: string
   supplier: string
-  grossWeight: string
   stoneWeight: string
   netWeight: string
   makingCharge: string
@@ -79,6 +83,21 @@ const CATEGORIES = [
 
 const DEFAULT_CATEGORY = 'Silver jewels'
 
+// The catalogue ships with one curated category; new ones can be added inline
+// from the category picker and are remembered in this browser for next time.
+const CATEGORY_OPTIONS = [DEFAULT_CATEGORY]
+const CUSTOM_CATEGORIES_KEY = 'opal.customCategories'
+
+function loadCustomCategories(): string[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_CATEGORIES_KEY)
+    const arr = raw ? (JSON.parse(raw) as unknown) : []
+    return Array.isArray(arr) ? arr.filter((c): c is string => typeof c === 'string' && c.trim() !== '') : []
+  } catch {
+    return []
+  }
+}
+
 const EMPTY_FORM: ProductForm = {
   name: '',
   description: '',
@@ -89,7 +108,6 @@ const EMPTY_FORM: ProductForm = {
   collection: '',
   purity: '92.5',
   supplier: '',
-  grossWeight: '',
   stoneWeight: '',
   netWeight: '',
   makingCharge: '20',
@@ -120,7 +138,6 @@ function fromProduct(p: Product): ProductForm {
     collection: p.collection ?? '',
     purity: p.purity != null ? String(p.purity) : '92.5',
     supplier: p.supplier ?? '',
-    grossWeight: p.grossWeight != null ? String(p.grossWeight) : '',
     stoneWeight: p.stoneWeight != null ? String(p.stoneWeight) : '',
     netWeight: p.netWeight != null ? String(p.netWeight) : '',
     makingCharge: p.makingCharge != null ? String(p.makingCharge) : '20',
@@ -162,7 +179,6 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     purity: parseFloat(form.purity) || null,
     supplier: form.supplier.trim() || null,
     supplierId: supplierIdVal || null,
-    grossWeight: parseFloat(form.grossWeight) || null,
     stoneWeight: parseFloat(form.stoneWeight) || null,
     netWeight: parseFloat(form.netWeight) || null,
     makingCharge: parseFloat(form.makingCharge) || null,
@@ -200,24 +216,62 @@ function SectionTitle({ title, hint }: { title: string; hint?: string }) {
   )
 }
 
-export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: ProductDialogProps) {
+export function ProductDialog({ open, onOpenChange, mode, product, onSaved, products, onEditProduct }: ProductDialogProps) {
   const [form, setForm] = useState<ProductForm>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [uploading, setUploading] = useState(false)
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [supplierId, setSupplierId] = useState<string>('')
+  // Active duplicate (same SKU or barcode) — resolved inline before saving.
+  const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null)
+  // Categories added inline by this user (persisted per browser).
+  const [customCategories, setCustomCategories] = useState<string[]>(loadCustomCategories)
   // Collection names already used by products (loaded once per mount) so the
   // collection picker can offer them alongside the built-in categories.
   const [collectionChoices, setCollectionChoices] = useState<string[]>([])
   const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Latest catalogue for code generation + duplicate checks without turning
+  // `products` into a dependency of the open effect.
+  const productsRef = useRef<Product[]>([])
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
 
   useEffect(() => {
+    if (products) productsRef.current = products
+  }, [products])
+
+  // Suppliers load once per mount — never on the open path — so opening the
+  // dialog is a pure render with zero network waits (was: a fetch on every
+  // open that re-rendered the whole form mid-animation).
+  useEffect(() => {
+    dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
+    // Collection fallback (pages that don't pass `products`): fetch lazily
+    // after first paint so it never competes with the dialog opening.
+    const t = window.setTimeout(() => {
+      if (collectionsLoaded.current || products) return
+      collectionsLoaded.current = true
+      dbApi.getProducts().then((ps) => {
+        const cols = Array.from(new Set(ps.map((p) => p.collection).filter((c): c is string => Boolean(c))))
+        setCollectionChoices(cols)
+      }).catch(() => setCollectionChoices([]))
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [products])
+
+  useEffect(() => {
     if (!open) return
-    const initial = mode === 'edit' && product ? fromProduct(product) : EMPTY_FORM
+    const initial = mode === 'edit' && product
+      ? fromProduct(product)
+      : {
+          ...EMPTY_FORM,
+          // New products get unique identifiers up front (house style
+          // SLV-RNG-00001, scan-ready EAN-13); saving re-checks and the
+          // duplicate panel offers fresh codes if anything still collides.
+          sku: generateSku(productsRef.current, EMPTY_FORM.category),
+          barcode: generateBarcode(productsRef.current),
+        }
     const p = computePrice(initial)
     if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
     // Defer the reset out of the effect body (react/set-state-in-effect).
@@ -225,15 +279,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
       setForm(initial)
       setSupplierId(product?.supplierId ?? '')
       setError('')
+      setDuplicate(null)
     })
-    dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
-    if (!collectionsLoaded.current) {
-      collectionsLoaded.current = true
-      dbApi.getProducts().then((ps) => {
-        const cols = Array.from(new Set(ps.map((p) => p.collection).filter((c): c is string => Boolean(c))))
-        setCollectionChoices(cols)
-      }).catch(() => setCollectionChoices([]))
-    }
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
@@ -246,13 +293,30 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
   }
 
   const categorySelectOptions = useMemo(() => {
-    const labels = new Set<string>([...CATEGORIES, 'Other'])
+    // One curated default for now; categories the user added inline join the
+    // list (remembered per browser), plus the current value while editing.
+    const labels = new Set<string>([...CATEGORY_OPTIONS, ...customCategories])
     if (form.category) labels.add(form.category)
     // Keep the default first, alphabetical after it.
     return Array.from(labels)
       .sort((a, b) => (a === DEFAULT_CATEGORY ? -1 : b === DEFAULT_CATEGORY ? 1 : a.localeCompare(b)))
       .map((c) => ({ value: c, label: c }))
-  }, [form.category])
+  }, [customCategories, form.category])
+
+  const commitCategory = (value: string) => {
+    set('category', value)
+    setCustomCategories((prev) => {
+      const known = [...CATEGORY_OPTIONS, ...prev].some((c) => c.toLowerCase() === value.toLowerCase())
+      if (known) return prev
+      const next = [...prev, value]
+      try {
+        localStorage.setItem(CUSTOM_CATEGORIES_KEY, JSON.stringify(next))
+      } catch {
+        // Private mode / quota — the category still applies to this product.
+      }
+      return next
+    })
+  }
 
   const collectionSelectOptions = useMemo(() => {
     const labels = new Set<string>([...collectionChoices, ...CATEGORIES])
@@ -349,6 +413,18 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
     setError('')
     try {
       const body = buildBody(form, silverRate, sellingPrice, supplierId)
+      // Duplicate guard: never silently create a second product on the same
+      // identifier — offer to open the existing one or mint fresh codes.
+      const dup = findDuplicateProduct(
+        productsRef.current,
+        body.sku ?? '',
+        body.barcode ?? '',
+        mode === 'edit' ? product?.id : undefined,
+      )
+      if (dup) {
+        setDuplicate(dup)
+        return
+      }
       let saved: Product
       if (mode === 'edit' && product) {
         // Stock is owned by the ledger now. Sending it would be rejected, and
@@ -397,10 +473,35 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
       onOpenChange(false)
       onSaved(saved, pushed)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to save product')
+      // The backend unique constraint is the final word (races, other users):
+      // map "already exists" onto the same resolve panel when we can match it.
+      const msg = e instanceof Error ? e.message : 'Failed to save product'
+      if (/already exists/i.test(msg)) {
+        const dup = findDuplicateProduct(
+          productsRef.current,
+          form.sku,
+          form.barcode,
+          mode === 'edit' ? product?.id : undefined,
+        )
+        if (dup) {
+          setDuplicate(dup)
+          return
+        }
+      }
+      setError(msg)
     } finally {
       setSaving(false)
     }
+  }
+
+  const regenerateCodes = () => {
+    setForm((f) => ({
+      ...f,
+      sku: generateSku(productsRef.current, f.category),
+      barcode: generateBarcode(productsRef.current),
+    }))
+    setDuplicate(null)
+    setError('')
   }
 
   return (
@@ -445,7 +546,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
                 <CreatableSelect
                   options={categorySelectOptions}
                   value={form.category}
-                  onValueChange={(v) => set('category', v)}
+                  onValueChange={commitCategory}
                   placeholder="Select or type a category…"
                   createLabel="Add category"
                 />
@@ -480,9 +581,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
           <div className="space-y-3">
             <SectionTitle title="Weight & pricing" />
             <div className="grid grid-cols-3 gap-3">
-              <Field label="Gross weight (g)">
-                <Input type="number" step="0.01" value={form.grossWeight} onChange={(e) => set('grossWeight', e.target.value)} />
-              </Field>
               <Field label="Stone weight (g)">
                 <Input type="number" step="0.01" value={form.stoneWeight} onChange={(e) => set('stoneWeight', e.target.value)} />
               </Field>
@@ -633,6 +731,33 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
             </div>
           </div>
         </div>
+
+        {duplicate ? (
+          <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
+            <p>
+              <span className="font-medium">{duplicate.field === 'sku' ? 'SKU' : 'Barcode'}</span>{' '}
+              <span className="font-mono">{duplicate.field === 'sku' ? form.sku : form.barcode}</span> is already used
+              by <span className="font-medium">“{duplicate.product.name}”</span>
+              {duplicate.product.sku ? (
+                <> (SKU <span className="font-mono">{duplicate.product.sku}</span>)</>
+              ) : null}
+              .
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {onEditProduct ? (
+                <Button variant="outline" size="sm" onClick={() => onEditProduct(duplicate.product)}>
+                  Edit existing product
+                </Button>
+              ) : null}
+              <Button variant="outline" size="sm" onClick={regenerateCodes}>
+                Generate new codes
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setDuplicate(null)}>
+                Keep editing
+              </Button>
+            </div>
+          </div>
+        ) : null}
 
         {error ? (
           <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700">
