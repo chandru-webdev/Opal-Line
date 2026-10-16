@@ -51,6 +51,20 @@ function columnsOf(table: any): string[] {
   return Object.keys(cols)
 }
 
+/**
+ * Full text of an error, including the wrapped driver cause. Drizzle wraps the
+ * underlying Postgres error in a DrizzleQueryError whose own `message` is just
+ * "Failed query: ...", so a unique-violation check that only reads `message`
+ * would miss the driver's "duplicate key value violates unique constraint".
+ */
+function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return typeof err === 'string' ? err : 'Unknown error'
+  const cause = (err as { cause?: unknown }).cause
+  const causeText =
+    cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : ''
+  return `${err.message} ${causeText}`.trim()
+}
+
 function sanitize(body: Record<string, unknown>, table: any): Record<string, unknown> {
   const allowed = new Set(columnsOf(table))
   const out: Record<string, unknown> = {}
@@ -3408,14 +3422,60 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
         error: 'Stock is managed by the stock ledger. Use a stock count for the location, or a transfer.',
       })
     }
-    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
-    const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
+    // Barcode identity. A supplied code is validated and must not already belong
+    // to another product; an explicit empty value clears it. It is handled HERE
+    // rather than in the generic CRUD loop below because these product routes
+    // shadow that loop — logic added to the loop never runs (see the note above).
+    let barcodeAction: { set: string | null } | undefined
+    if ('barcode' in body) {
+      const raw = normalizeBarcode(body.barcode)
+      if (raw) {
+        const fmtError = barcodeFormatError(raw)
+        if (fmtError) return res.status(400).json({ error: fmtError })
+        barcodeAction = { set: raw }
+      } else {
+        barcodeAction = { set: null }
+      }
+      delete body.barcode
+    }
+
+    if (Object.keys(body).length === 0 && !barcodeAction) {
+      return res.status(400).json({ error: 'No valid fields provided' })
+    }
+
+    const id = routeParam(req.params.id)
+    const row = await db!.transaction(async (tx) => {
+      if (barcodeAction) {
+        // Serialise writers on the same code so two concurrent edits cannot
+        // both pass the duplicate check before either row is visible.
+        const lockKey = barcodeAction.set ? `bc:${barcodeAction.set}` : `bc:clear:${id}`
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`)
+        if (barcodeAction.set) {
+          const [dup] = await tx
+            .select({ id: s.products.id })
+            .from(s.products)
+            .where(and(eq(s.products.barcode, barcodeAction.set), ne(s.products.id, id)))
+            .limit(1)
+          if (dup) throw new Error(duplicateBarcodeMessage(barcodeAction.set))
+        }
+        body.barcode = barcodeAction.set
+      }
+      const [updated] = await tx.update(s.products).set(body).where(eq(s.products.id, id)).returning()
+      return updated ?? null
+    })
     if (!row) return res.status(404).json({ error: 'Not found' })
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
+    const msg = errorText(err)
     logger.error({ err }, 'product update failed')
-    res.status(400).json({ error: 'Failed to update product' })
+    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
+    res.status(400).json({
+      error:
+        msg.includes('duplicate') || msg.includes('unique')
+          ? 'That SKU is already used by another product'
+          : 'Failed to update product',
+    })
   }
 })
 
@@ -3426,17 +3486,50 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   if (!requireDb(res)) return
   try {
     const body = sanitize(req.body ?? {}, s.products)
+    const name = String(body.name ?? '').trim()
+    const sku = String(body.sku ?? '').trim()
+    if (!name) return res.status(400).json({ error: 'Product name is required' })
+    if (!sku) return res.status(400).json({ error: 'SKU is required' })
+    body.name = name
+    body.sku = sku
+
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
-    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     if (!body.id) body.id = randomUUID()
+
+    // Barcode identity: validate a supplied code, otherwise mint one. Generation
+    // only runs when the caller sent no barcode, so a value a user typed in is
+    // never overwritten. (This lives here because the generic CRUD loop below is
+    // shadowed by this route — see the note above.)
+    const requested = normalizeBarcode(body.barcode)
+    if (requested) {
+      const fmtError = barcodeFormatError(requested)
+      if (fmtError) return res.status(400).json({ error: fmtError })
+    }
+    delete body.barcode
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
     if (openingQty > 0 && !locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
 
     const row = await db!.transaction(async (tx) => {
-      const [created] = await tx.insert(s.products).values(body as never).returning()
+      // Serialise barcode writers on the same code so two concurrent creates
+      // cannot mint an identical code before either row is visible.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${requested ? `bc:${requested}` : 'bc:generate'}))`)
+      let barcode: string
+      if (requested) {
+        const [dup] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(eq(s.products.barcode, requested))
+          .limit(1)
+        if (dup) throw new Error(duplicateBarcodeMessage(requested))
+        barcode = requested
+      } else {
+        barcode = await generateUniqueBarcode(tx)
+      }
+
+      const [created] = await tx.insert(s.products).values({ ...body, barcode } as never).returning()
       if (openingQty > 0 && created.sku) {
         await applyStockMovement({
           sku: String(created.sku),
@@ -3453,9 +3546,15 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     recordCrud('products', 'Created', req, row)
     res.status(201).json(row)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const msg = errorText(err)
     logger.error({ err }, 'product create failed')
-    res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
+    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
+    res.status(400).json({
+      error:
+        msg.includes('duplicate') || msg.includes('unique')
+          ? 'A product with that SKU already exists'
+          : 'Failed to create product',
+    })
   }
 })
 
@@ -3563,112 +3662,8 @@ function recordCrud(name: string, action: string, req: Request, row: Record<stri
   })
 }
 
-async function createProductHandler(req: Request, res: Response) {
-  if (!requireDb(res)) return
-  try {
-    const body = sanitize(req.body ?? {}, s.products)
-    const name = String(body.name ?? '').trim()
-    const sku = String(body.sku ?? '').trim()
-    if (!name) return res.status(400).json({ error: 'Product name is required' })
-    if (!sku) return res.status(400).json({ error: 'SKU is required' })
-    body.name = name
-    body.sku = sku
-    if (!body.id) body.id = randomUUID()
-
-    const requested = normalizeBarcode(body.barcode)
-    if (requested) {
-      const fmtError = barcodeFormatError(requested)
-      if (fmtError) return res.status(400).json({ error: fmtError })
-    }
-    delete body.barcode
-
-    const row = await db!.transaction(async (tx) => {
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${requested ? `bc:${requested}` : 'bc:generate'}))`)
-      let barcode: string
-      if (requested) {
-        const [dup] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.barcode, requested)).limit(1)
-        if (dup) throw new Error(duplicateBarcodeMessage(requested))
-        barcode = requested
-      } else {
-        barcode = await generateUniqueBarcode(tx)
-      }
-      const [created] = await tx.insert(s.products).values({ ...body, barcode } as never).returning()
-      return created
-    })
-    recordCrud('products', 'Created', req, row)
-    res.status(201).json(stripHash(row))
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
-    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
-    if (msg.includes('duplicate key') || msg.includes('unique')) {
-      return res.status(400).json({ error: 'That SKU is already used by another product' })
-    }
-    logger.error({ err }, 'product create failed')
-    res.status(400).json({ error: 'Failed to create resource' })
-  }
-}
-
-async function updateProductHandler(req: Request, res: Response) {
-  if (!requireDb(res)) return
-  const id = routeParam(req.params.id)
-  try {
-    const body = sanitize(req.body ?? {}, s.products)
-    delete body.id
-    if (body.name !== undefined) body.name = String(body.name).trim()
-    if (body.sku !== undefined) body.sku = String(body.sku).trim()
-
-    let barcodeAction: { set: string | null } | undefined
-    if ('barcode' in body) {
-      const raw = normalizeBarcode(body.barcode)
-      if (raw) {
-        const fmtError = barcodeFormatError(raw)
-        if (fmtError) return res.status(400).json({ error: fmtError })
-        barcodeAction = { set: raw }
-      } else {
-        // Explicit clear. Allowed, but the product then simply has no barcode.
-        barcodeAction = { set: null }
-      }
-      delete body.barcode
-    }
-
-    if (Object.keys(body).length === 0 && !barcodeAction) {
-      return res.status(400).json({ error: 'No valid fields provided' })
-    }
-
-    const row = await db!.transaction(async (tx) => {
-      if (barcodeAction) {
-        const lockKey = barcodeAction.set ? `bc:${barcodeAction.set}` : `bc:clear:${id}`
-        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`)
-        if (barcodeAction.set) {
-          const [dup] = await tx
-            .select({ id: s.products.id })
-            .from(s.products)
-            .where(and(eq(s.products.barcode, barcodeAction.set), ne(s.products.id, id)))
-            .limit(1)
-          if (dup) throw new Error(duplicateBarcodeMessage(barcodeAction.set))
-        }
-        body.barcode = barcodeAction.set
-      }
-      const [updated] = await tx.update(s.products).set(body).where(eq(s.products.id, id)).returning()
-      return updated ?? null
-    })
-    if (!row) return res.status(404).json({ error: 'Not found' })
-    recordCrud('products', 'Updated', req, row)
-    res.json(stripHash(row))
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
-    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
-    if (msg.includes('duplicate key') || msg.includes('unique')) {
-      return res.status(400).json({ error: 'That SKU is already used by another product' })
-    }
-    logger.error({ err }, 'product update failed')
-    res.status(400).json({ error: 'Failed to update resource' })
-  }
-}
-
 for (const [name, table] of Object.entries(resources)) {
   dbRouter.post(`/${name}`, requirePermission(resourceModule[name], 'create'), async (req, res) => {
-    if (name === 'products') { await createProductHandler(req, res); return }
     if (!requireDb(res)) return
     try {
       const isUser = name === 'users'
@@ -3699,7 +3694,6 @@ for (const [name, table] of Object.entries(resources)) {
   })
 
   dbRouter.patch(`/${name}/:id`, requirePermission(resourceModule[name], 'edit'), async (req, res) => {
-    if (name === 'products') { await updateProductHandler(req, res); return }
     if (!requireDb(res)) return
     try {
       const isUser = name === 'users'

@@ -393,14 +393,24 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
       if (form.pushToShopify) {
         // New/placeholder listings are created; already-listed products get
         // their content + local images pushed as an update by the backend.
-        const result = await shopifyApi.pushProducts([saved.id])
-        pushed = result.created > 0 || (result.updated ?? 0) > 0
-        if (result.created > 0 && form.trackInventory && (saved.stock ?? 0) > 0) {
-          try {
-            await shopifyApi.pushInventory([saved.id])
-          } catch {
-            // Inventory push is best-effort here; it can be retried from the Shopify tools.
+        // Best-effort: an unconfigured store or a Shopify outage must never make
+        // a locally-saved product read as "failed to create", so a push error is
+        // reported as a warning and the product still saves.
+        try {
+          const result = await shopifyApi.pushProducts([saved.id])
+          pushed = result.created > 0 || (result.updated ?? 0) > 0
+          if (result.created > 0 && form.trackInventory && (saved.stock ?? 0) > 0) {
+            try {
+              await shopifyApi.pushInventory([saved.id])
+            } catch {
+              // Inventory push is best-effort here; it can be retried from the Shopify tools.
+            }
           }
+        } catch (e) {
+          pushed = false
+          toast.info(
+            `Saved locally. Shopify push failed: ${e instanceof Error ? e.message : 'unknown error'}`,
+          )
         }
       }
       // Price changes always travel through the dedicated price endpoint — the
