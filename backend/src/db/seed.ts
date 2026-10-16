@@ -79,7 +79,10 @@ async function main() {
     roleNames.map((name, i) => ({
       id: `ROLE${i + 1}`,
       name,
-      description: `${name} role with default module permissions`,
+      description:
+        name === 'Super Admin'
+          ? 'Full access to every module'
+          : 'No modules by default — a super admin grants access per user',
       permissions: defaultRolePermissions(name),
       isSystem: true,
       createdAt: new Date().toISOString(),

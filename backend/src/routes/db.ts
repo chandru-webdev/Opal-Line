@@ -4,7 +4,7 @@ import argon2 from 'argon2'
 import { desc, eq, ilike, inArray, or, sql, and, gte, lte } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import { applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
-import { computeUserPermissions, requirePermission } from '../rbac'
+import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
   recoveryPasswordSchema,
@@ -111,6 +111,28 @@ async function prepareUserBody(body: Record<string, unknown>, isUpdate = false):
   if (isUpdate && password == null) delete cleaned.passwordHash
   delete cleaned.password
   return cleaned
+}
+
+/**
+ * Module access is the super admin's call. The generic user create/update
+ * routes must not smuggle it past the dedicated RBAC endpoints: writing the
+ * `permissions` column (grant or reset), assigning the Super Admin role, or
+ * assigning any role that carries module permissions all require a Super
+ * Admin requester. Plain roles with no modules stay assignable to any
+ * system-module editor.
+ */
+async function assertNoPrivilegeEscalation(
+  req: Request,
+  body: Record<string, unknown>,
+): Promise<string | null> {
+  const touchesPermissions = 'permissions' in body
+  const targetRole = typeof body.role === 'string' ? body.role : null
+  const privileged =
+    touchesPermissions ||
+    (targetRole !== null && (targetRole === 'Super Admin' || (await roleGrantsAnyModule(targetRole))))
+  if (!privileged) return null
+  if (await isSuperAdminUser(req.userId ?? '')) return null
+  return 'Only a super admin can grant module access or assign privileged roles'
 }
 
 /**
@@ -3357,6 +3379,10 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {})
           : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber
@@ -3390,6 +3416,10 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {}, true)
           : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber

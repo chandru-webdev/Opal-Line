@@ -9,22 +9,23 @@ import assert from 'node:assert/strict'
 import { MODULE_KEYS, defaultRolePermissions, emptyPermissions, mergePermissions } from './rbac'
 
 describe('defaultRolePermissions', () => {
-  test('the bootstrap Admin role can delete in every module, including system', () => {
-    // Regression: Admin used to carry system.delete = false while the Users page
-    // still rendered the Delete button, so deleting a user or a custom role was
-    // impossible for the account that owns the install.
-    const perms = defaultRolePermissions('Admin')
+  test('no role except Super Admin ships with any module access', () => {
+    // Module access is superadmin-controlled: every non-Super-Admin role —
+    // Admin included — must default to zero modules, so a new user only ever
+    // sees what a super admin has explicitly turned on for them.
+    for (const name of ['Admin', 'Manager', 'Accounts', 'Purchase', 'Sales', 'Shopify Manager', 'Customer Support']) {
+      assert.deepEqual(defaultRolePermissions(name), emptyPermissions(), name)
+    }
+  })
+
+  test('the bootstrap owner (Super Admin) has full access everywhere', () => {
+    // The install owner is created with this role and is the account that
+    // turns modules on for everyone else, so it must keep full access.
+    const perms = defaultRolePermissions('Super Admin')
     for (const key of MODULE_KEYS) {
       assert.equal(perms[key].view, true, `${key}.view`)
       assert.equal(perms[key].create, true, `${key}.create`)
       assert.equal(perms[key].edit, true, `${key}.edit`)
-      assert.equal(perms[key].delete, true, `${key}.delete`)
-    }
-  })
-
-  test('Super Admin also has full access everywhere', () => {
-    const perms = defaultRolePermissions('Super Admin')
-    for (const key of MODULE_KEYS) {
       assert.equal(perms[key].delete, true, `${key}.delete`)
     }
   })
@@ -55,8 +56,11 @@ describe('mergePermissions', () => {
   })
 
   test('a role default is never widened by an explicit false override', () => {
-    const role = defaultRolePermissions('Admin')
+    // Use a full-access role so the false override is actually narrowing it —
+    // every other role is empty by default and would make this vacuous.
+    const role = defaultRolePermissions('Super Admin')
     const merged = mergePermissions(role, { system: { view: true, create: true, edit: true, delete: false } })
     assert.equal(merged.system.delete, false)
+    assert.equal(role.system.delete, true)
   })
 })

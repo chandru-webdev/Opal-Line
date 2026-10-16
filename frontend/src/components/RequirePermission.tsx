@@ -1,6 +1,10 @@
 import { useEffect } from 'react'
-import { Navigate, useLocation } from 'react-router-dom'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { ShieldAlert } from 'lucide-react'
 import { useAuth } from '@/auth/auth-context'
+import { MODULES, moduleForPath, pathForModule } from '@/lib/permissions'
+import { navSections } from '@/config/navigation'
+import { Button } from '@/components/ui/button'
 import ChangePasswordPage from '@/pages/ChangePassword'
 
 export function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -33,8 +37,53 @@ export function RequireAuth({ children }: { children: React.ReactNode }) {
 
 export function RequireModule({ module, children }: { module: string; children: React.ReactNode }) {
   const { hasPermission } = useAuth()
-  if (!hasPermission(module, 'view')) {
-    return <Navigate to="/" replace />
+  const location = useLocation()
+  if (hasPermission(module, 'view')) {
+    return <>{children}</>
   }
-  return <>{children}</>
+  // Module not granted. Send the user to the first page they CAN see — a real
+  // nav destination (there are no bare '/sales' style routes to land on) — but
+  // when the super admin hasn't turned anything on yet, render a clear
+  // waiting screen instead of redirect-looping between '/' (the dashboard,
+  // itself guarded) and every guarded route.
+  const first = MODULES.find((m) => hasPermission(m.key, 'view'))
+  if (!first) return <NoModulesAccess />
+  const target =
+    navSections
+      .flatMap((s) => s.items)
+      .find((i) => hasPermission(moduleForPath(i.path), 'view'))?.path ?? pathForModule(first.key)
+  if (target === location.pathname) return <NoModulesAccess />
+  return <Navigate to={target} replace />
+}
+
+/** Shown when a user has no modules enabled at all — no redirect target exists. */
+function NoModulesAccess() {
+  const { currentUser, logout } = useAuth()
+  const navigate = useNavigate()
+  return (
+    <div className="flex h-full min-h-[60vh] items-center justify-center px-4">
+      <div className="w-full max-w-md rounded-xl border bg-card p-6 text-center shadow-sm sm:p-8">
+        <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+          <ShieldAlert className="h-6 w-6 text-muted-foreground" />
+        </div>
+        <h1 className="text-lg font-semibold text-foreground">No modules enabled yet</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          {currentUser ? `${currentUser.name}, no` : 'No'} modules have been turned on for this account yet.
+          Ask your super admin to enable the modules you need from{' '}
+          <span className="font-medium text-foreground">Users &amp; Roles</span> — they will appear in the
+          sidebar as soon as they are switched on.
+        </p>
+        <Button
+          variant="outline"
+          className="mt-5"
+          onClick={() => {
+            logout()
+            navigate('/login', { replace: true })
+          }}
+        >
+          Sign out
+        </Button>
+      </div>
+    </div>
+  )
 }

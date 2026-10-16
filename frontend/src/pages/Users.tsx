@@ -36,8 +36,12 @@ const statusBadge: Record<User['status'], { label: string; variant: 'success' | 
 }
 
 export default function UsersPage() {
-  const { hasPermission, refresh } = useAuth()
+  const { hasPermission, refresh, currentUser } = useAuth()
   const canEdit = hasPermission('system', 'edit')
+  // Module grants are the super admin's call — the backend enforces this
+  // (requireSuperAdmin); the controls are hidden from other editors so they
+  // are not clickable-then-403.
+  const isSuperAdmin = currentUser?.role === 'Super Admin'
   // Deleting a user or a custom role is a distinct server-side permission
   // (requirePermission('system', 'delete')), so it needs its own gate —
   // otherwise the button is clickable and always fails with 403.
@@ -375,11 +379,11 @@ export default function UsersPage() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" disabled={!canEdit} onClick={() => openPerms(row.original)}>
+                  <Button variant="ghost" size="icon-sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openPerms(row.original)}>
                     <Shield className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Manage permissions</TooltipContent>
+                <TooltipContent>{isSuperAdmin ? 'Manage permissions' : 'Super admin only'}</TooltipContent>
               </Tooltip>
               {row.original.status === 'active' ? (
                 <Tooltip>
@@ -405,7 +409,7 @@ export default function UsersPage() {
         ),
       },
     ],
-    [canEdit, setStatus],
+    [canEdit, isSuperAdmin, setStatus],
   )
 
   return (
@@ -486,7 +490,7 @@ export default function UsersPage() {
 
         <TabsContent value="roles">
           <div className="flex items-center justify-end pb-1">
-            <Button size="sm" variant="outline" onClick={() => openRoleDialog()} disabled={!canEdit}>
+            <Button size="sm" variant="outline" onClick={() => openRoleDialog()} disabled={!canEdit || !isSuperAdmin}>
               <Plus className="h-4 w-4" /> New Role
             </Button>
           </div>
@@ -523,10 +527,10 @@ export default function UsersPage() {
                     ) : null}
                   </div>
                   <div className="mt-auto flex items-center justify-end gap-2 pt-4">
-                    <Button variant="outline" size="sm" disabled={!canEdit} onClick={() => openRoleDialog(role)}>
+                    <Button variant="outline" size="sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openRoleDialog(role)}>
                       <Pencil className="h-3.5 w-3.5" /> Edit
                     </Button>
-                    <Button variant="ghost" size="sm" disabled={!canEdit} onClick={() => openRoleDialog(role)}>
+                    <Button variant="ghost" size="sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openRoleDialog(role)}>
                       <KeyRound className="h-3.5 w-3.5" /> Permissions
                     </Button>
                     {!role.isSystem ? (
