@@ -78,6 +78,8 @@ npm run dev              # backend on http://localhost:47191 + UI on http://127.
 
 Default seeded login: **admin / Opal@2026** (change it in Users & Roles).
 
+💡 Dev-mode DB check: after `npm run db:seed`, run `curl http://127.0.0.1:47191/api/v1/health` — it should return `"database":{"healthy":true,...}` confirming the API can reach PostgreSQL.
+
 Run pieces separately: `npm run dev:server` (backend only) or `npm run dev:web`
 (frontend only). All configuration — env vars, in-app settings, Shopify,
 integrations — is documented step-by-step in
@@ -185,9 +187,25 @@ bootstraps the schema (45 tables), the generated admin logs in, and
 dependency is needed on the target machine.
 
 Note: NSIS remembers the last chosen install directory (e.g. from a previous
-`/allusers` test run) and a silent install will reuse it — if the script fails
+/`allusers` test run) and a silent install will reuse it — if the script fails
 on path checks, uninstall via the existing *Uninstall Opal Line Billing*
 entry first, then re-run.
+
+## Run the dashboard bucket regression test locally
+
+The regression test in `backend/src/routes/dashboardBuckets.test.ts` checks that
+`salesBuckets`/`returnBuckets` group revenue correctly and exclude voided invoices
+and cancelled returns. It runs only when `DASHBOARD_TEST_DATABASE_URL` is set to a
+PostgreSQL URL pointing at a scratch database with the full schema applied. To run
+it:
+
+1. (Optional) Create a scratch database and apply the schema from the app's backup,
+   or start the dev PostgreSQL and create `opal_line_dash_test`.
+2. Set `DASHBOARD_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:47193/opal_line_dash_test`
+3. Run `npm run test` from the `backend/` directory.
+
+The test is automatically skipped when the env var is absent, so the normal test
+suite is unaffected.
 
 ### Build the installer yourself
 
