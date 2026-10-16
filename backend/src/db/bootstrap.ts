@@ -3,7 +3,8 @@ import postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { eq } from 'drizzle-orm'
 import * as schema from './schema'
-import { defaultRolePermissions, MODULE_KEYS } from '../rbac'
+import { defaultRolePermissions, emptyPermissions, MODULE_KEYS, MODULES } from '../rbac'
+import type { Permissions } from '../types'
 import { roleNames } from './seedData'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -938,7 +939,10 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
     await db.insert(schema.roles).values({
       id: `ROLE${i + 1}`,
       name,
-      description: `${name} role with default module permissions`,
+      description:
+        name === 'Super Admin'
+          ? 'Full access to every module'
+          : 'No modules by default — a super admin grants access per user',
       permissions: defaultRolePermissions(name),
       isSystem: true,
       createdAt: new Date().toISOString(),
@@ -950,18 +954,18 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
   const users = await db.select({ id: schema.users.id }).from(schema.users).limit(1)
   let generatedAdminPassword: string | undefined
   if (users.length === 0) {
-    // Generate a random 12-character password for the initial admin.
-    // This used to be thrown away in favour of a hardcoded "Opal@2026", which
-    // made every fresh install share a password that is published in this
-    // repository. The generated one is now used and surfaced once to the user.
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*'
-    const bytes = randomBytes(12)
-    let randomPassword = ''
-    for (let i = 0; i < 12; i++) {
-      randomPassword += chars[bytes[i] % chars.length]
-    }
-    generatedAdminPassword = randomPassword
-    const tempPassword = randomPassword
+    // Deterministic superadmin credential for every fresh install: the same
+    // owner account ships on every new system — username "admin", password
+    // below (SEED_ADMIN_PASSWORD overrides it). The earlier one-time random
+    // secret made new installs look broken: it was shown once in a dialog,
+    // easy to mistype, and five bad attempts hit the 15-minute lockout —
+    // leaving users unable to log in with the "auto-generated" credential.
+    // The default is published in this repo, so two things bound the
+    // exposure: the server binds to 127.0.0.1 only, and requirePasswordChange
+    // below forces a new password at the first sign-in — the default never
+    // survives the initial setup screen.
+    const tempPassword = process.env.SEED_ADMIN_PASSWORD?.trim() || 'Opal@2026'
+    generatedAdminPassword = tempPassword
     const passwordHash = await argon2.hash(tempPassword)
     await db.insert(schema.users).values({
       id: randomBytes(8).toString('hex'),
@@ -969,11 +973,11 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
       email: 'admin@opalline.local',
       username: 'admin',
       passwordHash,
-      role: 'Admin',
+      role: 'Super Admin',
       status: 'active',
       requirePasswordChange: true,
-      // No personal override: the owner must inherit the Admin role so that
-      // later fixes to the role's defaults actually reach this account.
+      // No personal override: the owner is the superadmin who turns modules on
+      // for everyone else, and must always inherit the Super Admin role.
       permissions: null,
     })
     logger.info('Bootstrap: created initial admin user')
@@ -981,7 +985,7 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
     console.log('  Initial admin account created:')
     console.log('    Username: admin')
     console.log(`    Password: ${tempPassword}`)
-    console.log('  Store this now — it is not shown again.')
+    console.log('  You will be asked to set a new password at first login.')
     console.log('══════════════════════════════════════════════════════\n')
     // Hand the one-time credential to the desktop app so it can show the real
     // password in its first-run dialog instead of a hardcoded placeholder.
@@ -1106,6 +1110,112 @@ async function repairAdminUserOverride(db: ReturnType<typeof drizzle>): Promise<
 }
 
 /**
+ * Frozen copy of the per-role module defaults that shipped before module
+ * access became superadmin-controlled. Role rows store a snapshot of their
+ * defaults, so changing defaultRolePermissions() alone never reaches an
+ * existing database. repairDefaultRolePermissions() matches this legacy shape
+ * to recognise stock rows; it is deliberately frozen here — it must keep
+ * describing what OLD installs stored, not what the code does today.
+ */
+function legacyDefaultRolePermissions(name: string): Permissions {
+  const p = emptyPermissions()
+  const all = { view: true, create: true, edit: true, delete: true }
+  const view = { view: true, create: false, edit: false, delete: false }
+  switch (name) {
+    case 'Admin':
+      for (const m of MODULES) p[m.key] = { ...all }
+      break
+    case 'Manager':
+      p.dashboard = { ...view }
+      p.sales = { ...all }
+      p.inventory = { ...all }
+      p.purchase = { view: true, create: true, edit: true, delete: false }
+      p['silver-rate'] = { ...all }
+      p.accounts = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Accounts':
+      p.accounts = { ...all }
+      p.sales = { view: true, create: false, edit: true, delete: false }
+      p.purchase = { ...view }
+      p.reports = { ...view }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Purchase':
+      p.purchase = { ...all }
+      p.inventory = { view: true, create: false, edit: true, delete: false }
+      p.reports = { ...view }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Sales':
+      p.sales = { ...all }
+      p.dashboard = { ...view }
+      p.inventory = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Shopify Manager':
+      p.shopify = { ...all }
+      p.inventory = { view: true, create: false, edit: true, delete: false }
+      p.dashboard = { ...view }
+      break
+    case 'Customer Support':
+      p.sales = { view: true, create: false, edit: true, delete: false }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    default:
+      return p // unknown name: legacy default was empty, nothing to recognise
+  }
+  return p
+}
+
+function samePermissions(a: Permissions | null, b: Permissions): boolean {
+  const x = (a ?? {}) as Permissions
+  return MODULE_KEYS.every((k) => {
+    const lhs = x[k]
+    const rhs = b[k]
+    if (!lhs || !rhs) return false
+    return lhs.view === rhs.view && lhs.create === rhs.create && lhs.edit === rhs.edit && lhs.delete === rhs.delete
+  })
+}
+
+/**
+ * Module access is now superadmin-controlled: no role except Super Admin
+ * ships with modules, so the install owner must actually BE a Super Admin —
+ * otherwise the account that is supposed to switch modules on would have no
+ * modules itself. Promotes the bootstrap owner (username "admin", role Admin)
+ * once; afterwards the role no longer reads 'Admin', so the repair is a no-op.
+ */
+async function repairOwnerSuperAdmin(db: ReturnType<typeof drizzle>): Promise<void> {
+  const [owner] = await db.select().from(schema.users).where(eq(schema.users.username, 'admin')).limit(1)
+  if (!owner || owner.role !== 'Admin') return
+  await db.update(schema.users).set({ role: 'Super Admin' }).where(eq(schema.users.id, owner.id))
+  logger.info('Bootstrap: promoted the install owner (admin) to Super Admin')
+}
+
+/**
+ * One-time reset of the stock role snapshots to the new empty defaults.
+ *
+ * Only rows that exactly match the legacy default shape are rewritten — a
+ * role an admin customised by hand, a custom role, and the Super Admin role
+ * itself are left untouched. Once cleared a row no longer matches a legacy
+ * shape, so re-running (every start) is a no-op.
+ */
+async function repairDefaultRolePermissions(db: ReturnType<typeof drizzle>): Promise<void> {
+  const roles = await db.select().from(schema.roles)
+  for (const role of roles) {
+    if (role.isSystem !== true || role.name === 'Super Admin') continue
+    const legacy = legacyDefaultRolePermissions(role.name)
+    if (!MODULE_KEYS.some((k) => legacy[k]?.view || legacy[k]?.create || legacy[k]?.edit || legacy[k]?.delete)) continue
+    if (!samePermissions(role.permissions as Permissions | null, legacy)) continue
+    await db.update(schema.roles).set({ permissions: emptyPermissions() }).where(eq(schema.roles.id, role.id))
+    logger.info({ role: role.name }, 'Bootstrap: cleared default module access (now superadmin-controlled)')
+  }
+}
+
+/**
  * Run bootstrap when the database is fresh (no users table). Idempotent and
  * safe on every start; upgrades add missing columns/tables for existing DBs.
  */
@@ -1137,6 +1247,8 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
     const upgradeDb = drizzle(sql, { schema })
     await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
     await repairAdminUserOverride(upgradeDb).catch(() => undefined)
+    await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
+    await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
     // Stock balances predate the movement ledger. Give them a dated opening
     // entry so an upgraded install has real history instead of a balance that
     // appears from nowhere on the day of its first sale.

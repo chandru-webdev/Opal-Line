@@ -65,16 +65,20 @@ scripts/            Build, desktop packaging and maintenance utilities
 
 ## Quick start (development)
 
-Prerequisites: **Node.js 20 LTS+**, **PostgreSQL 14+**, npm 9+.
+Prerequisites: **Node.js 20 LTS+**, npm 9+, and **PostgreSQL 14+** (or a
+portable server placed in `backend/pgsql`).
 
 ```bash
 npm install              # installs both workspaces (hoisted to root)
-cp backend/.env.example backend/.env
-# edit backend/.env → DATABASE_URL (and Shopify creds, or set them in the UI)
-npm run db:push          # create/update the schema
-npm run db:seed          # seed roles, admin user, sample data
-npm run dev              # backend on http://localhost:47191 + UI on http://127.0.0.1:47195
+npm run dev              # first run provisions the local PostgreSQL (port 47193),
+                         # writes backend/.env, then starts backend 47191 + UI 47195
 ```
+
+On first run the backend also bootstraps the schema and the admin user (same
+data directory as the desktop app). Prefer your own server or a cloud database
+(Neon/Supabase)? Create `backend/.env` from `backend/.env.example` with your
+`DATABASE_URL` first — `npm run dev` then leaves it alone. Add Shopify creds
+there too, or set them later in the UI.
 
 Default seeded login: **admin / Opal@2026** (change it in Users & Roles).
 
@@ -191,21 +195,7 @@ Note: NSIS remembers the last chosen install directory (e.g. from a previous
 on path checks, uninstall via the existing *Uninstall Opal Line Billing*
 entry first, then re-run.
 
-## Run the dashboard bucket regression test locally
 
-The regression test in `backend/src/routes/dashboardBuckets.test.ts` checks that
-`salesBuckets`/`returnBuckets` group revenue correctly and exclude voided invoices
-and cancelled returns. It runs only when `DASHBOARD_TEST_DATABASE_URL` is set to a
-PostgreSQL URL pointing at a scratch database with the full schema applied. To run
-it:
-
-1. (Optional) Create a scratch database and apply the schema from the app's backup,
-   or start the dev PostgreSQL and create `opal_line_dash_test`.
-2. Set `DASHBOARD_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:47193/opal_line_dash_test`
-3. Run `npm run test` from the `backend/` directory.
-
-The test is automatically skipped when the env var is absent, so the normal test
-suite is unaffected.
 
 ### Build the installer yourself
 

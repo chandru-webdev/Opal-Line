@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Select } from '@/components/ui/select'
+import { CreatableSelect } from '@/components/ui/creatable-select'
 import { Switch } from '@/components/ui/switch'
 import {
   Dialog,
@@ -60,6 +60,9 @@ interface ProductForm {
 }
 
 const CATEGORIES = [
+  // Business default: most of the catalogue is silver jewellery, so a new
+  // product starts here instead of the previous 'Rings' default.
+  'Silver jewels',
   'Rings',
   'Chains',
   'Bracelets',
@@ -74,13 +77,15 @@ const CATEGORIES = [
   'Accessories',
 ]
 
+const DEFAULT_CATEGORY = 'Silver jewels'
+
 const EMPTY_FORM: ProductForm = {
   name: '',
   description: '',
   sku: '',
   barcode: '',
   huid: '',
-  category: 'Rings',
+  category: DEFAULT_CATEGORY,
   collection: '',
   purity: '92.5',
   supplier: '',
@@ -111,7 +116,7 @@ function fromProduct(p: Product): ProductForm {
     sku: p.sku ?? '',
     barcode: p.barcode ?? '',
     huid: p.huid ?? '',
-    category: p.category ?? 'Rings',
+    category: p.category ?? DEFAULT_CATEGORY,
     collection: p.collection ?? '',
     purity: p.purity != null ? String(p.purity) : '92.5',
     supplier: p.supplier ?? '',
@@ -202,6 +207,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
   const [uploading, setUploading] = useState(false)
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [supplierId, setSupplierId] = useState<string>('')
+  // Collection names already used by products (loaded once per mount) so the
+  // collection picker can offer them alongside the built-in categories.
+  const [collectionChoices, setCollectionChoices] = useState<string[]>([])
+  const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
@@ -218,6 +227,13 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
       setError('')
     })
     dbApi.getSuppliers().then(setSuppliers).catch(() => setSuppliers([]))
+    if (!collectionsLoaded.current) {
+      collectionsLoaded.current = true
+      dbApi.getProducts().then((ps) => {
+        const cols = Array.from(new Set(ps.map((p) => p.collection).filter((c): c is string => Boolean(c))))
+        setCollectionChoices(cols)
+      }).catch(() => setCollectionChoices([]))
+    }
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
@@ -228,6 +244,23 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
       return next
     })
   }
+
+  const categorySelectOptions = useMemo(() => {
+    const labels = new Set<string>([...CATEGORIES, 'Other'])
+    if (form.category) labels.add(form.category)
+    // Keep the default first, alphabetical after it.
+    return Array.from(labels)
+      .sort((a, b) => (a === DEFAULT_CATEGORY ? -1 : b === DEFAULT_CATEGORY ? 1 : a.localeCompare(b)))
+      .map((c) => ({ value: c, label: c }))
+  }, [form.category])
+
+  const collectionSelectOptions = useMemo(() => {
+    const labels = new Set<string>([...collectionChoices, ...CATEGORIES])
+    if (form.collection) labels.add(form.collection)
+    return Array.from(labels)
+      .sort((a, b) => a.localeCompare(b))
+      .map((c) => ({ value: c, label: c }))
+  }, [collectionChoices, form.collection])
 
   const computed = computePrice(form)
   const hasAutoPrice = Number.isFinite(computed)
@@ -409,17 +442,21 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />
               </Field>
               <Field label="Category">
-                <Select
-                  options={[...CATEGORIES, 'Other'].map((c) => ({ value: c, label: c }))}
+                <CreatableSelect
+                  options={categorySelectOptions}
                   value={form.category}
                   onValueChange={(v) => set('category', v)}
+                  placeholder="Select or type a category…"
+                  createLabel="Add category"
                 />
               </Field>
               <Field label="Collection">
-                <Select
-                  options={[...CATEGORIES, 'Other'].map((c) => ({ value: c, label: c }))}
+                <CreatableSelect
+                  options={collectionSelectOptions}
                   value={form.collection}
                   onValueChange={(v) => set('collection', v)}
+                  placeholder="Select or type a collection…"
+                  createLabel="Add collection"
                 />
               </Field>
               <Field label="Purity %">

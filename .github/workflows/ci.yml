@@ -4,6 +4,13 @@ on:
   push:
   workflow_dispatch:
 
+# A newer push to the same branch supersedes the in-flight run: cancel it
+# instead of paying for two full Windows installer jobs back to back.
+# Master runs are never cancelled — releases watch them to completion.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   checks:
     name: Lint, typecheck, test, build
@@ -78,6 +85,52 @@ jobs:
       - name: Build frontend (tsc -b && vite build)
         run: npm run build
 
+  changes:
+    name: Detect affected paths
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      desktop: ${{ steps.filter.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether the desktop installer e2e is needed
+        id: filter
+        shell: bash
+        run: |
+          # The Windows job tests a BUILT installer. A push that only touches
+          # docs/*.md produces the same binary, so running 28 minutes of
+          # install/boot/e2e on it is pure waste. Anything else — and any
+          # uncertain base (force-push, first push of a branch) — runs it.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+            || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" "$GITHUB_SHA")
+          NON_DOC=$(printf '%s\n' "$CHANGED" | grep -v -E '^(docs/|[^/]+\.md$)' | head -n1 || true)
+          if [ -n "$NON_DOC" ]; then
+            echo "desktop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # On pushes the desktop suite never starts by itself any more — tell
+      # the team when the change they just pushed WOULD have needed it.
+      - name: Notify that the desktop e2e is manual now
+        if: github.event_name == 'push' && steps.filter.outputs.desktop == 'true'
+        shell: bash
+        run: |
+          echo "::notice title=Desktop installer e2e skipped::Code changes were detected, but the desktop job no longer runs automatically. Trigger it manually: Actions → CI → Run workflow (the repo owner approves before it starts)."
+
   desktop-e2e:
     name: Desktop installer e2e (Windows)
     # Builds the signed installer exactly like release.yml does, silent-installs
@@ -85,7 +138,14 @@ jobs:
     # app — the only environment where the bundled-PostgreSQL bootstrap and the
     # packaged backend actually execute.
     runs-on: windows-latest
-    needs: checks
+    needs: [checks, changes]
+    # Owner decision: the ~28-minute desktop suite no longer runs on pushes.
+    # It runs only when someone triggers it manually (Actions → CI → Run
+    # workflow), and the environment below holds it in "waiting" until the
+    # repo owner approves. The required `checks` gate is unaffected. Run it
+    # manually before cutting a release.
+    if: github.event_name == 'workflow_dispatch'
+    environment: desktop-e2e-gate
     timeout-minutes: 90
     env:
       # Set by the first step below. A step-level `if` cannot set env, so the
@@ -100,6 +160,18 @@ jobs:
         with:
           node-version: 26
           cache: npm
+
+      # Electron's runtime binary (fetched by npm's postinstall) and
+      # electron-builder's NSIS tooling are NOT covered by the npm cache
+      # above. Caching them takes ~2-4 min off every warm run. Restored
+      # before npm ci because that is when the Electron download happens.
+      - name: Cache Electron + electron-builder downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       # No ELECTRON_SKIP_BINARY_DOWNLOAD here — electron-builder packages the
       # Electron runtime into the installer.
@@ -239,6 +311,15 @@ jobs:
             Write-Error "Backend not healthy after password reset: $_"
             exit 1
           }
+
+      # Browser builds are pinned by the lockfile; re-downloading ~170 MB of
+      # Chromium on every run is pure network time when the cache is warm.
+      - name: Cache Playwright browsers
+        if: env.SIGNING_AVAILABLE == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install Playwright chromium
         if: env.SIGNING_AVAILABLE == 'true'

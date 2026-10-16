@@ -5,8 +5,14 @@
 //   4. cleanup
 import { chromium } from 'playwright'
 import { readFileSync, readdirSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// Was hardcoded to the original dev machine's ~/Downloads/Opal_project copy.
+// Default to THIS repo's backend/ — override with OPAL_BACKEND_DIR=... if the
+// dev stack genuinely lives elsewhere.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const BACKEND_DIR = process.env.OPAL_BACKEND_DIR ?? join(repoRoot, 'backend')
 
 const BASE = process.env.BASE ?? 'http://localhost:47191'
 
@@ -41,7 +47,7 @@ jar = mergeJar(jar, loginRes.headers.getSetCookie?.() ?? [])
 ;({ jar, csrfToken } = await getCsrf(jar))
 
 // temp product with two images
-const dir = join(homedir(), 'Downloads', 'Opal_project', 'backend', 'uploads')
+const dir = join(BACKEND_DIR, 'uploads')
 const pngs = readdirSync(dir).filter((f) => f.endsWith('.png')).slice(0, 2)
 const dataUrls = pngs.map((f) => `data:image/png;base64,${readFileSync(join(dir, f)).toString('base64')}`)
 const up = await (await fetch(`${BASE}/api/v1/uploads/image`, {

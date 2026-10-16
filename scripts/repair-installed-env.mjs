@@ -6,11 +6,16 @@
 // Never prints secret values.
 import { readFileSync, writeFileSync } from 'node:fs'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const DEV_ENV = join(homedir(), 'Downloads', 'Opal_project', 'backend', '.env')
-const DEV_KEY = join(homedir(), 'Downloads', 'Opal_project', 'backend', '.encryption-key')
+// Was hardcoded to the original dev machine's ~/Downloads/Opal_project copy.
+// Default to THIS repo's backend/ — override with OPAL_BACKEND_DIR=... if the
+// dev stack genuinely lives elsewhere.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+const BACKEND_DIR = process.env.OPAL_BACKEND_DIR ?? join(repoRoot, 'backend')
+const DEV_ENV = join(BACKEND_DIR, '.env')
+const DEV_KEY = join(BACKEND_DIR, '.encryption-key')
 const DATA_DIR = process.env.APPDATA
   ? join(process.env.APPDATA, 'Opal Line Billing', 'data')
   : null

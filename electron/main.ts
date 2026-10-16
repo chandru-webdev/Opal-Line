@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell, dialog, ipcMain } from 'electron'
 import { join, resolve } from 'node:path'
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, openSync, closeSync, readSync, statSync, createWriteStream, rmSync } from 'node:fs'
+import { isNewerVersion, sweepDownloads } from './updatesweep'
 import { execSync } from 'node:child_process'
 import { randomBytes, createHash } from 'node:crypto'
 import { pruneLogIfTooBig } from './logrotate'
@@ -386,6 +387,16 @@ function preflightPorts(): boolean {
     }
 
     const name = processNameForPid(pid)
+    // PostgreSQL already listening on the bundled-database port is NOT a
+    // conflict: it can be our own leftover cluster, or the dev stack
+    // (scripts/dev.mjs via npm run dev / electron:dev) deliberately sharing
+    // this data directory — and ensurePostgres() reuses a running server
+    // rather than starting a second one. Only a non-PostgreSQL program on
+    // 47193 is a real collision worth blocking startup for.
+    if (port === PG_PORT && /^postgres(?:\.exe)?$/i.test(name.trim())) {
+      logLine('startup', `port ${port} already served by ${name} (pid ${pid}) — reusing`)
+      continue
+    }
     if (/opal line billing/i.test(name)) {
       logLine('startup', `port ${port} held by another Opal Line instance (pid ${pid})`)
       dialog.showMessageBox({
@@ -945,15 +956,7 @@ function verifyInstallerSignature(file: string): void {
   execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore', timeout: 60000, windowsHide: true })
 }
 
-function isNewerVersion(current: string, latest: string): boolean {
-  const pa = current.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0)
-  const pb = latest.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0)
-  for (let i = 0; i < 3; i++) {
-    const diff = (pb[i] ?? 0) - (pa[i] ?? 0)
-    if (diff !== 0) return diff > 0
-  }
-  return false
-}
+
 
 /**
  * Fetch the latest-release metadata with limited retry/backoff. Transient
@@ -1224,6 +1227,13 @@ async function main() {
     // Auto-update: first check shortly after launch, then every 6 hours.
     if (app.isPackaged) {
       loadUpdatePrefs()
+      // Remove installers left behind by past update cycles before anything
+      // else touches the temp folder (see electron/updatesweep.ts).
+      try {
+        sweepDownloads(app.getPath('temp'), app.getVersion()).forEach(
+          (name) => logLine('update', `swept stale download ${name}`),
+        )
+      } catch { /* best effort — temp cleanup must never block startup */ }
       // Tell the user straight away if the last automatic install gave up.
       const failure = readUpdateFailure()
       if (failure) {
@@ -1256,13 +1266,13 @@ async function main() {
           const creds = JSON.parse(readFileSync(credFile, 'utf8')) as { username?: string; password?: string }
           if (creds.password) {
             const username = creds.username ?? 'admin'
-            detail = `Username: ${username}\nPassword: ${creds.password}\n\nStore this now — it is shown only once.`
+            detail = `Username: ${username}\nPassword: ${creds.password}\n\nThis is the built-in superadmin account. On the first sign-in the app asks you to set a new password — that is expected. Save these somewhere safe.`
             // Persist a plain-text copy the user can open and copy from at any
             // time. Written BEFORE the dialog: headless sessions may never show
             // the dialog, so this file — not the dialog — is the durable copy.
             try {
               credTxtPath = join(APP_DATA, 'Opal-First-Run-Credentials.txt')
-              writeFileSync(credTxtPath, `Opal Line Billing - first-run credentials\r\n==============================================\r\n\r\nUsername:  ${username}\r\nPassword:  ${creds.password}\r\n\r\nThis file is written once, on first install. Move it somewhere safe\r\n(or delete it) after saving the password in a password manager.\r\n`)
+              writeFileSync(credTxtPath, `Opal Line Billing - first-run credentials\r\n==============================================\r\n\r\nUsername:  ${username}\r\nPassword:  ${creds.password}\r\n\r\nThis is the built-in superadmin account. On the first sign-in the app\r\nasks you to set a new password — that is expected.\r\n\r\nThis file is written once, on first install. Move it somewhere safe\r\n(or delete it) after saving the password in a password manager.\r\n`)
             } catch { /* best effort */ }
           }
         } catch { /* no credentials file (existing install) */ }
