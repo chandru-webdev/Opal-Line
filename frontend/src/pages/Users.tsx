@@ -761,7 +761,6 @@ export default function UsersPage() {
               </div>
               <PermissionGrid
                 permissions={permsData.overrides ?? emptyPermissions()}
-                base={permsData.rolePermissions}
                 onChange={(next) => setPermsData((p) => (p ? { ...p, overrides: next } : p))}
               />
               <div className="rounded-md border bg-success-50 px-3 py-2">
@@ -839,11 +838,9 @@ export default function UsersPage() {
 
 function PermissionGrid({
   permissions,
-  base,
   onChange,
 }: {
   permissions: Permissions
-  base?: Permissions
   onChange: (next: Permissions) => void
 }) {
   const toggle = (moduleKey: string, action: keyof Permissions[string]) => {
@@ -853,9 +850,6 @@ function PermissionGrid({
     next[moduleKey] = cell
     onChange(next)
   }
-
-  const isOverride = (moduleKey: string, action: keyof Permissions[string]) =>
-    base ? Boolean(base[moduleKey]?.[action]) !== Boolean(permissions[moduleKey]?.[action]) : false
 
   return (
     <div className="overflow-hidden rounded-lg border">
@@ -883,12 +877,6 @@ function PermissionGrid({
                         checked={Boolean(permissions[m.key]?.[a.key])}
                         onCheckedChange={() => toggle(m.key, a.key)}
                       />
-                      {isOverride(m.key, a.key) ? (
-                        <span
-                          className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-amber-500 ring-2 ring-background"
-                          title="Overrides role default"
-                        />
-                      ) : null}
                     </span>
                   </div>
                 </td>

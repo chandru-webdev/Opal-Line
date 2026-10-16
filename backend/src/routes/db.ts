@@ -2885,17 +2885,25 @@ dbRouter.put('/settings', requirePermission('system', 'edit'), async (req, res) 
     for (const k of SETTINGS_SECRET_COLUMNS) delete body[k as keyof typeof body]
     // Same rule for the recovery password override: a settings round-trip must
     // preserve the stored value untouched (the dedicated endpoint manages it).
-    if (body.notificationSettings && typeof body.notificationSettings === 'object') {
-      const incoming = { ...(body.notificationSettings as Record<string, unknown>) }
-      delete incoming[RECOVERY_PASSWORD_KEY]
-      delete incoming[RECOVERY_PASSWORD_HASH_KEY]
+    // The two "Daily Summary" switches (Business Settings column + Notification
+    // Settings flag) drive the same email, so a write to either one updates both.
+    const wantsNsUpdate = !!(body.notificationSettings && typeof body.notificationSettings === 'object')
+    if (wantsNsUpdate || typeof body.dailySummary === 'boolean') {
       const [current] = await db!.select({ ns: s.settings.notificationSettings }).from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
       const existingNs = (current?.ns ?? null) as Record<string, unknown> | null
+      const incoming: Record<string, unknown> = wantsNsUpdate
+        ? { ...(body.notificationSettings as Record<string, unknown>) }
+        : { ...existingNs }
+      delete incoming[RECOVERY_PASSWORD_KEY]
+      delete incoming[RECOVERY_PASSWORD_HASH_KEY]
       if (existingNs && RECOVERY_PASSWORD_KEY in existingNs) {
         incoming[RECOVERY_PASSWORD_KEY] = existingNs[RECOVERY_PASSWORD_KEY]
       }
       if (existingNs && RECOVERY_PASSWORD_HASH_KEY in existingNs) {
         incoming[RECOVERY_PASSWORD_HASH_KEY] = existingNs[RECOVERY_PASSWORD_HASH_KEY]
+      }
+      if (typeof body.dailySummary === 'boolean') {
+        incoming.dailySummaryEnabled = body.dailySummary
       }
       body.notificationSettings = incoming
     }
@@ -3916,7 +3924,10 @@ dbRouter.put('/settings/notifications', requirePermission('system', 'edit'), asy
     const [row] = await db!.select().from(schema.settings).where(sql`${schema.settings.id} = 'app'`).limit(1)
     const existing = (row as any)?.notificationSettings ?? {}
     const merged = { ...existing, ...body }
-    await db!.update(schema.settings).set({ notificationSettings: merged } as any).where(sql`${schema.settings.id} = 'app'`)
+    // Mirror the switch onto the legacy Business Settings column (same email).
+    const setClause: Record<string, unknown> = { notificationSettings: merged }
+    if (typeof body.dailySummaryEnabled === 'boolean') setClause.dailySummary = body.dailySummaryEnabled
+    await db!.update(schema.settings).set(setClause as any).where(sql`${schema.settings.id} = 'app'`)
     const actor = actorFromRequest(req)
     void recordActivity({ action: 'Updated Notification Settings', module: 'system', entity: 'Notifications', details: Object.keys(body).join(', '), userId: actor.userId, ip: actor.ip })
     res.json(merged)

@@ -1,13 +1,13 @@
 import { toast } from '@/components/ui/confirm'
 import { useEffect, useState } from 'react'
-import { Mail, MessageCircle, RefreshCw, Save, PackageCheck } from 'lucide-react'
+import { Mail, MessageCircle, RefreshCw, Save, PackageCheck, Send } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { dbApi } from '@/lib/api'
+import { dbApi, shopifyApi } from '@/lib/api'
 
 interface NotificationSettings {
   dailySummaryEnabled: boolean
@@ -35,6 +35,7 @@ export default function NotificationSettingsPage() {
   })
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
 
   useEffect(() => {
     dbApi.getNotificationSettings()
@@ -52,6 +53,19 @@ export default function NotificationSettingsPage() {
       toast.error(err instanceof Error ? err.message : 'Failed to save settings')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const sendTest = async () => {
+    setTesting(true)
+    try {
+      const res = await shopifyApi.testEmail(settings.recipientEmail || undefined)
+      if (res.ok) toast.success(`Test email sent to ${res.to}`)
+      else toast.error(res.error ?? 'Test email failed')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Test email failed')
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -78,18 +92,30 @@ export default function NotificationSettingsPage() {
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="space-y-2">
-            <Label htmlFor="recipient">Notification Recipient</Label>
-            <Input
-              id="recipient"
-              type="email"
-              value={settings.recipientEmail}
-              onChange={(e) => setSettings({ ...settings, recipientEmail: e.target.value })}
-              placeholder="admin@example.com"
-            />
-            <p className="text-xs text-muted-foreground">All notification emails will be sent to this address.</p>
+            <Label htmlFor="recipient">Owner Notification Recipient</Label>
+            <div className="flex gap-2">
+              <Input
+                id="recipient"
+                type="email"
+                value={settings.recipientEmail}
+                onChange={(e) => setSettings({ ...settings, recipientEmail: e.target.value })}
+                placeholder="admin@example.com"
+                className="flex-1"
+              />
+              <Button variant="outline" onClick={sendTest} disabled={testing || loading}>
+                {testing ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                Send Test
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Owner emails (Daily Summary, Weekly Report, Supplier Payables) are sent to this address. Leave empty to fall
+              back to the NOTIFICATION_EMAIL environment variable, then the business email. Customer emails always go to
+              each customer's own address.
+            </p>
           </div>
 
           <div className="space-y-4">
+            <p className="text-sm font-medium text-muted-foreground">Owner emails — sent to the address above</p>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
                 <p className="font-medium">Daily Summary</p>
@@ -101,6 +127,18 @@ export default function NotificationSettingsPage() {
               />
             </div>
 
+            <div className="flex items-center justify-between rounded-lg border p-4">
+              <div className="space-y-0.5">
+                <p className="font-medium">Weekly Owner Report</p>
+                <p className="text-sm text-muted-foreground">Monday morning KPI summary with 8-week revenue/profit trend PDF.</p>
+              </div>
+              <Switch
+                checked={settings.weeklyReportEnabled}
+                onCheckedChange={(checked) => setSettings({ ...settings, weeklyReportEnabled: checked })}
+              />
+            </div>
+
+            <p className="pt-2 text-sm font-medium text-muted-foreground">Customer emails — sent to each customer's own address</p>
             <div className="flex items-center justify-between rounded-lg border p-4">
               <div className="space-y-0.5">
                 <p className="font-medium">Monthly Customer Statements</p>
@@ -120,17 +158,6 @@ export default function NotificationSettingsPage() {
               <Switch
                 checked={settings.dueRemindersEnabled}
                 onCheckedChange={(checked) => setSettings({ ...settings, dueRemindersEnabled: checked })}
-              />
-            </div>
-
-            <div className="flex items-center justify-between rounded-lg border p-4">
-              <div className="space-y-0.5">
-                <p className="font-medium">Weekly Owner Report</p>
-                <p className="text-sm text-muted-foreground">Monday morning KPI summary with 8-week revenue/profit trend PDF.</p>
-              </div>
-              <Switch
-                checked={settings.weeklyReportEnabled}
-                onCheckedChange={(checked) => setSettings({ ...settings, weeklyReportEnabled: checked })}
               />
             </div>
           </div>
