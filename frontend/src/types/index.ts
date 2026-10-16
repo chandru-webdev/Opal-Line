@@ -102,6 +102,21 @@ export interface GstReportResult {
   gstin: string
 }
 
+export type PeriodKey = 'today' | 'week' | 'month' | 'year' | 'custom'
+
+/** The custom window chosen for the `custom` period (inclusive `YYYY-MM-DD`). */
+export interface DateRange {
+  start: string
+  end: string
+}
+
+/** Query the dashboard endpoints with one page-wide range. */
+export interface RangeQuery {
+  period: PeriodKey
+  start?: string
+  end?: string
+}
+
 export interface KpiCardData {
   key: string
   label: string
@@ -109,6 +124,8 @@ export interface KpiCardData {
   trend?: Trend
   delta?: string
   deltaLabel?: string
+  /** Label of the range the figures cover, e.g. "This Week". */
+  rangeLabel?: string
   icon: string
   accent: 'purple' | 'green' | 'orange' | 'red' | 'blue' | 'slate'
 }
@@ -353,6 +370,16 @@ export interface AnalyticsStat {
   value: string
   delta?: string
   trend?: Trend
+  rangeLabel?: string
+  prevLabel?: string
+}
+
+/** Revenue rolled up by product category. */
+export interface TopCategory {
+  category: string
+  qty: number
+  weight: number
+  revenue: number
 }
 
 export interface Product {
