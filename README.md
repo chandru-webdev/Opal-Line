@@ -82,6 +82,8 @@ there too, or set them later in the UI.
 
 Default seeded login: **admin / Opal@2026** (change it in Users & Roles).
 
+💡 Dev-mode DB check: after `npm run db:seed`, run `curl http://127.0.0.1:47191/api/v1/health` — it should return `"database":{"healthy":true,...}` confirming the API can reach PostgreSQL.
+
 Run pieces separately: `npm run dev:server` (backend only) or `npm run dev:web`
 (frontend only). All configuration — env vars, in-app settings, Shopify,
 integrations — is documented step-by-step in
@@ -189,19 +191,11 @@ bootstraps the schema (45 tables), the generated admin logs in, and
 dependency is needed on the target machine.
 
 Note: NSIS remembers the last chosen install directory (e.g. from a previous
-`/allusers` test run) and a silent install will reuse it — if the script fails
+/`allusers` test run) and a silent install will reuse it — if the script fails
 on path checks, uninstall via the existing *Uninstall Opal Line Billing*
 entry first, then re-run.
 
-### Run the desktop app from source
 
-```bash
-npm run electron:dev     # backend + Vite + Electron window, one command
-```
-
-The window loads the dev UI at `http://localhost:47195`, so hot reload works
-in the desktop shell too. It runs alongside plain `npm run dev` — the browser
-and the desktop window share one database.
 
 ### Build the installer yourself
 
