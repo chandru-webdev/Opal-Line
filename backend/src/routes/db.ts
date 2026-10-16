@@ -346,6 +346,8 @@ dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), as
       copies: req.body?.copies == null ? 1 : Number(req.body.copies),
       symbology,
       showPrice: req.body?.showPrice !== false,
+      showWeight: req.body?.showWeight !== false,
+      showQR: req.body?.showQR !== false && req.body?.qr !== 'false',
       ...(brandName ? { brand: brandName } : {}),
     })
     const zpl = renderZpl(products, opts)

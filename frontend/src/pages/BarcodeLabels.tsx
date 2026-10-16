@@ -13,6 +13,27 @@ import { toast, confirmDialog } from '@/components/ui/confirm'
 import { dbApi, backupApi } from '@/lib/api'
 import type { Product } from '@/types'
 
+interface LabelFieldDesign {
+  kind: 'brand' | 'name' | 'rate' | 'code' | 'attr1' | 'attr2'
+  /** Left edge of the glyph box, mm. */
+  x: number
+  /** Text baseline measured from the label's top edge, mm. */
+  baseline: number
+  /** `^A0` `h` — ascender to descender, mm. */
+  capHeight: number
+  /** Room the line has before it would run into the QR symbol, mm. */
+  maxWidth: number
+  /** The condensation the reference's own `w` asks for, mm. */
+  refWidth: number
+}
+
+interface LabelDesign {
+  width: number
+  height: number
+  fields: LabelFieldDesign[]
+  qr: { x: number; bottom: number; size: number; magnification: number; modules: number }
+}
+
 interface LabelPreset {
   key: string
   label: string
@@ -21,6 +42,8 @@ interface LabelPreset {
   columns: number
   rows: number
   reference?: boolean
+  /** Transcribed reference geometry, present for the four supplied sizes. */
+  design?: LabelDesign
 }
 
 // Shown until the backend preset list loads. Mirrors LABEL_PRESET_LIST on the
@@ -33,6 +56,77 @@ const FALLBACK_PRESETS: LabelPreset[] = [
 ]
 
 const DEFAULT_PRESET = 'label-50x40'
+
+// Mirrors the renderers in `backend/src/barcodeLabels.ts`.
+const ZPL_EM_RATIO = 0.925
+const ZPL_CAP_RATIO = 718 / 925
+const PREVIEW_WIDTH_PX = 264
+
+/**
+ * Draws a reference label the way the printer lays it out: every line is placed
+ * by the same millimetre geometry the PDF and ZPL renderers use, so the preview
+ * matches the printed label rather than approximating it.
+ */
+function LabelDesignPreview({
+  design,
+  text,
+  showQR,
+}: {
+  design: LabelDesign
+  text: Record<string, string | undefined>
+  showQR: boolean
+}) {
+  const scale = PREVIEW_WIDTH_PX / design.width
+  return (
+    <div
+      className="relative overflow-hidden rounded-md border border-border bg-white text-gray-900"
+      style={{ width: PREVIEW_WIDTH_PX, height: design.height * scale }}
+    >
+      {design.fields.map((field) => {
+        const value = text[field.kind]
+        if (!value) return null
+        // Capitals print at ZPL_CAP_RATIO of `h`, so the em box is h / 0.925 —
+        // exactly what the PDF's font size is.
+        const fontSizeMm = field.capHeight / ZPL_EM_RATIO
+        const condense = field.refWidth / fontSizeMm
+        return (
+          <span
+            key={field.kind}
+            className="absolute whitespace-nowrap font-bold"
+            style={{
+              left: field.x * scale,
+              top: (field.baseline - field.capHeight * ZPL_CAP_RATIO) * scale,
+              fontSize: fontSizeMm * scale,
+              lineHeight: 1,
+              // The transform shrinks the drawn glyphs, so allow for it when
+              // clipping to the column the reference gives the line.
+              width: (field.maxWidth * scale) / condense,
+              overflow: 'hidden',
+              transform: `scaleX(${condense})`,
+              transformOrigin: 'left top',
+              fontFamily: "'Arial Narrow', Arial, Helvetica, sans-serif",
+            }}
+          >
+            {value}
+          </span>
+        )
+      })}
+      {showQR ? (
+        <div
+          className="absolute flex items-center justify-center bg-gray-900 text-white"
+          style={{
+            left: design.qr.x * scale,
+            top: (design.qr.bottom - design.qr.size) * scale,
+            width: design.qr.size * scale,
+            height: design.qr.size * scale,
+          }}
+        >
+          <QrCode className="h-3/4 w-3/4" />
+        </div>
+      ) : null}
+    </div>
+  )
+}
 
 export default function BarcodeLabelsPage() {
   const [searchParams] = useSearchParams()
@@ -312,7 +406,26 @@ export default function BarcodeLabelsPage() {
               <CardTitle className="text-sm">Preview</CardTitle>
             </CardHeader>
             <CardContent>
-              {currentPreset && (
+              {currentPreset && currentPreset.design ? (
+                <div className="flex justify-center">
+                  <LabelDesignPreview
+                    design={currentPreset.design}
+                    showQR={showQR}
+                    text={{
+                      brand: showBrand && brand ? brand : undefined,
+                      name: sample?.name ?? 'Product name',
+                      rate: showPrice
+                        ? `Rate: ${(sample?.sellingPrice ?? 0).toFixed(2)}/-`
+                        : undefined,
+                      code: showQR
+                        ? `${currentPreset.height <= 12 ? '' : 'Code: '}${sample?.barcode || sample?.sku || '—'}`
+                        : undefined,
+                      attr1: sample?.category || undefined,
+                      attr2: showWeight && sample?.netWeight ? `${sample.netWeight}g` : undefined,
+                    }}
+                  />
+                </div>
+              ) : currentPreset ? (
                 <div
                   className="flex w-full flex-col justify-between overflow-hidden rounded-md border border-border bg-white p-1.5 text-[8px] leading-tight text-gray-900"
                   style={{ aspectRatio: `${currentPreset.width} / ${currentPreset.height}` }}
@@ -327,8 +440,8 @@ export default function BarcodeLabelsPage() {
                   <div className="flex items-end justify-between gap-2">
                     <div className="min-w-0">
                       {showPrice ? (
-                        <p className="truncate font-semibold text-emerald-600">
-                          Rate: {(sample?.sellingPrice ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}/-
+                        <p className="truncate font-semibold">
+                          Rate: {(sample?.sellingPrice ?? 0).toFixed(2)}/-
                         </p>
                       ) : null}
                       {showQR ? (
@@ -345,7 +458,7 @@ export default function BarcodeLabelsPage() {
                     ) : null}
                   </div>
                 </div>
-              )}
+              ) : null}
               <p className="mt-2 text-center text-xs text-muted-foreground">
                 {printCount} label{printCount === 1 ? '' : 's'} will be printed
               </p>

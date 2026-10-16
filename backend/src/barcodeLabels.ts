@@ -42,6 +42,299 @@ const DEFAULT_OPTIONS: LabelOptions = {
   copies: 1,
 }
 
+// ─── Reference designs ───────────────────────────────────────────
+// Every number in LABEL_DESIGNS is transcribed from the supplied Zebra `.prn`
+// print streams (authored at 203 dpi = 8 dots per mm) and converted to
+// millimetres, so a printed label lands on the same grid as the samples:
+//
+//   50x40.prn   ^PW799 ^LL320  → two 400×320-dot labels per row (50×40 mm)
+//   50x25.prn   ^PW799 ^LL200  → two 400×200-dot labels per row (50×25 mm)
+//   35x22.prn   ^PW831 ^LL176  → three 280×176-dot labels per row (35×22 mm)
+//   50x 10.prn  ^PW831 ^LL80   → slim strip, content block mapped to 50×10 mm
+//
+// ZPL places a text field on its BASELINE using the scalable `^A0` font's
+// nominal character height, so each field carries a baseline and a cap height;
+// the QR symbol is placed by its left edge and its bottom edge (all four
+// reference streams overflow the label if `^BQN` is read as top-anchored, and
+// all four fit exactly when read as bottom-anchored).
+//
+// The 50×10 stream is authored on 104 mm-wide media with its content starting
+// at 14.75 mm. That content block (52.4 mm of artwork) is mapped into the real
+// 50 mm label — a uniform 0.897× horizontal compression with every height and
+// the reference's left-to-right ordering preserved. Its two right-hand lines
+// share one left edge because a production barcode (12 characters) is longer
+// than the 7-character sample and would otherwise collide with the QR symbol.
+
+/** Helvetica cap height, as a fraction of the em size (Adobe AFM metrics). */
+export const CAP_HEIGHT = 0.718
+
+/**
+ * `^A0N,h,w` measures `h` from ascender to descender rather than to the cap
+ * line. Measuring the supplied reference rasterisations — which are pixel-exact
+ * 203 dpi renderings of the `.prn` streams — confirms the printed capitals are
+ * 718/925 of `h`, i.e. Helvetica's cap height over its cap-plus-descender, and
+ * that the em size is therefore `h / 0.925`. Applying the same relation in the
+ * PDF is what makes both renderers draw type of identical height: an `h` of 53
+ * dots prints 41 dots of capitals on the reference and in the PDF alike.
+ */
+export const ZPL_CAP_RATIO = 0.718 / 0.925
+export const ZPL_EM_RATIO = 0.925
+
+/** Clear space the reference leaves around a QR symbol, in modules. */
+export const QR_QUIET_MODULES = 3
+
+/**
+ * Horizontal compression below which text stops being legible, so a line
+ * shrinks instead of condensing further. Shared with the ZPL renderer so the
+ * two formats make exactly the same decision.
+ */
+export const MIN_TEXT_SCALE = 0.34
+
+export type LabelFieldKind = 'brand' | 'name' | 'rate' | 'code' | 'attr1' | 'attr2'
+
+export interface LabelFieldDesign {
+  kind: LabelFieldKind
+  /** Left edge, mm from the label's left edge. */
+  x: number
+  /** Baseline, mm from the label's top edge. */
+  baseline: number
+  /** The `h` of `^A0N,h,w`, mm; printed capitals are `ZPL_CAP_RATIO` of it. */
+  capHeight: number
+  /** Room before the next block — the QR symbol or the label edge — in mm. */
+  maxWidth: number
+  /** The reference stream's `w` (nominal character width), in mm. */
+  refWidth: number
+}
+
+export interface LabelQrDesign {
+  /** Left edge, mm. */
+  x: number
+  /** Bottom edge, mm from the label's top edge. */
+  bottom: number
+  /** Physical width/height of the symbol, mm. */
+  size: number
+  /** `^BQN,2,<magnification>` at 203 dpi. */
+  magnification: number
+  /** Modules per side of the version the reference was authored for. */
+  modules: number
+}
+
+export interface LabelDesign {
+  width: number
+  height: number
+  fields: LabelFieldDesign[]
+  qr: LabelQrDesign
+}
+
+export const LABEL_DESIGNS: LabelDesign[] = [
+  {
+    width: 50,
+    height: 40,
+    fields: [
+      { kind: 'brand', x: 3.875, baseline: 9.125, capHeight: 6.625, maxWidth: 46.125, refWidth: 7.0 },
+      { kind: 'name', x: 3.375, baseline: 15.375, capHeight: 4.625, maxWidth: 46.625, refWidth: 1.625 },
+      { kind: 'rate', x: 3.125, baseline: 24.125, capHeight: 6.25, maxWidth: 30.75, refWidth: 4.125 },
+      { kind: 'code', x: 3.375, baseline: 30.625, capHeight: 4.0, maxWidth: 30.5, refWidth: 4.75 },
+      { kind: 'attr1', x: 3.375, baseline: 36.125, capHeight: 3.125, maxWidth: 16.75, refWidth: 5.75 },
+      { kind: 'attr2', x: 20.125, baseline: 36.125, capHeight: 3.125, maxWidth: 13.75, refWidth: 5.75 },
+    ],
+    qr: { x: 33.875, bottom: 35.5, size: 15.75, magnification: 6, modules: 21 },
+  },
+  {
+    width: 50,
+    height: 25,
+    fields: [
+      { kind: 'brand', x: 4.125, baseline: 4.875, capHeight: 3.875, maxWidth: 45.875, refWidth: 6.625 },
+      { kind: 'name', x: 3.375, baseline: 8.625, capHeight: 3.0, maxWidth: 46.625, refWidth: 1.625 },
+      { kind: 'rate', x: 3.375, baseline: 13.375, capHeight: 3.75, maxWidth: 31.375, refWidth: 3.75 },
+      { kind: 'code', x: 3.375, baseline: 17.875, capHeight: 3.0, maxWidth: 31.375, refWidth: 3.75 },
+      { kind: 'attr1', x: 3.375, baseline: 22.0, capHeight: 2.625, maxWidth: 13.75, refWidth: 4.75 },
+      { kind: 'attr2', x: 17.125, baseline: 21.75, capHeight: 2.375, maxWidth: 17.625, refWidth: 4.375 },
+    ],
+    qr: { x: 34.75, bottom: 21.625, size: 10.5, magnification: 4, modules: 21 },
+  },
+  {
+    width: 35,
+    height: 22,
+    fields: [
+      { kind: 'brand', x: 2.875, baseline: 4.875, capHeight: 3.875, maxWidth: 32.125, refWidth: 4.375 },
+      { kind: 'name', x: 2.875, baseline: 9.0, capHeight: 3.75, maxWidth: 32.125, refWidth: 1.875 },
+      { kind: 'rate', x: 2.875, baseline: 13.375, capHeight: 3.0, maxWidth: 21.375, refWidth: 2.875 },
+      { kind: 'code', x: 2.875, baseline: 16.875, capHeight: 2.0, maxWidth: 21.375, refWidth: 2.875 },
+      { kind: 'attr1', x: 2.875, baseline: 19.875, capHeight: 2.0, maxWidth: 11.75, refWidth: 3.5 },
+      { kind: 'attr2', x: 14.625, baseline: 19.875, capHeight: 2.0, maxWidth: 9.625, refWidth: 3.75 },
+    ],
+    qr: { x: 24.25, bottom: 20.375, size: 7.875, magnification: 3, modules: 21 },
+  },
+  {
+    width: 50,
+    height: 10,
+    fields: [
+      { kind: 'brand', x: 2.06, baseline: 3.125, capHeight: 2.5, maxWidth: 33.09, refWidth: 3.75 },
+      { kind: 'name', x: 1.5, baseline: 7.25, capHeight: 2.5, maxWidth: 23.22, refWidth: 2.25 },
+      { kind: 'code', x: 24.72, baseline: 3.75, capHeight: 3.125, maxWidth: 16.71, refWidth: 3.125 },
+      { kind: 'rate', x: 24.72, baseline: 7.75, capHeight: 3.5, maxWidth: 16.71, refWidth: 2.5 },
+    ],
+    qr: { x: 41.43, bottom: 9.375, size: 7.875, magnification: 3, modules: 21 },
+  },
+]
+
+/** Look up the transcribed reference design for a physical label size. */
+export function labelDesignFor(width: number, height: number): LabelDesign | null {
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return null
+  const tol = 0.15
+  return (
+    LABEL_DESIGNS.find((d) => Math.abs(d.width - width) <= tol && Math.abs(d.height - height) <= tol) ?? null
+  )
+}
+
+/** Width of one QR module, mm (the streams print at 8 dots per mm). */
+export function qrModuleMm(design: LabelDesign): number {
+  return design.qr.magnification / 8
+}
+
+/** Clear space the reference leaves on every side of a QR symbol, mm. */
+export function qrQuietMm(design: LabelDesign): number {
+  return qrModuleMm(design) * QR_QUIET_MODULES
+}
+
+/**
+ * Top edge of the printed QR symbol, mm.
+ *
+ * The `^FT` in the reference streams marks the bottom of a box that includes
+ * the quiet zone, while its x marks the symbol's own left edge — measuring all
+ * four rasterisations puts the ink at `bottom − (modules + QR_QUIET_MODULES)`,
+ * within a dot every time. `LabelDesign.qr.bottom` keeps the transcribed `^FT`
+ * value so the provenance stays visible.
+ */
+export function qrTopMm(design: LabelDesign): number {
+  return design.qr.bottom - (design.qr.modules + QR_QUIET_MODULES) * qrModuleMm(design)
+}
+
+/**
+ * Room a line has before the next block, mm — the label edge, the QR symbol or
+ * the attribute chip sitting beside it.
+ *
+ * Text is kept `QR_QUIET_MODULES` clear of the QR box: the reference does the
+ * same, and without it a long product name or rate would run straight into the
+ * symbol's quiet zone and stop scanning.
+ */
+export function fieldMaxWidthMm(
+  design: LabelDesign,
+  field: LabelFieldDesign,
+  showQR: boolean,
+): number {
+  const quiet = qrQuietMm(design)
+  let maxWidth = showQR ? field.maxWidth : design.width - field.x
+
+  // Two attribute chips share a row; leave room between them.
+  const sibling = design.fields.find((f) => f.kind === 'attr2')
+  if (field.kind === 'attr1' && sibling && sibling.x > field.x) {
+    maxWidth = Math.min(maxWidth, sibling.x - field.x - quiet)
+  }
+
+  if (!showQR || field.x >= design.qr.x) return Math.max(0, maxWidth)
+
+  // Only lines whose row actually crosses the QR box are pushed left of it.
+  const boxTop = qrTopMm(design) - quiet
+  const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
+  const overlap = Math.min(field.baseline, design.qr.bottom) - Math.max(capTop, boxTop)
+  if (overlap > field.capHeight * ZPL_CAP_RATIO * 0.25) {
+    maxWidth = Math.min(maxWidth, design.qr.x - quiet - field.x)
+  }
+  return Math.max(0, maxWidth)
+}
+
+// Helvetica-Bold advance widths (1000 units per em) for printable ASCII. Used
+// to condense text the same way in the ZPL output, where the printer's own
+// scalable font does the rendering and there is nothing to measure against.
+const HELVETICA_BOLD_WIDTHS: Record<string, number> = {
+  ' ': 278, '!': 333, '"': 474, '#': 556, $: 556, '%': 889, '&': 722, "'": 238,
+  '(': 333, ')': 333, '*': 389, '+': 584, ',': 278, '-': 333, '.': 278, '/': 278,
+  '0': 556, '1': 556, '2': 556, '3': 556, '4': 556, '5': 556, '6': 556, '7': 556,
+  '8': 556, '9': 556, ':': 333, ';': 333, '<': 584, '=': 584, '>': 584, '?': 611,
+  '@': 975, A: 722, B: 722, C: 722, D: 722, E: 667, F: 611, G: 778, H: 722, I: 278,
+  J: 556, K: 722, L: 611, M: 833, N: 722, O: 778, P: 667, Q: 778, R: 722, S: 667,
+  T: 611, U: 722, V: 667, W: 944, X: 667, Y: 667, Z: 611, '[': 333, '\\': 278,
+  ']': 333, '^': 584, _: 556, '`': 333, a: 556, b: 611, c: 556, d: 611, e: 556,
+  f: 333, g: 611, h: 611, i: 278, j: 278, k: 556, l: 278, m: 889, n: 611, o: 611,
+  p: 611, q: 611, r: 389, s: 556, t: 333, u: 611, v: 556, w: 778, x: 556, y: 556,
+  z: 500, '{': 389, '|': 280, '}': 389, '~': 584,
+}
+
+/** Width of `text` in em units for Helvetica-Bold. Unknown glyphs use the average. */
+export function textEmWidth(text: string): number {
+  let sum = 0
+  let counted = 0
+  for (const ch of text) {
+    const w = HELVETICA_BOLD_WIDTHS[ch]
+    if (w === undefined) continue
+    sum += w
+    counted++
+  }
+  return counted === 0 ? text.length * 0.556 : sum / 1000
+}
+
+/**
+ * The optional chips the reference prints in its bottom row ("FUY"/"BW" in the
+ * samples). They are filled from real product data only — a missing value
+ * simply leaves the slot empty, so no placeholder is ever printed.
+ */
+export function labelAttributes(product: LabelLineInput, opts: LabelLineOptions): string[] {
+  const out: string[] = []
+  if (product.category) out.push(String(product.category))
+  if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
+  return out
+}
+
+export interface DesignFieldText {
+  kind: LabelFieldKind
+  text: string
+}
+
+/** Resolve which strings each reference field should print for one product. */
+export function designFieldTexts(
+  product: LabelLineInput,
+  opts: LabelLineOptions,
+  design: LabelDesign,
+): DesignFieldText[] {
+  const out: DesignFieldText[] = []
+  const attrs = labelAttributes(product, opts)
+  for (const field of design.fields) {
+    switch (field.kind) {
+      case 'brand': {
+        const brand = (opts.brand ?? '').trim()
+        if (opts.showBrand !== false && brand) out.push({ kind: 'brand', text: brand })
+        break
+      }
+      case 'name': {
+        // Every reference size prints a name line; a product without one still
+        // gets the placeholder rather than an empty field.
+        const name = String(product.name ?? '').trim() || 'Product'
+        out.push({ kind: 'name', text: name })
+        break
+      }
+      case 'rate':
+        if (opts.showPrice !== false) out.push({ kind: 'rate', text: formatLabelRate(product.price) })
+        break
+      case 'code': {
+        const code = labelCode(product)
+        // The slim 50×10 reference prints the bare identifier; every other size
+        // prefixes it with "Code:" exactly like the samples.
+        if (code) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
+        break
+      }
+      case 'attr1':
+        if (attrs[0]) out.push({ kind: 'attr1', text: attrs[0] })
+        break
+      case 'attr2':
+        if (attrs[1]) out.push({ kind: 'attr2', text: attrs[1] })
+        break
+    }
+  }
+  return out
+}
+
 // ─── Label presets ────────────────────────────────────────────────
 // `columns`/`rows` describe how many labels are laid out per A4 sheet; they are
 // derived from the physical label size so the grid always fits the page.
@@ -73,6 +366,12 @@ export interface LabelPresetMeta {
   rows: number
   /** The four sizes supplied as physical design references. */
   reference: boolean
+  /**
+   * The transcribed reference geometry (millimetres), when this preset is one
+   * of the four supplied sizes. The print UI uses it to draw a preview that
+   * matches the printed label exactly instead of an approximation.
+   */
+  design?: LabelDesign
 }
 
 const REFERENCE_PRESETS = ['label-50x40', 'label-50x25', 'label-50x10', 'label-35x22']
@@ -88,6 +387,7 @@ export const LABEL_PRESET_LIST: LabelPresetMeta[] = Object.entries(LABEL_PRESETS
     columns: v.columns,
     rows: v.rows,
     reference: REFERENCE_PRESETS.includes(key),
+    design: labelDesignFor(v.width, v.height) ?? undefined,
   }
 })
 
@@ -166,16 +466,24 @@ export function labelCode(product: Pick<ProductLabel, 'barcode' | 'sku'>): strin
   return (product.barcode && product.barcode.trim()) || (product.sku ?? '').trim()
 }
 
-async function generateQRBuffer(data: string, size: number): Promise<Buffer | null> {
+/**
+ * Render the scannable symbol to a PNG sized so that one QR module is a whole
+ * number of pixels. The reference streams encode at error-correction level L
+ * (`^FDLA,<data>` means "level L, auto data type"), and keeping the module count
+ * whole is what stops a tiny label's code from being blurred by resampling.
+ */
+async function generateQRBuffer(data: string, sizeMm: number): Promise<Buffer | null> {
   try {
+    const qr = await QRCode.create(data, { errorCorrectionLevel: 'L' })
+    const modules = qr.modules.size
+    // ~12 device pixels per point keeps the symbol crisp on a high-res print.
+    const targetPx = mmToPt(sizeMm) * 12
+    const px = Math.max(modules, Math.round(targetPx / modules) * modules)
     return await QRCode.toBuffer(data, {
-      width: Math.max(1, Math.round(size)),
+      width: px,
       margin: 0,
-      // Short labels leave the code very little room. A lower error-correction
-      // level keeps the module count (and therefore each physical module) as
-      // large as possible, which is what keeps a tiny code scanable.
-      errorCorrectionLevel: size < 32 ? 'L' : 'M',
-      color: { dark: '#1a1a2e', light: '#ffffff' },
+      errorCorrectionLevel: 'L',
+      color: { dark: '#000000', light: '#ffffff' },
     })
   } catch {
     return null
@@ -253,10 +561,15 @@ export interface LabelLineOptions {
 
 const LINE_HEIGHT = 1.15
 
-/** Format the reference "Rate: 99999.00/-" string from a numeric price. */
+/**
+ * Format the reference "Rate: 99999.00/-" string from a numeric price.
+ *
+ * The supplied samples print the amount without a thousands separator, and the
+ * PDF and the ZPL must agree byte-for-byte, so this is the single source.
+ */
 export function formatLabelRate(price: number): string {
   const value = Number.isFinite(price) ? price : 0
-  return `Rate: ${value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/-`
+  return `Rate: ${value.toFixed(2)}/-`
 }
 
 export function computeLabelLines(
@@ -371,18 +684,11 @@ function drawLabel(
   product: ProductLabel,
   actualX: number,
   actualY: number,
-  labelW: number,
-  labelH: number,
   geometry: LabelGeometry,
   opts: LabelOptions,
   qrBuffer: Buffer | null,
 ): void {
-  // Border
-  doc.save()
-  doc.roundedRect(actualX + 1, actualY + 1, labelW - 2, labelH - 2, 2).lineWidth(0.3).stroke('#e5e7eb')
-  doc.restore()
-
-  // Scannable code on the right, vertically centred (reference placement).
+  // Scannable code on the right, vertically centred (legacy adaptive layout).
   if (opts.showQR && qrBuffer && geometry.qrSize > 0) {
     const qrY = actualY + geometry.pad + Math.max((geometry.innerH - geometry.qrSize) / 2, 0)
     doc.image(qrBuffer, actualX + geometry.qrX, qrY, {
@@ -427,6 +733,151 @@ function drawLabel(
   }
 }
 
+// ─── Reference-design rendering ──────────────────────────────────
+// Black on white, bold condensed type, tight spacing — the same look the
+// supplied print streams produce. No borders, cards or tinted text: the
+// samples are plain white labels and any decoration would show up on paper.
+
+const LABEL_INK = '#000000'
+
+export interface FittedDesignText {
+  text: string
+  /** Horizontal compression applied so the line stays inside its column. */
+  scale: number
+  /** PDF font size in points — the em size behind the line's height. */
+  fontSize: number
+}
+
+/** How much of its reference em size a line may give up before it is shortened. */
+const MIN_CAP_RATIO = 0.5
+const CAP_SHRINK = 0.88
+
+/**
+ * Condense a line the way the reference's narrow scalable font does, while
+ * keeping the reference's height wherever possible.
+ *
+ * Two things limit the line: the width the reference's own `w` parameter asks
+ * for (`baseScale`, the condensation its design intends) and the column it has
+ * to live in. Whichever is tighter wins, so a line matches the sample for
+ * ordinary product names and can never run under the QR symbol. A line that
+ * still will not fit is first given a slightly smaller em size — what a label
+ * designer would do — and only shortened with an ellipsis as a last resort, so
+ * it is never clipped and never overlaps its neighbours.
+ */
+export function fitDesignText(
+  measure: (text: string, fontSize: number) => number,
+  text: string,
+  fontSizePt: number,
+  maxWidthPt: number,
+  baseScale: number,
+): FittedDesignText {
+  const floor = Math.min(MIN_TEXT_SCALE, baseScale)
+  const shrinkFloor = fontSizePt * MIN_CAP_RATIO
+
+  for (let fs = fontSizePt, i = 0; i < 12; fs *= CAP_SHRINK, i++) {
+    const natural = measure(text, fs)
+    if (natural <= 0 || maxWidthPt / natural >= floor) {
+      return { text, scale: natural > 0 ? Math.min(baseScale, maxWidthPt / natural) : baseScale, fontSize: fs }
+    }
+    if (fs <= shrinkFloor) break
+  }
+
+  // Last resort: shorten the line until it condenses within tolerance.
+  const fontSize = shrinkFloor
+  const ellipsis = '\u2026'
+  const fits = (candidate: string): boolean => {
+    const natural = measure(candidate, fontSize)
+    return natural <= 0 || maxWidthPt / natural >= floor
+  }
+  let lo = 0
+  let hi = text.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (fits(text.slice(0, mid).trimEnd() + ellipsis)) lo = mid
+    else hi = mid - 1
+  }
+  const trimmed = lo > 0 ? text.slice(0, lo).trimEnd() + ellipsis : text.slice(0, 1)
+  const natural = measure(trimmed, fontSize)
+  return {
+    text: trimmed,
+    scale: natural > 0 ? Math.min(baseScale, maxWidthPt / natural) : baseScale,
+    fontSize,
+  }
+}
+
+/**
+ * The same decision as {@link fitDesignText}, expressed in the printer's units:
+ * returns the `h` and `w` of `^A0N,h,w` for one line. Exported so the ZPL
+ * renderer condenses text by exactly the rules the PDF uses.
+ */
+export function fitDesignField(
+  text: string,
+  maxWidthDots: number,
+  refHeightDots: number,
+  refWidthDots: number,
+): { h: number; w: number } {
+  const em = textEmWidth(text)
+  // Condensation `w` produces at this height — the PDF's `baseScale`.
+  const baseScale = refWidthDots / (refHeightDots / ZPL_EM_RATIO)
+  const floor = Math.min(MIN_TEXT_SCALE, baseScale)
+  const shrinkFloor = Math.max(4, Math.round(refHeightDots * MIN_CAP_RATIO))
+  const fitWidth = (): number =>
+    em > 0 ? Math.max(4, Math.min(refWidthDots, Math.floor(maxWidthDots / em))) : refWidthDots
+
+  for (let h = refHeightDots; ; h = Math.max(shrinkFloor, Math.round(h * CAP_SHRINK))) {
+    const w = fitWidth()
+    if (em <= 0 || w / (h / ZPL_EM_RATIO) >= floor) return { h, w }
+    if (h <= shrinkFloor) return { h, w }
+  }
+}
+
+/** Draw one label following a transcribed reference design. */
+function drawDesignLabel(
+  doc: PDFKit.PDFDocument,
+  product: ProductLabel,
+  design: LabelDesign,
+  originX: number,
+  originY: number,
+  opts: LabelOptions,
+  qrBuffer: Buffer | null,
+): void {
+  const texts = designFieldTexts(product, opts, design)
+  const fields = new Map(design.fields.map((f) => [f.kind, f]))
+  const measure = (text: string, fontSize: number): number => {
+    doc.font('Helvetica-Bold').fontSize(fontSize)
+    return doc.widthOfString(text)
+  }
+
+  for (const entry of texts) {
+    const field = fields.get(entry.kind)
+    if (!field) continue
+    // The reference's `h` spans ascender to descender: the em size behind it is
+    // `h / 0.925`, and `w` over that em size is the condensation it asks for.
+    const fontSizeMm = field.capHeight / ZPL_EM_RATIO
+    const baseScale = field.refWidth / fontSizeMm
+    const maxWidthMm = fieldMaxWidthMm(design, field, opts.showQR !== false)
+    const fitted = fitDesignText(measure, entry.text, mmToPt(fontSizeMm), mmToPt(maxWidthMm), baseScale)
+    doc.save()
+    // PDFKit positions the top of the ascender; the reference positions the
+    // baseline, so the box top sits one printed cap height above it.
+    const capDrawnPt = fitted.fontSize * CAP_HEIGHT
+    doc.translate(originX + mmToPt(field.x), originY + mmToPt(field.baseline) - capDrawnPt)
+    doc.scale(fitted.scale, 1)
+    doc.font('Helvetica-Bold').fontSize(fitted.fontSize).fillColor(LABEL_INK)
+    doc.text(fitted.text, 0, 0, { lineBreak: false })
+    doc.restore()
+  }
+
+  if (opts.showQR !== false && qrBuffer) {
+    doc.image(
+      qrBuffer,
+      originX + mmToPt(design.qr.x),
+      originY + mmToPt(qrTopMm(design)),
+      { width: mmToPt(design.qr.size), height: mmToPt(design.qr.size) },
+    )
+  }
+}
+
 export async function generateLabelsPDF(
   products: ProductLabel[],
   options: Partial<LabelOptions> = {}
@@ -441,6 +892,9 @@ export async function generateLabelsPDF(
 
   const labelW = mmToPt(resolved.width)
   const labelH = mmToPt(resolved.height)
+  // The four supplied sizes print from their transcribed reference design; any
+  // other (legacy) size keeps the adaptive layout it has always used.
+  const design = labelDesignFor(resolved.width, resolved.height)
   const geometry = computeLabelGeometry(labelW, labelH, resolved.showQR)
 
   const copies = Math.min(Math.max(Math.floor(resolved.copies) || 1, 1), 999)
@@ -448,10 +902,12 @@ export async function generateLabelsPDF(
   for (const product of products) for (let i = 0; i < copies; i++) expanded.push(product)
 
   // Pre-generate all QR codes at the exact size the layout will draw them.
+  // `geometry.qrSize` is in points, so convert it before sharing one path.
+  const qrSizeMm = design ? design.qr.size : (geometry.qrSize * 25.4) / 72
   const qrBuffers: (Buffer | null)[] = []
-  if (resolved.showQR && geometry.qrSize > 0) {
+  if (resolved.showQR && qrSizeMm > 0) {
     for (const product of expanded) {
-      qrBuffers.push(await generateQRBuffer(labelCode(product), geometry.qrSize))
+      qrBuffers.push(await generateQRBuffer(labelCode(product), qrSizeMm))
     }
   }
 
@@ -482,7 +938,11 @@ export async function generateLabelsPDF(
       const actualY = startY + row * labelH
       const actualX = startX + col * labelW
 
-      drawLabel(doc, product, actualX, actualY, labelW, labelH, geometry, resolved, qrBuffers[i] ?? null)
+      if (design) {
+        drawDesignLabel(doc, product, design, actualX, actualY, resolved, qrBuffers[i] ?? null)
+      } else {
+        drawLabel(doc, product, actualX, actualY, geometry, resolved, qrBuffers[i] ?? null)
+      }
 
       // Advance position
       col++

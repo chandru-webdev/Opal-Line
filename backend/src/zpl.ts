@@ -16,7 +16,7 @@
 // port — the caller decides how to deliver it (file download for a ZPL-capable
 // printer / print server), so a browser can never be asked to open a socket.
 
-import { labelCode, LABEL_PRESETS, type ProductLabel } from './barcodeLabels'
+import { labelCode, LABEL_PRESETS, labelDesignFor, designFieldTexts, fitDesignField, fieldMaxWidthMm, type LabelDesign, type ProductLabel } from './barcodeLabels'
 
 export const ZPL_DOTS_PER_MM = 8
 export const ZPL_MAX_MM = 200
@@ -30,6 +30,8 @@ export interface ZplOptions {
   symbology?: ZplSymbology
   brand?: string
   showPrice?: boolean
+  showWeight?: boolean
+  showQR?: boolean
 }
 
 export interface ZplLabelInput extends ProductLabel {}
@@ -105,10 +107,96 @@ function computeGeometry(width: number, height: number): ZplGeometry {
   }
 }
 
+// ─── Reference-design ZPL ────────────────────────────────────────
+// Emits the same `^FT`/`^A0N`/`^BQ` grid the supplied `.prn` streams use, so a
+// ZPL-capable printer lays the label out identically to the samples.
+
+/**
+ * Fit one line of `^A0N,h,w`.
+ *
+ * `w` is the nominal character width the reference stream asks for, capped by
+ * the room the line actually has so nothing runs under the QR symbol; `h` only
+ * drops when a line is so long that no readable size would hold it. The rules
+ * live in `barcodeLabels.ts` and are shared with the PDF, which is what keeps
+ * the two formats' layouts in step.
+ */
+function zplFitLine(text: string, maxWidthDots: number, refHeightMm: number, refWidthMm: number): string {
+  const fitted = fitDesignField(
+    text,
+    maxWidthDots,
+    Math.round(refHeightMm * ZPL_DOTS_PER_MM),
+    Math.round(refWidthMm * ZPL_DOTS_PER_MM),
+  )
+  return `${fitted.h},${fitted.w}`
+}
+
+function zplDesignLabel(product: ZplLabelInput, options: ZplOptions, design: LabelDesign): string | null {
+  const copies = Math.min(Math.max(Math.floor(options.copies ?? 1) || 1, 1), 999)
+  const symbology: ZplSymbology = options.symbology === 'code128' ? 'code128' : 'qr'
+  const showQR = options.showQR !== false
+
+  const fieldTexts = designFieldTexts(
+    product,
+    {
+      showPrice: options.showPrice !== false,
+      showWeight: options.showWeight !== false,
+      showBrand: true,
+      brand: options.brand ?? '',
+    },
+    design,
+  )
+  const fields = new Map(design.fields.map((f) => [f.kind, f]))
+
+  const lines: string[] = []
+  lines.push('^XA')
+  lines.push('^CI28')
+  lines.push(`^PW${mmToDots(design.width)}`)
+  lines.push(`^LL${mmToDots(design.height)}`)
+  lines.push('^MMT')
+  lines.push('^LS0')
+  lines.push('^LH0,0')
+
+  for (const entry of fieldTexts) {
+    const field = fields.get(entry.kind)
+    if (!field) continue
+    const maxWidthMm = fieldMaxWidthMm(design, field, showQR)
+    const hw = zplFitLine(entry.text, mmToDots(maxWidthMm), field.capHeight, field.refWidth)
+    lines.push(
+      `^FT${mmToDots(field.x)},${mmToDots(field.baseline)}^A0N,${hw}^FH\\^FD${zplEscape(entry.text)}^FS`,
+    )
+  }
+
+  const code = labelCode(product)
+  if (showQR && code) {
+    // `^FT` + `^BQN` are emitted verbatim from the reference stream: the
+    // printer applies its own quiet-zone anchoring, which is exactly what the
+    // supplied samples show, so ZPL output lands where the reference does.
+    if (symbology === 'qr') {
+      lines.push(
+        `^FT${mmToDots(design.qr.x)},${mmToDots(design.qr.bottom)}^BQN,2,${design.qr.magnification}`,
+      )
+      lines.push(`^FH\\^FDLA,${code}^FS`)
+    } else {
+      // A linear symbol has no quiet-zone square to anchor on: `^FT` marks its
+      // top-left corner, so it is raised by its own height.
+      const barHeight = mmToDots(design.qr.size)
+      lines.push(`^FT${mmToDots(design.qr.x)},${mmToDots(design.qr.bottom) - barHeight}^BCN,${barHeight},Y,N,N`)
+      lines.push(`^FH\\^FD${code}^FS`)
+    }
+  }
+
+  lines.push(`^PQ${copies},0,1,Y`)
+  lines.push('^XZ')
+  return lines.join('\n')
+}
+
 /** Content for a single ZPL label block. Exported for tests. */
 export function zplLabel(product: ZplLabelInput, options: ZplOptions): string | null {
   const error = zplDimensionError(options.width, options.height)
   if (error) return null
+
+  const design = labelDesignFor(options.width, options.height)
+  if (design) return zplDesignLabel(product, options, design)
 
   const g = computeGeometry(options.width, options.height)
   const symbology: ZplSymbology = options.symbology === 'code128' ? 'code128' : 'qr'
@@ -179,5 +267,7 @@ export function zplOptionsForPreset(preset: string | undefined, overrides: Parti
     symbology: overrides.symbology ?? 'qr',
     brand: overrides.brand ?? 'Opal Line',
     showPrice: overrides.showPrice ?? true,
+    showWeight: overrides.showWeight ?? true,
+    showQR: overrides.showQR ?? true,
   }
 }

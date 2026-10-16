@@ -77,7 +77,10 @@ test('labelCode prefers the product barcode and falls back to SKU', () => {
 })
 
 test('formatLabelRate matches the reference "Rate: x/-" shape', () => {
-  assert.equal(formatLabelRate(99999), 'Rate: 99,999.00/-')
+  // The supplied `.prn` samples print the amount without a thousands
+  // separator, and the PDF and the ZPL must agree on the exact string.
+  assert.equal(formatLabelRate(99999), 'Rate: 99999.00/-')
+  assert.equal(formatLabelRate(1234.5), 'Rate: 1234.50/-')
   assert.equal(formatLabelRate(0), 'Rate: 0.00/-')
   assert.equal(formatLabelRate(Number.NaN), 'Rate: 0.00/-')
 })
