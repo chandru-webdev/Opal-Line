@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
+import { ImagePlus, Loader2, Plus, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -14,6 +14,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
+import { toast } from '@/components/ui/confirm'
 import type { Product, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
 import { todayIST } from '@/lib/format'
@@ -210,6 +211,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
   // Collection names already used by products (loaded once per mount) so the
   // collection picker can offer them alongside the built-in categories.
   const [collectionChoices, setCollectionChoices] = useState<string[]>([])
+  const [barcodeBusy, setBarcodeBusy] = useState(false)
   const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -236,8 +238,25 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
     }
   }, [open, mode, product])
 
-  const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
-    setForm((f) => {
+  // Edit mode: the product already exists, so the server can assign a real,
+  // globally-unique barcode immediately. In add mode we leave the field blank
+  // and the backend generates one on save (see createProductHandler).
+  const generateBarcode = async () => {
+    if (!product?.id) return
+    setBarcodeBusy(true)
+    try {
+      const res = await dbApi.generateProductBarcode(product.id)
+      set('barcode', res.barcode)
+      setError('')
+      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not generate a barcode')
+    } finally {
+      setBarcodeBusy(false)
+    }
+  }
+
+  const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {    setForm((f) => {
       const next = { ...f, [key]: value }
       const p = computePrice(next)
       if (Number.isFinite(p)) next.sellingPrice = String(Math.round(p * 100) / 100)
@@ -436,7 +455,31 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved }: Pr
                 <Input value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. SLV-RNG-00001" />
               </Field>
               <Field label="Barcode">
-                <Input value={form.barcode} onChange={(e) => set('barcode', e.target.value)} placeholder="12-digit EAN" />
+                <div className="flex gap-1.5">
+                  <Input
+                    value={form.barcode}
+                    onChange={(e) => set('barcode', e.target.value)}
+                    placeholder={mode === 'edit' ? 'Code encoded in the label' : 'Auto-generated if left blank'}
+                    className="font-mono"
+                  />
+                  {mode === 'edit' && product?.id ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      disabled={barcodeBusy}
+                      onClick={generateBarcode}
+                      title="Generate a unique barcode"
+                    >
+                      <Wand2 className={cn('h-4 w-4', barcodeBusy && 'animate-pulse')} />
+                    </Button>
+                  ) : null}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {mode === 'edit'
+                    ? 'This exact value is encoded in the printed QR/barcode.'
+                    : 'Leave blank to generate a unique barcode automatically on save.'}
+                </p>
               </Field>
               <Field label="HUID (Hallmark)">
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />

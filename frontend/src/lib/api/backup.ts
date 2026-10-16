@@ -6,7 +6,7 @@ import type {
   SystemPortsInfo,
   SystemStatusInfo,
 } from '@/types'
-import { API_BASE, request } from './core'
+import { API_BASE, request, requestText } from './core'
 
 export interface BackupResult {
   ok: boolean
@@ -226,14 +226,38 @@ export const backupApi = {
       method: 'POST',
       body: JSON.stringify({ to }),
     }),
-  downloadAllLabels: (opts?: { preset?: string; showPrice?: boolean; showWeight?: boolean; showQR?: boolean; ids?: string[] }) => {
+  downloadAllLabels: (opts?: { preset?: string; showPrice?: boolean; showWeight?: boolean; showQR?: boolean; showBrand?: boolean; copies?: number; brandName?: string; ids?: string[] }) => {
     const params = new URLSearchParams()
     if (opts?.preset) params.set('preset', opts.preset)
     if (opts?.showPrice === false) params.set('price', 'false')
     if (opts?.showWeight === false) params.set('weight', 'false')
     if (opts?.showQR === false) params.set('qr', 'false')
+    if (opts?.showBrand === false) params.set('brand', 'false')
+    if (opts?.copies && opts.copies > 1) params.set('copies', String(opts.copies))
+    if (opts?.brandName) params.set('brandName', opts.brandName)
     if (opts?.ids && opts.ids.length > 0) params.set('ids', opts.ids.join(','))
     window.open(`${API_BASE}/db/products/labels?${params.toString()}`, '_blank', 'noopener')
+  },
+  /**
+   * Raw ZPL for a ZPL-capable label printer / print server. Saves the returned
+   * text as a `.zpl` file — it is never written to a raw printer port.
+   */
+  downloadLabelsZpl: async (
+    productIds: string[],
+    opts?: { preset?: string; copies?: number; format?: 'qr' | 'code128'; showPrice?: boolean; brandName?: string },
+  ): Promise<string> => {
+    const text = await requestText('/db/products/labels/zpl', {
+      method: 'POST',
+      body: JSON.stringify({ productIds, ...opts }),
+    })
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `product-labels-${Date.now()}.zpl`
+    a.click()
+    URL.revokeObjectURL(url)
+    return text
   },
   downloadCatalogPdf: () => {
     window.open(`${API_BASE}/db/products/catalog-pdf`, '_blank', 'noopener')
@@ -243,7 +267,7 @@ export const backupApi = {
       method: 'POST',
       body: JSON.stringify({ productIds, ...opts }),
     }),
-  getLabelPresets: (): Promise<Array<{ key: string; width: number; height: number; columns: number; rows: number }>> =>
+  getLabelPresets: (): Promise<Array<{ key: string; label: string; width: number; height: number; columns: number; rows: number; reference: boolean }>> =>
     request('/db/products/labels/presets'),
   whatsappStatus: (): Promise<{ configured: boolean }> =>
     request('/backup/whatsapp/status'),

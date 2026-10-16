@@ -84,6 +84,8 @@ export const products = pgTable('products', {
   statusIdx: index('products_status_idx').on(table.status),
   shopifyStatusIdx: index('products_shopify_status_idx').on(table.shopifyStatus),
   supplierIdIdx: index('products_supplier_id_idx').on(table.supplierId),
+  barcodeIdx: index('products_barcode_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
+  barcodeUniqueIdx: uniqueIndex('products_barcode_unique_idx').on(table.barcode).where(sql`${table.barcode} is not null and ${table.barcode} <> ''`),
   nameSearchIdx: index('products_name_search_idx').using('gin', sql`to_tsvector('english', ${table.name})`),
 }))
 

@@ -57,6 +57,13 @@
       "when": 1788855000000,
       "tag": "0007_shipments_notif_log",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789000000000,
+      "tag": "0008_product_barcode_index",
+      "breakpoints": true
     }
   ]
 }
