@@ -4,6 +4,7 @@ import * as schema from './db/schema'
 import { logger } from './logger'
 import { generateCustomerStatementPDF } from './statements'
 import { notifyCustomerStatement } from './notifications'
+import { loadNotificationPrefs } from './notificationPrefs'
 import { createScheduler } from './lib/scheduler'
 
 /**
@@ -25,9 +26,14 @@ function msUntilNextRun(now = new Date()): number {
   return next.getTime() - now.getTime()
 }
 
-async function runMonthlyStatements(): Promise<void> {
+export async function runMonthlyStatements(): Promise<void> {
   try {
     if (!db) return
+    const prefs = await loadNotificationPrefs()
+    if (!prefs.monthlyStatementsEnabled) {
+      logger.info('Monthly customer statements skipped — disabled in notification settings')
+      return
+    }
     // customers with an email and at least one invoice
     const rows = await db
       .select({ customer: schema.salesInvoices.customer, email: schema.customers.email })

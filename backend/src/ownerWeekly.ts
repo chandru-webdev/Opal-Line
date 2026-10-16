@@ -4,6 +4,7 @@ import { db } from './db/client'
 import * as schema from './db/schema'
 import { logger } from './logger'
 import { sendEmail } from './notifications'
+import { loadNotificationPrefs, resolveOwnerRecipient } from './notificationPrefs'
 import { createScheduler } from './lib/scheduler'
 
 /**
@@ -129,10 +130,15 @@ export async function generateWeeklyReportPDF(weeks: WeekPoint[]): Promise<Buffe
   return done
 }
 
-async function runWeeklyOwnerReport(): Promise<void> {
+export async function runWeeklyOwnerReport(): Promise<void> {
   try {
+    const prefs = await loadNotificationPrefs()
+    if (!prefs.weeklyReportEnabled) {
+      logger.info('Weekly owner report skipped — disabled in notification settings')
+      return
+    }
     const [settingsRow] = await db!.select().from(schema.settings).where(sql`${schema.settings.id} = 'app'`).limit(1)
-    const recipient = process.env.NOTIFICATION_EMAIL?.trim() || settingsRow?.email?.trim()
+    const recipient = resolveOwnerRecipient(prefs, settingsRow?.email)
     if (!recipient) return
     const weeks = await collectWeeklyTrend()
     if (weeks.length === 0) return

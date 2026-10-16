@@ -5,6 +5,7 @@ import { logger } from './logger'
 import { recordActivity } from './activity'
 import { collectSupplierDues } from './purchases'
 import { sendEmail } from './notifications'
+import { loadNotificationPrefs, resolveOwnerRecipient } from './notificationPrefs'
 import { escapeHtml } from './htmlEscape'
 import { createScheduler } from './lib/scheduler'
 
@@ -45,16 +46,14 @@ function dayKey(d = new Date()): string {
 }
 
 async function recipient(): Promise<string> {
-  const env = String(process.env.NOTIFICATION_EMAIL ?? '').trim()
-  if (env) return env
-  if (!db) return ''
+  const prefs = await loadNotificationPrefs()
+  if (!db) return prefs.recipientEmail
   const [row] = await db
-    .select({ email: schema.settings.email, notify: schema.settings.notificationSettings })
+    .select({ email: schema.settings.email })
     .from(schema.settings)
     .where(eq(schema.settings.id, 'app'))
     .limit(1)
-  const fromSettings = String((row?.notify as { recipientEmail?: string } | null)?.recipientEmail ?? '').trim()
-  return fromSettings || String(row?.email ?? '').trim()
+  return resolveOwnerRecipient(prefs, row?.email)
 }
 
 /**
