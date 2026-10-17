@@ -205,7 +205,7 @@ export default function Bookings() {
       </Card>
 
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-        <DialogContent className="max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>New booking order</DialogTitle>
             <DialogDescription>Record the order and any advance collected. Convert to an invoice later — the advance is credited automatically.</DialogDescription>
@@ -218,8 +218,10 @@ export default function Bookings() {
             <div className="space-y-2">
               <p className="text-xs font-medium">Items *</p>
               {items.map((it, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input className="flex-1" placeholder="Product" value={it.product} onChange={(e) => setItems((arr) => arr.map((x, j) => (j === i ? { ...x, product: e.target.value } : x)))} />
+                // flex-wrap + full-width product on phones: sku/qty/price
+                // can't all fit beside the product input on a 390px screen.
+                <div key={i} className="flex flex-wrap items-center gap-2">
+                  <Input className="min-w-0 w-full flex-1 sm:w-auto" placeholder="Product" value={it.product} onChange={(e) => setItems((arr) => arr.map((x, j) => (j === i ? { ...x, product: e.target.value } : x)))} />
                   <Input className="w-28" placeholder="SKU" value={it.sku} onChange={(e) => setItems((arr) => arr.map((x, j) => (j === i ? { ...x, sku: e.target.value } : x)))} />
                   <Input className="w-16" type="number" min={1} value={it.qty} onChange={(e) => setItems((arr) => arr.map((x, j) => (j === i ? { ...x, qty: Number(e.target.value) || 1 } : x)))} />
                   <Input className="w-24" type="number" min={0} placeholder="₹" value={it.price || ''} onChange={(e) => setItems((arr) => arr.map((x, j) => (j === i ? { ...x, price: Number(e.target.value) || 0 } : x)))} />

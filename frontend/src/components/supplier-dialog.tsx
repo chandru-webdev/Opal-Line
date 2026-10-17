@@ -1,14 +1,7 @@
 import * as React from 'react'
 import { Loader2, Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -98,12 +91,24 @@ export function SupplierDialog({
       : 'Register a new silver supplier with contact details.'
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
+    <AppDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      size="2xl"
+      title={title}
+      description={description}
+      footer={
+        <div className="flex flex-row justify-end gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button onClick={handleSubmit} disabled={saving}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : mode === 'add' ? <Plus className="h-4 w-4" /> : null}
+            {mode === 'add' ? 'Add Supplier' : 'Save Changes'}
+          </Button>
+        </div>
+      }
+    >
 
         <div className="grid gap-4">
           <Field label="Supplier Name *">
@@ -182,18 +187,7 @@ export function SupplierDialog({
 
           {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
         </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button onClick={handleSubmit} disabled={saving}>
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : mode === 'add' ? <Plus className="h-4 w-4" /> : null}
-            {mode === 'add' ? 'Add Supplier' : 'Save Changes'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    </AppDialog>
   )
 }
 

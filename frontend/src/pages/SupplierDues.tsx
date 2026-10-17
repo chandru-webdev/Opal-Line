@@ -299,7 +299,7 @@ export default function SupplierDuesPage() {
 
       {/* Record payment — pick which invoices this settles */}
       <Dialog open={payFor !== null} onOpenChange={(open) => { if (!open) { setPayFor(null); setDetail(null) } }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>Pay Supplier — {payFor?.supplier}</DialogTitle>
             <DialogDescription>
@@ -405,7 +405,7 @@ export default function SupplierDuesPage() {
 
       {/* Supplier ledger: open invoices + payment history */}
       <Dialog open={viewFor !== null} onOpenChange={(open) => { if (!open) { setViewFor(null); setViewDetail(null) } }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>Supplier Ledger — {viewFor?.supplier}</DialogTitle>
             <DialogDescription>

@@ -5,14 +5,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { CreatableSelect } from '@/components/ui/creatable-select'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
 import { findDuplicateProduct, generateBarcode, generateSku, type DuplicateMatch } from '@/lib/productCodes'
 import type { Product, Supplier } from '@/types'
@@ -504,17 +497,75 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     setError('')
   }
 
+  // Validation + duplicate panels live in the footer so they are always
+  // visible — the body of this dialog scrolls, the footer does not.
+  const duplicatePanel = duplicate ? (
+    <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
+      <p>
+        <span className="font-medium">{duplicate.field === 'sku' ? 'SKU' : 'Barcode'}</span>{' '}
+        <span className="font-mono">{duplicate.field === 'sku' ? form.sku : form.barcode}</span> is already used
+        by <span className="font-medium">“{duplicate.product.name}”</span>
+        {duplicate.product.sku ? (
+          <> (SKU <span className="font-mono">{duplicate.product.sku}</span>)</>
+        ) : null}
+        .
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {onEditProduct ? (
+          <Button variant="outline" size="sm" onClick={() => onEditProduct(duplicate.product)}>
+            Edit existing product
+          </Button>
+        ) : null}
+        <Button variant="outline" size="sm" onClick={regenerateCodes}>
+          Generate new codes
+        </Button>
+        <Button variant="ghost" size="sm" onClick={() => setDuplicate(null)}>
+          Keep editing
+        </Button>
+      </div>
+    </div>
+  ) : null
+
+  const errorPanel = error ? (
+    <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700">
+      <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
+      <p>{error}</p>
+    </div>
+  ) : null
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[88vh] max-w-2xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>{mode === 'edit' ? 'Edit Product' : 'Add Product'}</DialogTitle>
-          <DialogDescription>
-            {mode === 'edit'
-              ? 'Update the product in the billing software. Shopify options are only used when "Push to Shopify" is on.'
-              : 'Create a product in the billing software. Shopify options (title, SKU, inventory tracking, photo, vendor and tags) are pushed when "Push to Shopify" is on.'}
-          </DialogDescription>
-        </DialogHeader>
+    <AppDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      size="2xl"
+      title={mode === 'edit' ? 'Edit Product' : 'Add Product'}
+      description={
+        mode === 'edit'
+          ? 'Update the product in the billing software. Shopify options are only used when "Push to Shopify" is on.'
+          : 'Create a product in the billing software. Shopify options (title, SKU, inventory tracking, photo, vendor and tags) are pushed when "Push to Shopify" is on.'
+      }
+      footer={
+        <div className="flex flex-col gap-2">
+          {duplicatePanel}
+          {errorPanel}
+          <div className="flex flex-row justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              {saving
+                ? 'Saving...'
+                : mode === 'edit'
+                  ? 'Save Changes'
+                  : form.pushToShopify
+                    ? 'Create & Push to Shopify'
+                    : 'Create Product'}
+            </Button>
+          </div>
+        </div>
+      }
+    >
 
         <div className="space-y-5">
           <div className="space-y-3">
@@ -732,56 +783,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           </div>
         </div>
 
-        {duplicate ? (
-          <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
-            <p>
-              <span className="font-medium">{duplicate.field === 'sku' ? 'SKU' : 'Barcode'}</span>{' '}
-              <span className="font-mono">{duplicate.field === 'sku' ? form.sku : form.barcode}</span> is already used
-              by <span className="font-medium">“{duplicate.product.name}”</span>
-              {duplicate.product.sku ? (
-                <> (SKU <span className="font-mono">{duplicate.product.sku}</span>)</>
-              ) : null}
-              .
-            </p>
-            <div className="flex flex-wrap gap-2">
-              {onEditProduct ? (
-                <Button variant="outline" size="sm" onClick={() => onEditProduct(duplicate.product)}>
-                  Edit existing product
-                </Button>
-              ) : null}
-              <Button variant="outline" size="sm" onClick={regenerateCodes}>
-                Generate new codes
-              </Button>
-              <Button variant="ghost" size="sm" onClick={() => setDuplicate(null)}>
-                Keep editing
-              </Button>
-            </div>
-          </div>
-        ) : null}
-
-        {error ? (
-          <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-3 py-2 text-sm text-red-700">
-            <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
-            <p>{error}</p>
-          </div>
-        ) : null}
-
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={saving}>
-            Cancel
-          </Button>
-          <Button size="sm" onClick={submit} disabled={saving}>
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            {saving
-              ? 'Saving...'
-              : mode === 'edit'
-                ? 'Save Changes'
-                : form.pushToShopify
-                  ? 'Create & Push to Shopify'
-                  : 'Create Product'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    </AppDialog>
   )
 }

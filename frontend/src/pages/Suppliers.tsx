@@ -268,7 +268,7 @@ export default function SuppliersPage() {
           </div>
 
           <DataTable
-            onRowClick={(s) => setViewSupplier(s)}
+            onRowClick={setViewSupplier}
             columns={columns}
             data={filtered}
             loading={loading}
@@ -278,7 +278,7 @@ export default function SuppliersPage() {
       </Card>
 
       <Dialog open={viewSupplier !== null} onOpenChange={(open) => { if (!open) setViewSupplier(null) }}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Avatar className="h-8 w-8">

@@ -514,7 +514,7 @@ export default function ProductsPage() {
       />
 
       <Dialog open={viewProduct !== null} onOpenChange={(open) => { if (!open) setViewProduct(null) }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               {productImageSrc(viewProduct ?? {}) ? (
@@ -561,7 +561,7 @@ export default function ProductsPage() {
       </Dialog>
 
       <Dialog open={reorderFor !== null} onOpenChange={(open) => { if (!open) setReorderFor(null) }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Quick Reorder — {reorderFor?.name}</DialogTitle>
             <DialogDescription>Add stock for {reorderFor?.sku}</DialogDescription>
