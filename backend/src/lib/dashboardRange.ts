@@ -11,7 +11,7 @@
  * business-day reporting the rest of the app uses.
  */
 
-export type PeriodKey = 'today' | 'week' | 'month' | 'year' | 'custom'
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
 
 export interface DashboardRange {
   key: PeriodKey
@@ -34,7 +34,7 @@ export type RangeResult =
   | { ok: true; range: DashboardRange }
   | { ok: false; status: number; error: string }
 
-const PERIODS: readonly PeriodKey[] = ['today', 'week', 'month', 'year', 'custom']
+const PERIODS: readonly PeriodKey[] = ['today', 'week', 'last7', 'last30', 'month', 'year', 'custom']
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
@@ -117,6 +117,36 @@ export function resolveDashboardRange(query: Record<string, unknown>, now: Date 
     }
   }
 
+  if (key === 'last7') {
+    const from = addDays(today, -6)
+    const to = addDays(today, 1)
+    return {
+      ok: true,
+      range: {
+        key, label: 'Last 7 Days',
+        from: naive(from), to: naive(to),
+        prevFrom: naive(addDays(from, -7)), prevTo: naive(addDays(to, -7)),
+        prevLabel: 'vs previous 7 days',
+        days: 7, bucket: 'day',
+      },
+    }
+  }
+
+  if (key === 'last30') {
+    const from = addDays(today, -29)
+    const to = addDays(today, 1)
+    return {
+      ok: true,
+      range: {
+        key, label: 'Last 30 Days',
+        from: naive(from), to: naive(to),
+        prevFrom: naive(addDays(from, -30)), prevTo: naive(addDays(to, -30)),
+        prevLabel: 'vs previous 30 days',
+        days: 30, bucket: 'day',
+      },
+    }
+  }
+
   if (key === 'month') {
     const from = new Date(today.getFullYear(), today.getMonth(), 1)
     const to = addDays(today, 1)
@@ -177,4 +207,53 @@ export function resolveDashboardRange(query: Record<string, unknown>, now: Date 
       days, bucket: days <= 1 ? 'hour' : days > 62 ? 'month' : 'day',
     },
   }
+}
+export interface BucketPoint {
+  key: string
+  label: string
+  date: string
+}
+
+export function enumerateBuckets(range: { from: string; to: string; days: number; bucket: 'hour' | 'day' | 'month' }): BucketPoint[] {
+  const points: BucketPoint[] = []
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const start = new Date(range.from)
+  const toDate = new Date(range.to)
+  const lastDay = new Date(toDate.getTime() - 86400000)
+
+  if (range.bucket === 'hour') {
+    const day = start.getFullYear() + '-' + pad(start.getMonth() + 1) + '-' + pad(start.getDate())
+    for (let h = 0; h < 24; h++) {
+      const hh = pad(h)
+      points.push({ key: hh, label: hh + ':00', date: day + 'T' + hh + ':00:00' })
+    }
+    return points
+  }
+
+  if (range.bucket === 'month') {
+    const cursor = new Date(start.getFullYear(), start.getMonth(), 1)
+    const last = new Date(lastDay.getFullYear(), lastDay.getMonth(), 1)
+    while (cursor.getTime() <= last.getTime()) {
+      const key = cursor.getFullYear() + '-' + pad(cursor.getMonth() + 1)
+      points.push({
+        key,
+        label: cursor.toLocaleDateString('en-IN', { month: 'short' }),
+        date: key + '-01',
+      })
+      cursor.setMonth(cursor.getMonth() + 1)
+    }
+    return points
+  }
+
+  const cursor = new Date(start)
+  for (let i = 0; i < range.days; i++) {
+    const key = cursor.getFullYear() + '-' + pad(cursor.getMonth() + 1) + '-' + pad(cursor.getDate())
+    points.push({
+      key,
+      label: cursor.toLocaleDateString('en-IN', { weekday: 'short' }) + ' ' + key.slice(8, 10),
+      date: key,
+    })
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return points
 }

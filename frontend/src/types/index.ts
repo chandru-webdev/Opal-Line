@@ -102,7 +102,7 @@ export interface GstReportResult {
   gstin: string
 }
 
-export type PeriodKey = 'today' | 'week' | 'month' | 'year' | 'custom'
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
 
 /** The custom window chosen for the `custom` period (inclusive `YYYY-MM-DD`). */
 export interface DateRange {
@@ -1149,3 +1149,4 @@ export interface UpdatePrefsInfo {
   autoInstall: boolean
   showBanner: boolean
 }
+

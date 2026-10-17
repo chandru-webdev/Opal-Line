@@ -166,7 +166,7 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
     const todayEnd = localDayStart(1)
     // Aggregated in SQL: full-table loads here scaled with every product,
     // customer, supplier, expense and invoice row for a handful of numbers.
-    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows] = await Promise.all([
+    const [productAgg, customerAgg, supplierAgg, expenseAgg, outstandingRows, orderAgg, invoiceAgg] = await Promise.all([
       db!.select({
         total: sql<number>`count(*)`,
         active: sql<number>`count(*) filter (where status = 'active')`,
@@ -186,6 +186,8 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
         ranged: sql<number>`coalesce(sum(coalesce(amount, 0)) filter (where date >= ${range.from} and date < ${range.to}), 0)`,
       }).from(schema.expenses),
       db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!.select({ total: sql<number>`count(*)` }).from(schema.salesOrders),
+      db!.select({ total: sql<number>`count(*)` }).from(schema.salesInvoices),
     ])
 
     res.json({
@@ -200,6 +202,11 @@ dashboardRouter.get('/dashboard/summary', async (req, res) => {
       todayExpenses: round2(num(expenseAgg[0]?.today)),
       rangeExpenses: round2(num(expenseAgg[0]?.ranged)),
       pendingPayments: round2(num(outstandingRows[0]?.total)),
+      // Whether anything has been imported/persisted yet — drives the dashboard
+      // "No orders imported yet. Run Orders Sync" empty state. A store can have
+      // orders but no invoices (e.g. all unpaid), so both are reported.
+      totalOrders: Number(orderAgg[0]?.total ?? 0),
+      totalInvoices: Number(invoiceAgg[0]?.total ?? 0),
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -264,35 +271,8 @@ dashboardRouter.get('/dashboard/sales-overview', async (req, res) => {
       })
     }
 
-    const start = new Date(range.from)
-    const lastDay = new Date(new Date(range.to).getTime() - 86400000)
-
-    if (range.bucket === 'hour') {
-      const day = `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`
-      for (let h = 0; h < 24; h++) {
-        const hh = pad(h)
-        point(hh, `${hh}:00`, `${day}T${hh}:00:00`)
-      }
-      return res.json(points)
-    }
-
-    if (range.bucket === 'month') {
-      const cursor = new Date(start.getFullYear(), start.getMonth(), 1)
-      const last = new Date(lastDay.getFullYear(), lastDay.getMonth(), 1)
-      while (cursor.getTime() <= last.getTime()) {
-        const key = `${cursor.getFullYear()}-${pad(cursor.getMonth() + 1)}`
-        point(key, cursor.toLocaleDateString('en-IN', { month: 'short' }), `${key}-01`)
-        cursor.setMonth(cursor.getMonth() + 1)
-      }
-      return res.json(points)
-    }
-
-    const cursor = new Date(start)
-    for (let i = 0; i < range.days; i++) {
-      const key = `${cursor.getFullYear()}-${pad(cursor.getMonth() + 1)}-${pad(cursor.getDate())}`
-      point(key, `${cursor.toLocaleDateString('en-IN', { weekday: 'short' })} ${key.slice(8, 10)}`, key)
-      cursor.setDate(cursor.getDate() + 1)
-    }
+    const { enumerateBuckets } = await import('../lib/dashboardRange')
+    for (const b of enumerateBuckets(range)) point(b.key, b.label, b.date)
     res.json(points)
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -353,7 +333,7 @@ dashboardRouter.get('/dashboard/top-category', async (req, res) => {
   try {
     const rows = await db!
       .select({
-        category: sql<string>`coalesce(nullif(${schema.products.category}, ''), 'Uncategorised')`,
+        category: sql<string>`coalesce(nullif(${schema.products.category}, ''), 'Uncategorized')`,
         qty: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.qty}, 0)), 0)`,
         weight: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.weight}, 0)), 0)`,
         revenue: sql<number>`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0)`,
@@ -366,7 +346,7 @@ dashboardRouter.get('/dashboard/top-category', async (req, res) => {
         sql`${schema.salesInvoices.date} < ${range.to}`,
         NOT_VOIDED,
       ))
-      .groupBy(sql`coalesce(nullif(${schema.products.category}, ''), 'Uncategorised')`)
+      .groupBy(sql`coalesce(nullif(${schema.products.category}, ''), 'Uncategorized')`)
       .orderBy(sql`coalesce(sum(coalesce(${schema.salesInvoiceItems.amount}, 0)), 0) desc`)
       .limit(6)
 
