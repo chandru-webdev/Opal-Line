@@ -35,8 +35,10 @@ working on every future sign-in until it is rotated.
 
 - **Owner roles only.** It signs in `Admin` and `Super Admin` accounts; every
   other role is rejected before any comparison happens.
-- **Lockout still applies.** Wrong guesses count towards the 5-failures /
-  15-minute lockout and are recorded as failed login attempts.
+- **Lockout still applies when it is switched on.** Wrong guesses count
+  towards the 5-failures / 15-minute lockout and are recorded as failed login
+  attempts — the lockout itself is a per-install switch (Settings → Security →
+  Login lockout) and ships disabled for testing.
 - **Fully audited.** Every successful use writes a `Recovery Login Used`
   activity-log entry with the account, role and IP.
 - **Stored only as an argon2id hash.** The app verifies with

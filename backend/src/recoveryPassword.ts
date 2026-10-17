@@ -29,7 +29,8 @@ import { decryptSecret } from './lib/crypto'
  * with argon2id on first use, after which the encrypted copy is dropped.
  *
  * Every use is recorded in the activity log, the login lockout still applies
- * to failed attempts, and non-owner roles are rejected before any comparison.
+ * when it is switched on for the install (Settings → Security → Login
+ * lockout), and non-owner roles are rejected before any comparison.
  */
 
 /** Roles the recovery password may ever sign in for. */
