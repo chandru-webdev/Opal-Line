@@ -175,7 +175,7 @@ export default function DispatchPage() {
       )}
 
       <Dialog open={dispatchFor !== null} onOpenChange={(open) => { if (!open) setDispatchFor(null) }}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>Dispatch order {dispatchFor?.internalId || dispatchFor?.shopifyId}</DialogTitle>
             <DialogDescription>

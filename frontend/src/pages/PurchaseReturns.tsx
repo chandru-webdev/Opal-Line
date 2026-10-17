@@ -385,13 +385,13 @@ export default function PurchaseReturnsPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No purchase returns found"
-            onRowClick={(r) => setViewReturn(r)}
+            onRowClick={setViewReturn}
           />
         </CardContent>
       </Card>
 
       <Dialog open={viewReturn !== null} onOpenChange={(open) => { if (!open) setViewReturn(null) }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>Return {viewReturn?.number}</DialogTitle>
             <DialogDescription>{viewReturn ? formatDate(viewReturn.date) : ''}</DialogDescription>
@@ -451,7 +451,7 @@ export default function PurchaseReturnsPage() {
       </Dialog>
 
       <Dialog open={formOpen} onOpenChange={setFormOpen}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Record Purchase Return</DialogTitle>
             <DialogDescription>

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, or, sql, and, gte, lte } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, ne, or, sql, and, gte, lte } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import { applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
@@ -3221,12 +3221,33 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
       })
     }
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+    // Same duplicate guard as create, ignoring the product being updated.
+    if (body.sku != null) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(and(sql`lower(${s.products.sku}) = lower(${String(body.sku).trim()})`, ne(s.products.id, routeParam(req.params.id))))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    }
+    if (body.barcode != null) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(and(eq(s.products.barcode, String(body.barcode).trim()), ne(s.products.id, routeParam(req.params.id))))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
+    }
     const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
+    const msg = err instanceof Error ? err.message : ''
     logger.error({ err }, 'product update failed')
+    if (msg.includes('duplicate')) {
+      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
+    }
     res.status(400).json({ error: 'Failed to update product' })
   }
 })
@@ -3242,6 +3263,28 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     delete body.stock
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     if (!body.id) body.id = randomUUID()
+
+    // Identifier uniqueness: sku also has a DB unique index; barcode only has
+    // this check. Either way, respond with the conflicting product so the UI
+    // can offer "edit existing" or fresh codes instead of a blind failure.
+    const skuStr = body.sku != null ? String(body.sku).trim() : ''
+    const barcodeStr = body.barcode != null ? String(body.barcode).trim() : ''
+    if (skuStr) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(sql`lower(${s.products.sku}) = lower(${skuStr})`)
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    }
+    if (barcodeStr) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(eq(s.products.barcode, barcodeStr))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
+    }
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
@@ -3267,7 +3310,11 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     logger.error({ err }, 'product create failed')
-    res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
+    if (msg.includes('duplicate')) {
+      // Unique-index race (two saves at once) — same shape as the pre-check.
+      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
+    }
+    res.status(400).json({ error: 'Failed to create product' })
   }
 })
 

@@ -552,7 +552,7 @@ export default function SilverRatePage() {
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Update Silver Rate</DialogTitle>
             <DialogDescription>
@@ -566,7 +566,7 @@ export default function SilverRatePage() {
 
               {step === 1 && (
                 <div className="space-y-4">
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <div className="rounded-lg border bg-muted/40 p-3">
                       <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Old Rate</Label>
                       <p className="mt-1 text-lg font-bold tabular-nums text-foreground">₹{currentRate.rate.toFixed(2)} / gm</p>
@@ -797,8 +797,8 @@ function Stepper({ step }: { step: number }) {
         const done = i < step
         const active = i === step
         return (
-          <div key={s.key} className="flex flex-1 items-center gap-2">
-            <div className="flex flex-1 items-center gap-2">
+          <div key={s.key} className="flex min-w-0 flex-1 items-center gap-2">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
               <div
                 className={cn(
                   'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold',

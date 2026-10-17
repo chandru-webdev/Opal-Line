@@ -1,8 +1,6 @@
 import { useRef, useState } from 'react'
 import { Upload, FileSpreadsheet, Images, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react'
-import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Button } from '@/components/ui/button'
 import { dbApi } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -104,19 +102,27 @@ export function BulkImportDialog({ open, onOpenChange, mode, onDone }: {
   const canRun = isCsv ? csvText.trim().length > 0 : files.length > 0
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!o) reset(); onOpenChange(o) }}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            {isCsv ? <FileSpreadsheet className="h-4 w-4" /> : <Images className="h-4 w-4" />}
-            {isCsv ? 'Bulk import products (CSV)' : 'Bulk upload product images'}
-          </DialogTitle>
-          <DialogDescription>
-            {isCsv
-              ? 'Paste CSV or upload a file. Headers are auto-mapped (name, sku, purity, net weight, making charge, price, stock, huid…). Existing SKUs are updated, new ones created.'
-              : 'Pick image files named after the product SKU (e.g. SLV-RNG-00001.jpg). Each image is attached to the matching product automatically.'}
-          </DialogDescription>
-        </DialogHeader>
+    <AppDialog
+      open={open}
+      onOpenChange={(o) => { if (!o) reset(); onOpenChange(o) }}
+      size="lg"
+      titleAdornment={isCsv ? <FileSpreadsheet className="h-4 w-4" /> : <Images className="h-4 w-4" />}
+      title={isCsv ? 'Bulk import products (CSV)' : 'Bulk upload product images'}
+      description={
+        isCsv
+          ? 'Paste CSV or upload a file. Headers are auto-mapped (name, sku, purity, net weight, making charge, price, stock, huid…). Existing SKUs are updated, new ones created.'
+          : 'Pick image files named after the product SKU (e.g. SLV-RNG-00001.jpg). Each image is attached to the matching product automatically.'
+      }
+      footer={
+        <div className="flex flex-row justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={() => { reset(); onOpenChange(false) }}>Close</Button>
+          <Button size="sm" onClick={run} disabled={busy || !canRun}>
+            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {isCsv ? 'Import products' : 'Upload & match'}
+          </Button>
+        </div>
+      }
+    >
 
         {isCsv ? (
           <div className="space-y-2">
@@ -170,14 +176,6 @@ export function BulkImportDialog({ open, onOpenChange, mode, onDone }: {
           </div>
         )}
 
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={() => { reset(); onOpenChange(false) }}>Close</Button>
-          <Button size="sm" onClick={run} disabled={busy || !canRun}>
-            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {isCsv ? 'Import products' : 'Upload & match'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    </AppDialog>
   )
 }

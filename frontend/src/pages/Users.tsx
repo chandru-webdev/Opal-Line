@@ -734,7 +734,7 @@ export default function UsersPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={permsOpen} onOpenChange={setPermsOpen}>        <DialogContent className="max-w-3xl">
+      <Dialog open={permsOpen} onOpenChange={setPermsOpen}>        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Manage Permissions</DialogTitle>
             <DialogDescription>
@@ -792,7 +792,7 @@ export default function UsersPage() {
       </Dialog>
 
       <Dialog open={roleDialogOpen} onOpenChange={setRoleDialogOpen}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>{editingRole ? `Edit Role — ${editingRole.name}` : 'New Role'}</DialogTitle>
             <DialogDescription>

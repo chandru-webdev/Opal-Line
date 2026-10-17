@@ -651,7 +651,7 @@ function BackupRestoreContent() {
       </Dialog>
 
       <Dialog open={restoreDialogOpen} onOpenChange={(open) => { if (!open) setRestoreTarget(null) }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>Restore Preview</DialogTitle>
             <DialogDescription>Review what will happen before restoring {restoreTarget?.fileName}</DialogDescription>

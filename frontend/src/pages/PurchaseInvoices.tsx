@@ -162,6 +162,11 @@ export default function PurchaseInvoicesPage() {
     }
   }, [])
 
+  // Stable row handler: an inline lambda here would change identity every
+  // render and defeat the DataTable memo (re-rendering the whole table on
+  // every keystroke in the create/edit dialog).
+  const openViewById = useCallback((i: PurchaseInvoice) => { void openView(i.id) }, [openView])
+
   const openCreate = () => {
     setEditing(null)
     setHeader({ number: `PI-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(4, '0')}`, supplier: '', date: todayIST(), supplierGstin: '', tcsRate: '0' })
@@ -507,14 +512,14 @@ export default function PurchaseInvoicesPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No purchase invoices found"
-            onRowClick={(i) => openView(i.id)}
+            onRowClick={openViewById}
           />
         </CardContent>
       </Card>
 
       {/* View detail */}
       <Dialog open={viewInvoice !== null} onOpenChange={(open) => { if (!open) setViewInvoice(null) }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>Purchase Invoice {viewInvoice?.number}</DialogTitle>
             <DialogDescription>
@@ -605,7 +610,7 @@ export default function PurchaseInvoicesPage() {
 
       {/* Create / edit */}
       <Dialog open={formOpen} onOpenChange={(open) => { if (!open) setFormOpen(false) }}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>{editing ? `Edit ${editing.number}` : 'Record Purchase'}</DialogTitle>
             <DialogDescription>
