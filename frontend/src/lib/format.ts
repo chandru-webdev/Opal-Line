@@ -30,7 +30,9 @@ export function formatNumber(value: number | null | undefined) {
 }
 
 export function formatWeight(value: number | null | undefined, opts?: { decimals?: number }) {
-  if (value == null || !Number.isFinite(value)) return '—'
+  // A 0 weight is not a real measurement — on imported or quoted items it
+  // means "weight never captured". Show it as unknown rather than "0.00 gm".
+  if (value == null || !Number.isFinite(value) || value === 0) return '—'
   const dec = opts?.decimals ?? 2
   return `${value.toLocaleString('en-IN', {
     minimumFractionDigits: dec,
