@@ -40,7 +40,7 @@ the installed desktop app and a Docker deployment can coexist on one machine.
 | **5432** | PostgreSQL (standard port) — the dev database (`DATABASE_URL` in `backend/.env`) |
 | **47191** | Backend API in development (`npm run dev:server`) |
 | **47192** | Backend API of the installed desktop app (bundled runtime) |
-| **47193** | PostgreSQL of the installed desktop app (portable, `%APPDATA%\Opal Line Billing\pgdata`) |
+| **47193** | PostgreSQL of the installed desktop app (portable, `%APPDATA%\Opal Line Billing\pgdata`). The desktop app owns the `opal_line` database; dev uses its own `opal_line_dev` database in the same cluster, so dev seeding/wipes can never touch the app's data |
 | **47195** | Vite dev server (UI in development) |
 | **47196** | Backend in Docker (`docker-compose.yml`, container listens on 4000) |
 | **47197** | Frontend in Docker (nginx) |
@@ -74,8 +74,10 @@ npm run dev              # first run provisions the local PostgreSQL (port 47193
                          # writes backend/.env, then starts backend 47191 + UI 47195
 ```
 
-On first run the backend also bootstraps the schema and the admin user (same
-data directory as the desktop app). Prefer your own server or a cloud database
+On first run the backend also bootstraps the schema and the admin user in
+dev's own database `opal_line_dev` (same local cluster and data directory as
+the desktop app, but never the app's `opal_line` database — so dev work and
+seeding can't touch installed-app data). Prefer your own server or a cloud database
 (Neon/Supabase)? Create `backend/.env` from `backend/.env.example` with your
 `DATABASE_URL` first — `npm run dev` then leaves it alone. Add Shopify creds
 there too, or set them later in the UI.

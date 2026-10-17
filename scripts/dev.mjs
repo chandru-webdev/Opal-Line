@@ -8,19 +8,23 @@
  * "on Node" only worked after hand-copying .env.example and installing
  * PostgreSQL yourself.
  *
- * This script provisions exactly the way the desktop app does
- * (electron/main.ts → ensurePostgres), so dev and the installed app share one
- * database instead of drifting into two:
+ * This script provisions the way the desktop app does
+ * (electron/main.ts → ensurePostgres) — same cluster, same lookup order:
  *
  *   - same PostgreSQL lookup order: portable <repo>/backend/pgsql → system
  *     install (Windows) → pg_ctl on PATH (other platforms)
  *   - same cluster: %APPDATA%/Opal Line Billing/pgdata on port 47193, password
  *     in the same .pg-password file (initdb --auth=trust like the app)
  *   - same data dirs: APP_DATA_DIR/LOG_DIR point at the desktop app's folders,
- *     so uploads, backups and the .encryption-key (which unlocks DB-stored
- *     secrets) are shared, and backend/.env (gitignored) receives
- *     DATABASE_URL — the file every backend entry point already reads
- *     (dev, dev:server, db:seed, typecheck).
+ *     so uploads and the .encryption-key (which unlocks DB-stored secrets)
+ *     are shared, and backend/.env (gitignored) receives DATABASE_URL — the
+ *     file every backend entry point already reads (dev, dev:server,
+ *     db:seed, typecheck).
+ *
+ * Dev gets its OWN database in that cluster (opal_line_dev), never the
+ * desktop app's bundled one (opal_line): seeding, wiping or re-bootstrapping
+ * dev data can never touch the installed app's data. A backend/.env that
+ * still points at the old shared database is migrated automatically.
  *
  * The dev backend (47191) and the installed app's backend (47192) use
  * deliberately distinct ports — by design they can run at once against this
@@ -45,9 +49,10 @@ const ENV_PATH = join(ROOT, 'backend', '.env')
 const EXE = process.platform === 'win32' ? '.exe' : ''
 
 // Port block shared with electron/main.ts: dev backend 47191, desktop backend
-// 47192, PostgreSQL 47193.
+// 47192, PostgreSQL 47193. The desktop app owns the `opal_line` database on
+// that cluster — dev uses its own `opal_line_dev` so the two never collide.
 const PG_PORT = 47193
-const DB_NAME = 'opal_line'
+const DB_NAME = 'opal_line_dev'
 
 // Same folder electron's app.getPath('appData') resolves to per platform, so
 // dev and the desktop app literally share one data directory.
@@ -93,11 +98,18 @@ function upsertEnvValue(file, key, value) {
   writeFileSync(file, next, 'utf8')
 }
 
-/** Parse host/port out of a postgres:// URL without a driver (no deps here). */
+/** Parse host/port/database out of a postgres:// URL without a driver. */
 function parseDbUrl(url) {
-  const m = /^postgres(?:ql)?:\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^:/]+)(?::(\d+))?/.exec(url)
+  const m = /^postgres(?:ql)?:\/\/(?:[^@/]+@)?(\[[^\]]+\]|[^:/]+)(?::(\d+))?(?:\/([^?\s]+))?/.exec(url)
   if (!m) return null
-  return { host: m[1].replace(/^\[|\]$/g, ''), port: m[2] ? Number(m[2]) : 5432 }
+  return { host: m[1].replace(/^\[|\]$/g, ''), port: m[2] ? Number(m[2]) : 5432, db: m[3] ?? '' }
+}
+
+/** True for the desktop app's bundled database (127.0.0.1:47193/opal_line). */
+function isDesktopDbUrl(url) {
+  const t = parseDbUrl(url)
+  if (!t) return false
+  return (t.host === '127.0.0.1' || t.host === 'localhost') && t.port === 47193 && t.db === 'opal_line'
 }
 
 async function tcpOpen(host, port, ms = 3000) {
@@ -272,19 +284,30 @@ async function main() {
   }
 
   // An explicit, reachable DATABASE_URL wins: never rewrite the file a
-  // developer maintains by hand.
+  // developer maintains by hand. The one exception is the desktop app's
+  // bundled database — dev must not share it, so an old URL pointing there
+  // is migrated to opal_line_dev below.
   const existing = envFileValue(ENV_PATH, 'DATABASE_URL')
   if (existing) {
     const target = parseDbUrl(existing)
-    if (target && await tcpOpen(target.host, target.port)) {
-      console.log(`[dev] Using DATABASE_URL from backend/.env (${target.host}:${target.port})`)
-      return
+    if (target && (await tcpOpen(target.host, target.port))) {
+      if (isDesktopDbUrl(existing)) {
+        console.log(
+          `[dev] backend/.env points at the desktop app's bundled database (${target.host}:${target.port}/${target.db}) — ` +
+            `switching dev to its own database (${DB_NAME})`,
+        )
+        // Fall through to provisioning, which rewrites DATABASE_URL.
+      } else {
+        console.log(`[dev] Using DATABASE_URL from backend/.env (${target.host}:${target.port}${target.db ? `/${target.db}` : ''})`)
+        return
+      }
+    } else {
+      die(
+        `backend/.env sets DATABASE_URL but ${target ? `${target.host}:${target.port}` : 'its host could not be parsed'} is not reachable.\n` +
+          '    Fix that line (or delete it to let npm run dev provision the local\n' +
+          '    PostgreSQL that the desktop app uses), then re-run npm run dev.',
+      )
     }
-    die(
-      `backend/.env sets DATABASE_URL but ${target ? `${target.host}:${target.port}` : 'its host could not be parsed'} is not reachable.\n` +
-      '    Fix that line (or delete it to let npm run dev provision the local\n' +
-      '    PostgreSQL that the desktop app uses), then re-run npm run dev.',
-    )
   }
 
   const url = await provisionDatabase()
@@ -299,7 +322,7 @@ async function main() {
 }
 
 // Small self-check used by scripts/dev.test.mjs — keeps the file import-safe.
-export { envFileValue, upsertEnvValue, parseDbUrl, appDataDir }
+export { envFileValue, upsertEnvValue, parseDbUrl, isDesktopDbUrl, appDataDir }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err) => die(err?.message ?? String(err)))

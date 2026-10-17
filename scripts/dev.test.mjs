@@ -3,15 +3,15 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
-import { envFileValue, upsertEnvValue, parseDbUrl, appDataDir } from './dev.mjs'
+import { envFileValue, upsertEnvValue, parseDbUrl, isDesktopDbUrl, appDataDir } from './dev.mjs'
 
 // Pure-helper tests for the `npm run dev` bootstrap. No database, no network:
 // provisioning itself is exercised live by running `npm run dev`.
 
-test('parseDbUrl extracts host and port from postgres URLs', () => {
-  assert.deepEqual(parseDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), { host: '127.0.0.1', port: 47193 })
-  assert.deepEqual(parseDbUrl('postgres://user@db.example.com/opal'), { host: 'db.example.com', port: 5432 })
-  assert.deepEqual(parseDbUrl('postgresql://[::1]:5433/x'), { host: '::1', port: 5433 })
+test('parseDbUrl extracts host, port and database from postgres URLs', () => {
+  assert.deepEqual(parseDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), { host: '127.0.0.1', port: 47193, db: 'opal_line' })
+  assert.deepEqual(parseDbUrl('postgres://user@db.example.com/opal'), { host: 'db.example.com', port: 5432, db: 'opal' })
+  assert.deepEqual(parseDbUrl('postgresql://[::1]:5433/x'), { host: '::1', port: 5433, db: 'x' })
   assert.equal(parseDbUrl('not a url'), null)
 })
 
@@ -51,6 +51,17 @@ test('upsertEnvValue adds and replaces without disturbing the rest of the file',
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('isDesktopDbUrl matches only the bundled desktop database', () => {
+  assert.equal(isDesktopDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), true)
+  assert.equal(isDesktopDbUrl('postgresql://postgres:pw@localhost:47193/opal_line'), true)
+  // Dev's own database in the same cluster is fine.
+  assert.equal(isDesktopDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line_dev'), false)
+  // Same database name on another host/port is not the desktop app's.
+  assert.equal(isDesktopDbUrl('postgresql://postgres:pw@127.0.0.1:5432/opal_line'), false)
+  assert.equal(isDesktopDbUrl('postgres://user@db.example.com/opal_line'), false)
+  assert.equal(isDesktopDbUrl('garbage'), false)
 })
 
 test('appDataDir resolves to the desktop app data folder for this platform', () => {
