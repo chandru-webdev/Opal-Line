@@ -27,6 +27,11 @@ export interface AppSettings {
   lowStockAlerts: boolean
   dailySummary: boolean
   orderImports: boolean
+  /**
+   * Account lockout after 5 failed sign-in attempts (15 minutes). Off by
+   * default (testing) — toggled from Settings → Security → Login lockout.
+   */
+  loginLockoutEnabled?: boolean
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }

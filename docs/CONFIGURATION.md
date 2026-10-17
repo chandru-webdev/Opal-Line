@@ -34,9 +34,29 @@ PORT=47191
 3. `npm install` (repo root), then:
    ```bash
    npm run db:push      # create/update all tables
-   npm run db:seed      # admin user, roles, settings row
+   npm run db:seed      # demo users, roles, settings row
    ```
 4. `npm run dev` → UI at `http://127.0.0.1:47195`, API at `http://localhost:47191`.
+
+**No PostgreSQL setup needed:** if `backend/.env` has no `DATABASE_URL`,
+`npm run dev` provisions one automatically — a **dev-only** cluster on port
+**47194** under `%APPDATA%/Opal Line Billing Dev` (Windows), fully separate
+from the installed desktop app's cluster (port **47193** under
+`%APPDATA%/Opal Line Billing`). Dev and the desktop app never share users,
+sessions or data, and both stacks can run at once.
+
+**Logins** (each environment bootstraps its own database, so credentials do
+not transfer between machines):
+
+| Setup | Username | Password |
+|---|---|---|
+| Fresh database (first backend start / bootstrap) | `admin` | `Opal@2026` — first login forces a change |
+| After `npm run db:seed` (demo data) | `arjun` | `Opal@2026` |
+
+A teammate's working password will not work on a new clone; use the table
+above. An older `backend/.env` that still points `DATABASE_URL` at
+`127.0.0.1:47193` (the pre-separation shared setup) is migrated to the dev
+cluster automatically on the next `npm run dev`.
 
 Cloud database (Neon example) — just swap the URL and keep `sslmode=require`:
 
@@ -429,6 +449,13 @@ approval and rejection is written to the activity log with the actor's name.
   npm run auth:reset -- someusername    # a different account
   ```
   Do **not** use `npm run db:seed` for this — it truncates every table.
+- **Account lockout (Settings → Security → Login lockout).** After 5 failed
+  sign-in attempts an account is locked for 15 minutes. The product ships
+  with this **disabled** (testing default) — failed attempts never lock an
+  account until an Admin / Super Admin switches it on from Settings. Each
+  install owns the setting (dev stack and desktop app are separate), every
+  successful use is audited in the activity log, and switching it off starts
+  counters fresh on the next attempt.
 - E2E tests abort with a clear 429 message when the login budget is exhausted.
 
 ## 14. Quick-reference: full example `backend/.env`

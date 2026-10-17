@@ -718,6 +718,13 @@ export const settings = pgTable('settings', {
   lowStockAlerts: boolean('low_stock_alerts'),
   dailySummary: boolean('daily_summary'),
   orderImports: boolean('order_imports'),
+  /**
+   * Account lockout after repeated failed logins (5 failures / 15 minutes —
+   * see src/lockout.ts). Default off: the product ships with lockout disabled
+   * for testing and it is switched on per install from Settings → Security →
+   * Login lockout. Read on every login attempt; NULL means disabled.
+   */
+  loginLockoutEnabled: boolean('login_lockout_enabled').default(false),
   shopifyStoreUrlEncrypted: text('shopify_store_url_encrypted'),
   shopifyAccessTokenEncrypted: text('shopify_access_token_encrypted'),
   shopifyApiVersion: text('shopify_api_version'),

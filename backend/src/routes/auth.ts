@@ -15,6 +15,29 @@ export const authRouter = Router()
 const LOCKOUT_THRESHOLD = 5
 const LOCKOUT_DURATION_MS = 15 * 60 * 1000
 
+/**
+ * Whether account lockout is switched on for this install
+ * (settings.login_lockout_enabled, managed from Settings → Security → Login
+ * lockout; default/NULL = off — the product ships with lockout disabled for
+ * testing and it is turned on per install). Fails open: if the setting cannot
+ * be read, no lockout is enforced, matching the rest of this module where a
+ * storage error must never lock the owner out of their own system.
+ */
+async function isLockoutEnabled(): Promise<boolean> {
+  try {
+    const { db: getDb, schema } = await import('../db/client')
+    if (!getDb) return false
+    const rows = await getDb
+      .select({ enabled: schema.settings.loginLockoutEnabled })
+      .from(schema.settings)
+      .where(eq(schema.settings.id, 'app'))
+      .limit(1)
+    return rows[0]?.enabled === true
+  } catch {
+    return false
+  }
+}
+
 async function checkLockout(identifier: string): Promise<{ locked: boolean; remainingMs: number }> {
   try {
     const { db: getDb, schema } = await import('../db/client')
@@ -164,9 +187,16 @@ authRouter.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Username or email and password are required' })
     }
 
-    const lockout = await checkLockout(identifier)
-    if (lockout.locked) {
-      return res.status(429).json({ error: `Account temporarily locked. Try again in ${Math.ceil(lockout.remainingMs / 60000)} minutes.` })
+    // Lockout is a per-install switch (Settings → Security → Login lockout,
+    // off by default). One settings read gates both the check and the
+    // recording below, so a disabled install neither blocks nor counts
+    // attempts — re-enabling later starts from a clean counter.
+    const lockoutEnabled = await isLockoutEnabled()
+    if (lockoutEnabled) {
+      const lockout = await checkLockout(identifier)
+      if (lockout.locked) {
+        return res.status(429).json({ error: `Account temporarily locked. Try again in ${Math.ceil(lockout.remainingMs / 60000)} minutes.` })
+      }
     }
 
     const [user] = await db!
@@ -175,7 +205,7 @@ authRouter.post('/login', async (req, res) => {
       .where(or(eq(schema.users.username, identifier), eq(schema.users.email, identifier)))
       .limit(1)
     if (!user) {
-      await recordFailedAttempt(identifier)
+      if (lockoutEnabled) await recordFailedAttempt(identifier)
       void recordActivity({ action: 'Failed Login Attempt', module: 'system', entity: identifier, details: 'Unknown username or email', ip: req.ip ?? null })
       return res.status(401).json({ error: 'Invalid username or password' })
     }
@@ -198,11 +228,13 @@ authRouter.post('/login', async (req, res) => {
       valid = usedRecovery
     }
     if (!valid) {
-      await recordFailedAttempt(identifier)
+      if (lockoutEnabled) await recordFailedAttempt(identifier)
       void recordActivity({ action: 'Failed Login Attempt', module: 'system', entity: user.name, details: user.passwordHash ? 'Invalid password' : 'Account has no password set', ip: req.ip ?? null })
       return res.status(401).json({ error: 'Invalid username or password' })
     }
 
+    // Successful sign-in always clears the counter (harmless when disabled,
+    // and it wipes stale rows left from when lockout was on).
     await clearFailedAttempts(identifier)
 
     if (user.status !== 'active') {

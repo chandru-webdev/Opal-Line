@@ -17,8 +17,10 @@ let localPostgresStarted = false
 // Dedicated desktop port — deliberately different from the dev backend port
 // Opal Line uses a dedicated port block (47191-47198) chosen to avoid
 // collisions with common software on any machine. The installed app uses
-// 47192/47193, distinct from the dev backend (47191), so the dev server and
-// the installed desktop app can run at the same time.
+// 47192/47193, distinct from the dev stack (backend 47191, its own PostgreSQL
+// on 47194 — see scripts/dev.mjs), so the dev server and the installed
+// desktop app run at the same time without sharing anything (separate
+// clusters, sessions and data dirs — a dev login cannot log the app out).
 const BACKEND_PORT = 47192
 const PG_PORT = 47193
 const isDev = !app.isPackaged
