@@ -899,3 +899,168 @@ export async function getSupplierOpenInvoices(supplier: string) {
     .filter((r) => r.balance > 0)
 }
 
+// ─── Auto invoice: purchase order → purchase invoice ────────────────────────
+
+export type EnsurePurchaseInvoiceResult =
+  | { ok: true; action: 'created' | 'refreshed'; invoice: typeof schema.purchaseInvoices.$inferSelect }
+  | { ok: false; skipped: string }
+
+/**
+ * Raise (and keep in step) the purchase invoice linked to a purchase order.
+ *
+ * Called every time a PO's lines are saved: a new order gets its invoice
+ * immediately, and editing the order refreshes the one it already has — one
+ * live invoice per order (cancelled ones are ignored), idempotent under
+ * retries. The invoice mirrors the manual POST /db/purchase-invoices flow:
+ *
+ *  - line weight is the TOTAL for the line (qty × per-piece weight), which is
+ *    what reconcileOrder compares ordered weight against;
+ *  - tax carries the order's GST rate per line, so the invoice total matches
+ *    the order's grand total (the PO discount has no invoice column — same as
+ *    the manual flow);
+ *  - stock moves now, because in this app a purchase invoice IS the receipt
+ *    (cancel or delete the invoice to take the stock back out).
+ *
+ * Skips (never errors) when the order has no supplier or no line items — a
+ * header-only row can't be billed.
+ */
+export async function ensurePurchaseInvoiceForOrder(orderId: string): Promise<EnsurePurchaseInvoiceResult> {
+  if (!db) return { ok: false, skipped: 'database unavailable' }
+  const [order] = await db.select().from(schema.purchaseOrders).where(eq(schema.purchaseOrders.id, orderId)).limit(1)
+  if (!order) return { ok: false, skipped: 'order not found' }
+  const supplier = String(order.supplier ?? '').trim()
+  if (!supplier) return { ok: false, skipped: 'order has no supplier' }
+  const lines = await getOrderLines([orderId])
+  if (lines.length === 0) return { ok: false, skipped: 'order has no line items' }
+
+  // GST rate on the order (NULL predates the columns — 3% is the app default,
+  // same rule as poGstRate in the route file). The cast keeps the legacy
+  // empty-string guard: numeric columns have come back as '' before.
+  const gstRaw = order.gst as unknown
+  const gstRate = gstRaw == null || gstRaw === '' ? 3 : Number(gstRaw) || 0
+
+  // PO line amount is qty × per-piece weight × rate; invoice cost is
+  // total-weight × rate, so the weight must be the line total here.
+  const items = normalizePurchaseItems(
+    lines.map((l) => {
+      const qty = Math.max(1, Math.floor(Number(l.qty ?? 1) || 1))
+      const weight = round2(qty * (Number(l.weight ?? 0) || 0))
+      const cost = round2(weight * (Number(l.rate ?? 0) || 0))
+      return {
+        product: l.product ?? '',
+        sku: l.sku ?? '',
+        qty,
+        weight,
+        rate: Number(l.rate ?? 0) || 0,
+        cost,
+        tax: round2((cost * gstRate) / 100),
+      }
+    }),
+  )
+  if (items.length === 0) return { ok: false, skipped: 'order has no billable lines' }
+  const totals = purchaseTotals(items)
+
+  const linked = await db
+    .select()
+    .from(schema.purchaseInvoices)
+    .where(eq(schema.purchaseInvoices.orderId, orderId))
+  const existing = linked.find((i) => String(i.status ?? '').toLowerCase() !== 'cancelled') ?? null
+
+  const locationId = await resolveMovementLocation(null)
+
+  if (existing) {
+    // Same guard as the manual PATCH: never drop the total below what has
+    // already been paid against the invoice.
+    const paid = Number(existing.paidAmount ?? 0)
+    if (paid > 0 && totals.total + 0.01 < paid) {
+      return { ok: false, skipped: `linked invoice ${existing.number} is paid more than the new total` }
+    }
+    const gstSplit = splitInputGst(totals.tax, existing.supplierGstin, await getBusinessState())
+    const invoice = await db.transaction(async (tx) => {
+      // Replace the lines exactly like the manual edit does: reverse the old
+      // stock, rewrite the lines, re-apply stock.
+      await reversePurchaseStock(existing.id, tx as never)
+      await tx.delete(schema.purchaseInvoiceItems).where(eq(schema.purchaseInvoiceItems.invoiceId, existing.id))
+      const [row] = await tx
+        .update(schema.purchaseInvoices)
+        .set({
+          supplier,
+          items: totals.qty,
+          qty: totals.qty,
+          weight: totals.weight,
+          rate: totals.rate,
+          cost: totals.cost,
+          tax: totals.tax,
+          total: totals.total,
+          supplierState: gstSplit.supplierState || null,
+          cgst: gstSplit.cgst,
+          sgst: gstSplit.sgst,
+          igst: gstSplit.igst,
+        })
+        .where(eq(schema.purchaseInvoices.id, existing.id))
+        .returning()
+      await saveInvoiceItems(tx as never, existing.id, items, { addStock: true, locationId: existing.locationId ?? locationId })
+      return row
+    })
+    if (!invoice) return { ok: false, skipped: 'invoice refresh failed' }
+    return { ok: true, action: 'refreshed', invoice }
+  }
+
+  const id = randomUUID()
+  const number = await mintPurchaseInvoiceNumber()
+  const gstSplit = splitInputGst(totals.tax, null, await getBusinessState())
+  const invoice = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .insert(schema.purchaseInvoices)
+      .values({
+        id,
+        number,
+        supplier,
+        items: totals.qty,
+        qty: totals.qty,
+        weight: totals.weight,
+        rate: totals.rate,
+        cost: totals.cost,
+        tax: totals.tax,
+        total: totals.total,
+        paidAmount: 0,
+        supplierGstin: null,
+        supplierState: gstSplit.supplierState || null,
+        cgst: gstSplit.cgst,
+        sgst: gstSplit.sgst,
+        igst: gstSplit.igst,
+        tcsRate: 0,
+        tcsAmount: 0,
+        // Link back so reconcileOrder counts it as received against the order.
+        orderId: order.id,
+        // 'pending' is the manual endpoint's default for an unpaid invoice.
+        status: 'pending',
+        date: order.date ? String(order.date) : new Date().toISOString(),
+        locationId,
+      })
+      .returning()
+    await saveInvoiceItems(tx as never, id, items, { addStock: true, locationId })
+    return row
+  })
+  if (!invoice) return { ok: false, skipped: 'invoice create failed' }
+  return { ok: true, action: 'created', invoice }
+}
+
+/**
+ * `PI-YYYY-NNNN` — the same shape the New Invoice dialog mints. The
+ * count-based suffix can collide after a delete, so the first free number
+ * wins here; the unique index backs the whole thing up.
+ */
+async function mintPurchaseInvoiceNumber(): Promise<string> {
+  if (!db) throw new Error('database unavailable')
+  const year = new Date().getFullYear()
+  const used = new Set(
+    (await db.select({ number: schema.purchaseInvoices.number }).from(schema.purchaseInvoices)).map((r) => String(r.number)),
+  )
+  for (let n = 1; n < 100000; n++) {
+    const candidate = `PI-${year}-${String(n).padStart(4, '0')}`
+    if (!used.has(candidate)) return candidate
+  }
+  throw new Error('could not mint a purchase invoice number')
+}
+

@@ -2351,7 +2351,7 @@ function poGstRate(stored: unknown): number {
 dbRouter.patch('/purchase-orders/:id', requirePermission('purchase', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const { normalizeOrderLines, orderLineTotals, saveOrderLines } = await import('../purchases')
+    const { normalizeOrderLines, orderLineTotals, saveOrderLines, ensurePurchaseInvoiceForOrder } = await import('../purchases')
     const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
     if (!order) return res.status(404).json({ error: 'Purchase order not found' })
 
@@ -2399,7 +2399,31 @@ dbRouter.patch('/purchase-orders/:id', requirePermission('purchase', 'edit'), as
     let savedLines: number | undefined
     if (lines) savedLines = await saveOrderLines(order.id, lines)
     recordCrud('purchase-orders', 'Updated', req, updated)
-    res.json({ ...stripHash(updated), ...(lines ? { lines } : {}), ...(savedLines !== undefined ? { linesSaved: savedLines } : {}) })
+    // Auto-invoice: edited lines change what is owed to the supplier, so the
+    // linked purchase invoice is refreshed to match (header-only edits skip).
+    let autoInvoice: string | undefined
+    let autoInvoiceSkipped: string | undefined
+    if (lines) {
+      try {
+        const ensured = await ensurePurchaseInvoiceForOrder(order.id)
+        if (ensured.ok) {
+          autoInvoice = ensured.invoice.number
+          recordCrud('purchase-invoices', ensured.action === 'created' ? 'Created' : 'Updated', req, ensured.invoice)
+        } else {
+          autoInvoiceSkipped = ensured.skipped
+        }
+      } catch (err) {
+        logger.error({ err }, 'auto purchase invoice refresh failed')
+        autoInvoiceSkipped = 'auto-invoice failed — check server logs'
+      }
+    }
+    res.json({
+      ...stripHash(updated),
+      ...(lines ? { lines } : {}),
+      ...(savedLines !== undefined ? { linesSaved: savedLines } : {}),
+      ...(autoInvoice ? { autoInvoice } : {}),
+      ...(autoInvoiceSkipped ? { autoInvoiceSkipped } : {}),
+    })
   } catch (err) {
     logger.error({ err }, 'purchase order update failed')
     res.status(500).json({ error: 'Failed to update purchase order' })
@@ -2411,7 +2435,7 @@ dbRouter.patch('/purchase-orders/:id', requirePermission('purchase', 'edit'), as
 dbRouter.patch('/purchase-orders/:id/lines', requirePermission('purchase', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const { normalizeOrderLines, orderLineTotals, saveOrderLines } = await import('../purchases')
+    const { normalizeOrderLines, orderLineTotals, saveOrderLines, ensurePurchaseInvoiceForOrder } = await import('../purchases')
     const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
     if (!order) return res.status(404).json({ error: 'Purchase order not found' })
     const lines = normalizeOrderLines(req.body?.items ?? req.body?.lines)
@@ -2427,7 +2451,30 @@ dbRouter.patch('/purchase-orders/:id/lines', requirePermission('purchase', 'edit
       .returning()
     const saved = await saveOrderLines(order.id, lines)
     recordCrud('purchase-orders', 'Updated', req, updated)
-    res.json({ ...stripHash(updated), lines, linesSaved: saved })
+    // Auto-invoice: the order's lines are what gets billed — as soon as they
+    // land, raise the order's purchase invoice (or refresh the one it has).
+    // Never fails the order save itself; the next save retries idempotently.
+    let autoInvoice: string | undefined
+    let autoInvoiceSkipped: string | undefined
+    try {
+      const ensured = await ensurePurchaseInvoiceForOrder(order.id)
+      if (ensured.ok) {
+        autoInvoice = ensured.invoice.number
+        recordCrud('purchase-invoices', ensured.action === 'created' ? 'Created' : 'Updated', req, ensured.invoice)
+      } else {
+        autoInvoiceSkipped = ensured.skipped
+      }
+    } catch (err) {
+      logger.error({ err }, 'auto purchase invoice failed')
+      autoInvoiceSkipped = 'auto-invoice failed — check server logs'
+    }
+    res.json({
+      ...stripHash(updated),
+      lines,
+      linesSaved: saved,
+      ...(autoInvoice ? { autoInvoice } : {}),
+      ...(autoInvoiceSkipped ? { autoInvoiceSkipped } : {}),
+    })
   } catch (err) {
     logger.error({ err }, 'purchase order lines update failed')
     res.status(500).json({ error: 'Failed to save purchase order lines' })
