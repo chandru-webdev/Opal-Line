@@ -146,13 +146,15 @@ async function main() {
   await db.insert(schema.auditLogs).values(auditLogSeed)
   await db.insert(schema.activityLogs).values(activityLogSeed)
   await db.insert(schema.syncLogs).values(syncLogSeed)
-  // Seed admin password: never hardcode a real one. Read from env, or generate
-  // a random password and print it once so the first login is possible.
-  const seedAdminPassword = process.env.SEED_ADMIN_PASSWORD?.trim()
-  const defaultPasswordHash = await argon2.hash(seedAdminPassword || `Opal-${randomBytes(6).toString('base64url')}`, { type: argon2.argon2id })
-  if (!seedAdminPassword) {
-    console.log(`Seed admin (arjun) password: ${seedAdminPassword || '(random — set SEED_ADMIN_PASSWORD to choose one)'}`)
-  }
+  // Seed admin password: same deterministic default as the first-run
+  // bootstrap (SEED_ADMIN_PASSWORD ?? 'Opal@2026', documented in
+  // docs/CONFIGURATION.md). An unset variable must NOT fall back to a random
+  // secret: the docs tell fresh setups to run `npm run db:seed`, and a random
+  // fallback replaced the known bootstrap credential with one that was never
+  // printed — "login not working on the other developers' machines".
+  const seedAdminPassword = process.env.SEED_ADMIN_PASSWORD?.trim() || 'Opal@2026'
+  const defaultPasswordHash = await argon2.hash(seedAdminPassword, { type: argon2.argon2id })
+  console.log(`Seed admin (arjun) password: ${seedAdminPassword}${process.env.SEED_ADMIN_PASSWORD?.trim() ? '' : ' (default — set SEED_ADMIN_PASSWORD to override)'}`)
   const tempPasswordHash = await argon2.hash('Temp@' + randomBytes(8).toString('hex'), { type: argon2.argon2id })
   await db.insert(schema.users).values(userSeed.map((u, i) => ({ 
     ...u, 

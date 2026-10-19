@@ -186,6 +186,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         low_stock_alerts boolean,
         daily_summary boolean,
         order_imports boolean,
+        login_lockout_enabled boolean DEFAULT false,
         shopify_store_url_encrypted text,
         shopify_access_token_encrypted text,
         shopify_api_version text,
@@ -1279,6 +1280,10 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
 async function applyUpgrades(sql: postgres.Sql): Promise<void> {
   const upgrades: string[] = [
     ...STOCK_LEDGER_DDL,
+    // Login lockout became a per-install switch (Settings → Security → Login
+    // lockout), off by default. Existing installs get the column as false,
+    // which keeps today's behaviour (no lockout) until it is turned on.
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS login_lockout_enabled boolean DEFAULT false`,
     `INSERT INTO inventory_locations (id, name, type) VALUES ('LOC-DEFAULT', 'Main Store', 'store') ON CONFLICT DO NOTHING`,
       `CREATE TABLE IF NOT EXISTS loyalty_transactions (
         id text PRIMARY KEY,

@@ -462,7 +462,7 @@ export default function CustomersPage() {
             </div>
           )}
           <DataTable
-            onRowClick={(c) => setViewCustomer(c)}
+            onRowClick={setViewCustomer}
             onSelectionChange={setSelected}
             columns={columns}
             data={filtered}
@@ -473,7 +473,7 @@ export default function CustomersPage() {
       </Card>
 
       <Dialog open={viewCustomer !== null} onOpenChange={(open) => { if (!open) setViewCustomer(null) }}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Avatar className="h-8 w-8">

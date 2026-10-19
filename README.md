@@ -37,10 +37,11 @@ the installed desktop app and a Docker deployment can coexist on one machine.
 
 | Port | Used by |
 |---|---|
-| **5432** | PostgreSQL (standard port) — the dev database (`DATABASE_URL` in `backend/.env`) |
+| **5432** | PostgreSQL on the standard port — only when you point `DATABASE_URL` in `backend/.env` at your own server; `npm run dev` provisions its own cluster and leaves such a URL alone |
 | **47191** | Backend API in development (`npm run dev:server`) |
 | **47192** | Backend API of the installed desktop app (bundled runtime) |
-| **47193** | PostgreSQL of the installed desktop app (portable, `%APPDATA%\Opal Line Billing\pgdata`). The desktop app owns the `opal_line` database; dev uses its own `opal_line_dev` database in the same cluster, so dev seeding/wipes can never touch the app's data |
+| **47193** | PostgreSQL of the installed desktop app (portable, `%APPDATA%\Opal Line Billing\pgdata`) |
+| **47194** | PostgreSQL of the dev stack (portable, `%APPDATA%\Opal Line Billing Dev\pgdata`, provisioned by `npm run dev`) |
 | **47195** | Vite dev server (UI in development) |
 | **47196** | Backend in Docker (`docker-compose.yml`, container listens on 4000) |
 | **47197** | Frontend in Docker (nginx) |
@@ -48,9 +49,9 @@ the installed desktop app and a Docker deployment can coexist on one machine.
 
 In Docker the backend reaches the database over the compose network
 (`DATABASE_URL=...@db:5432`), so 47198 is only for host-side tools. Dev vs
-desktop never collide: dev uses 47191/47195 + external PG on 5432, the desktop
-app uses its own 47192/47193 pair and refuses to start with a clear message if
-those are taken.
+desktop never collide: dev uses 47191/47195 + its own PostgreSQL on 47194, the
+desktop app uses its own 47192/47193 pair and refuses to start with a clear
+message if those are taken.
 
 ## Repository layout
 
@@ -70,19 +71,38 @@ portable server placed in `backend/pgsql`).
 
 ```bash
 npm install              # installs both workspaces (hoisted to root)
-npm run dev              # first run provisions the local PostgreSQL (port 47193),
+npm run dev              # first run provisions a dev-only PostgreSQL (port 47194),
                          # writes backend/.env, then starts backend 47191 + UI 47195
 ```
 
-On first run the backend also bootstraps the schema and the admin user in
-dev's own database `opal_line_dev` (same local cluster and data directory as
-the desktop app, but never the app's `opal_line` database — so dev work and
-seeding can't touch installed-app data). Prefer your own server or a cloud database
-(Neon/Supabase)? Create `backend/.env` from `backend/.env.example` with your
-`DATABASE_URL` first — `npm run dev` then leaves it alone. Add Shopify creds
-there too, or set them later in the UI.
+On first run the backend also bootstraps the schema and the admin user. The
+dev stack is **fully separate from the installed desktop app**: its own
+PostgreSQL cluster (port 47194, data under `%APPDATA%/Opal Line Billing Dev`
+on Windows), its own uploads/backups/encryption key, its own users and
+sessions — logging into the dev UI never logs the desktop app out, and vice
+versa. Both stacks can run at the same time. Prefer your own server or a cloud
+database (Neon/Supabase)? Create `backend/.env` from `backend/.env.example`
+with your `DATABASE_URL` first — `npm run dev` then leaves it alone. Add
+Shopify creds there too, or set them later in the UI.
 
-Default seeded login: **admin / Opal@2026** (change it in Users & Roles).
+### Login not working on a fresh clone?
+
+Every checkout bootstraps **its own database** — credentials do not travel
+between machines:
+
+| Setup | Username | Password |
+|---|---|---|
+| Fresh clone (just `npm run dev`) | `admin` | `Opal@2026` (first login forces a change) |
+| After `npm run db:seed` (demo data) | `arjun` | `Opal@2026` |
+
+A password that works on a teammate's machine will not work on yours. If
+login still fails: check the `npm run dev` output — a first-run bootstrap
+prints the initial-admin banner — and confirm the API is up with
+`curl http://127.0.0.1:47191/api/v1/health` (it should return
+`"database":{"healthy":true,...}`). Repeated failed attempts hit a
+15-minute lockout **when it is switched on** — the product ships with login
+lockout **disabled** for testing; enable it per install in **Settings →
+Security → Login lockout**.
 
 💡 Dev-mode DB check: after `npm run db:seed`, run `curl http://127.0.0.1:47191/api/v1/health` — it should return `"database":{"healthy":true,...}` confirming the API can reach PostgreSQL.
 
@@ -188,7 +208,7 @@ in with the generated first-run admin credentials.
 The first-run bootstrap is verified on a **clean machine**: with the install
 directory, `%APPDATA%\Opal Line Billing` and the uninstall registry entries
 wiped beforehand, the bundled PostgreSQL initializes on 47193, the backend
-bootstraps the schema (45 tables), the generated admin logs in, and
+bootstraps the schema (53 tables), the generated admin logs in, and
 `/api/v1/db/stats` returns fresh data. No Node.js, PostgreSQL or other
 dependency is needed on the target machine.
 

@@ -256,7 +256,7 @@ export default function DuesPage() {
 
       {/* Record Payment dialog */}
       <Dialog open={payFor !== null} onOpenChange={(open) => { if (!open) setPayFor(null) }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Record Payment — {payFor?.customer}</DialogTitle>
             <DialogDescription>

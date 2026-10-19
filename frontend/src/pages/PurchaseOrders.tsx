@@ -372,13 +372,13 @@ export default function PurchaseOrdersPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No purchase orders found"
-            onRowClick={(o) => openView(o)}
+            onRowClick={openView}
           />
         </CardContent>
       </Card>
 
       <Dialog open={viewPo !== null} onOpenChange={(open) => { if (!open) setViewPo(null) }}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>Purchase Order {viewPo?.number}</DialogTitle>
             <DialogDescription>{viewPo ? formatDate(viewPo.date) : ''}</DialogDescription>
@@ -480,7 +480,7 @@ export default function PurchaseOrdersPage() {
             <DialogTitle>New Purchase Order</DialogTitle>
             <DialogDescription>Raise a purchase order with a supplier for silver raw material.</DialogDescription>
           </DialogHeader>
-          <div className="grid gap-4">
+          <div className="space-y-4">
             <Field label="Supplier">
               <SupplierPicker
                 suppliers={suppliers}

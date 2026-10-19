@@ -267,7 +267,7 @@ export default function LedgerPage() {
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>{editing ? 'Edit Ledger Entry' : 'Add Ledger Entry'}</DialogTitle>
             <DialogDescription>{editing ? 'Update the ledger entry details.' : 'Record a new debit or credit entry.'}</DialogDescription>

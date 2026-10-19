@@ -37,6 +37,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   lowStockAlerts: true,
   dailySummary: true,
   orderImports: true,
+  loginLockoutEnabled: false,
   updatedAt: null,
 }
 
@@ -472,14 +473,45 @@ function SettingRow({ title, description, checked, onCheckedChange }: { title: s
         <p className="text-sm font-medium text-foreground">{title}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
       </div>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      <Switch checked={checked} onCheckedChange={onCheckedChange} aria-label={title} />
     </div>
   )
 }
 
 function SessionSecurityCard() {
-  const { currentUser } = useAuth()
+  const { currentUser, hasPermission } = useAuth()
   const [revoking, setRevoking] = useState(false)
+  // Login lockout is a per-install switch saved straight to settings (there is
+  // no form-wide Save in this card), mirroring the recovery-password card.
+  const [lockout, setLockout] = useState(false)
+  const [lockoutSaving, setLockoutSaving] = useState(false)
+  const canEdit = hasPermission('system', 'edit')
+
+  useEffect(() => {
+    dbApi.getSettings()
+      .then((row) => setLockout(row?.loginLockoutEnabled === true))
+      .catch(() => {})
+  }, [])
+
+  const toggleLockout = async (v: boolean) => {
+    const previous = lockout
+    setLockout(v)
+    setLockoutSaving(true)
+    try {
+      const saved = await dbApi.updateSettings({ loginLockoutEnabled: v })
+      if (saved) setLockout(saved.loginLockoutEnabled === true)
+      toast.success(
+        v
+          ? 'Login lockout enabled — 5 failed attempts now lock the account for 15 minutes'
+          : 'Login lockout disabled — failed attempts no longer lock accounts',
+      )
+    } catch (err) {
+      setLockout(previous)
+      toast.error(err instanceof Error ? err.message : 'Could not update the login lockout')
+    } finally {
+      setLockoutSaving(false)
+    }
+  }
 
   const revokeOthers = async () => {
     if (
@@ -518,6 +550,19 @@ function SessionSecurityCard() {
             <LogOut className="h-3.5 w-3.5" /> {revoking ? 'Signing out…' : 'Log out other devices'}
           </Button>
         </div>
+        {canEdit ? (
+          <SettingRow
+            title="Login lockout"
+            description="After 5 failed sign-in attempts, block that account for 15 minutes (recorded in the activity log). Off by default while testing — turn it on for production."
+            checked={lockout}
+            onCheckedChange={(v) => { void toggleLockout(v) }}
+          />
+        ) : null}
+        {lockoutSaving ? (
+          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" /> Saving…
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   )
