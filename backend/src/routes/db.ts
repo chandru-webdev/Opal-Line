@@ -3,7 +3,7 @@ import { Router, type Request, type Response, json as expressJson } from 'expres
 import argon2 from 'argon2'
 import { desc, eq, ilike, inArray, ne, or, sql, and, gte, lte } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
-import { applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
@@ -45,6 +45,19 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
   const out: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(body ?? {})) {
     if (allowed.has(key)) out[key] = value
+  }
+  // Login-lockout rules (Settings → Security): clamp rather than reject, so a
+  // stale UI or scripted PUT can never store threshold 0 (protection off) or
+  // a week-long lock. Mirrors normalizeLockoutPolicy in src/lockout.ts.
+  if (table === s.settings) {
+    const clampRule = (key: 'lockoutThreshold' | 'lockoutDurationMinutes', min: number, max: number) => {
+      if (out[key] === undefined) return
+      const n = Number(out[key])
+      if (!Number.isFinite(n)) throw new Error(`${key} must be a number`)
+      out[key] = Math.min(max, Math.max(min, Math.round(n)))
+    }
+    clampRule('lockoutThreshold', 1, 50)
+    clampRule('lockoutDurationMinutes', 1, 1440)
   }
   // Stock/price floors: the transactional order/invoice paths guard stock with
   // row locks, but direct product writes must never push stock or prices negative.
@@ -673,6 +686,17 @@ export function round2(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+/**
+ * Apply an invoice's stock delta THROUGH THE LEDGER (stock_levels +
+ * stock_movements + the products.stock rollup), all inside the caller's
+ * transaction.
+ *
+ * The old implementation was `UPDATE products SET stock = stock + delta`,
+ * which left the availability balances and the audit trail untouched — a
+ * manual invoice never reduced what the app treats as shoppable stock, and
+ * the rollup silently drifted from the ledger. The historical oversell guard
+ * (row lock + insufficient-stock error) is preserved.
+ */
 async function applyStockDelta(tx: any, sku: string, delta: number): Promise<void> {
   if (!sku || !delta) return
   if (delta < 0) {
@@ -683,10 +707,13 @@ async function applyStockDelta(tx: any, sku: string, delta: number): Promise<voi
       throw new Error(`Insufficient stock for SKU ${sku}: available ${current}, requested ${Math.abs(delta)}`)
     }
   }
-  await tx
-    .update(s.products)
-    .set({ stock: sql`${s.products.stock} + ${delta}` })
-    .where(eq(s.products.sku, sku))
+  await applyStockMovement({
+    sku,
+    qty: delta,
+    type: delta < 0 ? 'sale_out' : 'sale_return_in',
+    refType: 'invoice',
+    tx,
+  })
 }
 
 export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknown>> {
@@ -881,6 +908,16 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         clean.grandTotal = grandTotal
         clean.silverValue = silverValue
         clean.makingCharge = makingCharge
+      } else if (clean.discount !== undefined || clean.gst !== undefined) {
+        // Header-only edit that changes discount/GST: recompute the totals
+        // from the existing subtotal so grandTotal never goes stale. No items
+        // were sent, so stock is untouched.
+        const subtotal = num(existing.subtotal, 0)
+        const gst = num(clean.gst ?? existing.gst, 3)
+        const discount = num(clean.discount ?? existing.discount, 0)
+        const gstAmount = round2(subtotal * gst / 100)
+        clean.gstAmount = gstAmount
+        clean.grandTotal = round2(subtotal + gstAmount - discount)
       }
       if (Object.keys(clean).length === 0) return existing
       const [updated] = await tx.update(s.salesInvoices).set(clean).where(eq(s.salesInvoices.id, routeParam(req.params.id))).returning()
@@ -917,7 +954,7 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
   try {
     const removed = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
-      if (!existing) return false
+      if (!existing) return null
       const items = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       for (const it of items) {
         await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0))
@@ -925,9 +962,24 @@ dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (re
       await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
       await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id)))
       recordCrud('invoices', 'Deleted', req, existing)
-      return true
+      return existing
     })
     if (!removed) return res.status(404).json({ error: 'Not found' })
+    // Deleting an invoice must undo everything it granted: stock is restored
+    // above, and the loyalty points it earned go back too — the same rule as
+    // marking it cancelled/refunded. Fire-and-forget so the delete never
+    // blocks; reverseEarnedForInvoice tolerates the now-missing invoice row
+    // (it falls back to reversing the full outstanding balance).
+    void import('../loyalty')
+      .then(({ reverseEarnedForInvoice }) =>
+        reverseEarnedForInvoice({
+          id: removed.id,
+          number: String(removed.number ?? ''),
+          customer: String(removed.customer ?? ''),
+          reason: `Reversed — invoice ${removed.number} deleted`,
+        }),
+      )
+      .catch(() => undefined)
     res.json({ ok: true, id: routeParam(req.params.id) })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -1246,6 +1298,40 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
 })
 
 // ─── Order status pipeline (kanban drag & drop) ──────────────────────────────
+/**
+ * Auto-raise the sales invoice when an order lands in the fulfilled stage.
+ *
+ * Idempotent (createInvoiceForOrderRow returns the existing number when the
+ * order is already invoiced) and non-blocking: a failure here must never
+ * undo the status move the user just asked for, so errors are logged and
+ * swallowed. Returns the invoice number when one exists after the call.
+ */
+async function autoInvoiceFulfilledOrder(
+  order: typeof s.salesOrders.$inferSelect,
+  actor: { userId?: string | null; ip?: string | null },
+): Promise<string | null> {
+  if (!db || order.invoice) return order.invoice ?? null
+  try {
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    const invoiceNumber = await createInvoiceForOrderRow(order)
+    if (invoiceNumber) {
+      await insertOrderEvent(order.id, 'Invoice Created', `Invoice ${invoiceNumber} generated automatically on fulfilment`, actor.userId ?? 'system')
+      void recordActivity({
+        action: 'Auto-Invoiced Order',
+        module: 'sales',
+        entity: order.internalId ?? order.id,
+        details: `Invoice ${invoiceNumber} created on fulfilment`,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+    return invoiceNumber
+  } catch (err) {
+    logger.error({ err, orderId: order.id }, 'auto-invoice on fulfilment failed')
+    return null
+  }
+}
+
 dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
@@ -1264,7 +1350,11 @@ dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), a
       userId: actor.userId,
       ip: actor.ip,
     })
-    res.json(row)
+    // Receiving the order (fulfilled stage) raises its sales invoice
+    // automatically — the same idempotent pipeline the manual button uses.
+    let autoInvoice: string | null = null
+    if (status === 'fulfilled') autoInvoice = await autoInvoiceFulfilledOrder(row, actor)
+    res.json({ ...row, autoInvoice })
   } catch {
     res.status(400).json({ error: 'Failed to update order status' })
   }
@@ -1407,6 +1497,67 @@ dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res
   }
 })
 
+// Edit a booking that hasn't been converted to an invoice yet: customer,
+// line items, discount and advance. Value/advance are recomputed the same
+// way as create so totals never drift.
+dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [booking] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+    if (!booking.isBooking) return res.status(400).json({ error: 'Order is not a booking' })
+    if (booking.invoice) return res.status(400).json({ error: 'Booking already converted to an invoice — edit the invoice instead' })
+
+    const body = req.body ?? {}
+    const patch: Partial<typeof s.salesOrders.$inferInsert> = {}
+
+    if (body.customer !== undefined) {
+      const customer = String(body.customer ?? '').trim()
+      if (!customer) return res.status(400).json({ error: 'customer cannot be empty' })
+      patch.customer = customer
+    }
+
+    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity?: number; price?: number }>
+    let discount = num(booking.discount, 0)
+    if (body.items !== undefined) {
+      const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(body.items) ? body.items : []
+      const parsed = rawItems
+        .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
+        .filter((it) => it.title && it.quantity > 0)
+      if (parsed.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
+      items = parsed
+      patch.lineItems = parsed
+      patch.items = parsed.reduce((a, it) => a + it.quantity, 0)
+    }
+    if (body.discount !== undefined) {
+      discount = Math.max(toNum(body.discount) ?? 0, 0)
+      patch.discount = discount
+    }
+
+    if (body.items !== undefined || body.discount !== undefined) {
+      const value = Math.round((items.reduce((a, it) => a + Number(it.price ?? 0) * Number(it.quantity ?? 0), 0) - discount) * 100) / 100
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), Math.max(value, 0))
+      patch.value = value
+      patch.advancePaid = advancePaid
+      patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
+    } else if (body.advanceAmount !== undefined) {
+      const value = num(booking.value, 0)
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? 0, 0), Math.max(value, 0))
+      patch.advancePaid = advancePaid
+      patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
+    }
+
+    if (Object.keys(patch).length === 0) return res.json(booking)
+    const [updated] = await db!.update(s.salesOrders).set(patch).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+    recordCrud('sales-orders', 'Updated', req, updated)
+    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} — customer ${updated.customer}, value ₹${num(updated.value, 0).toLocaleString('en-IN')}, advance ₹${num(updated.advancePaid, 0).toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    res.json(updated)
+  } catch (err) {
+    logger.error({ err }, 'booking update failed')
+    res.status(500).json({ error: 'Failed to update booking' })
+  }
+})
+
 // Booking advance payment link — customers pay their advance online via Razorpay
 dbRouter.post('/bookings/:id/payment-link', requirePermission('sales', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
@@ -1545,16 +1696,23 @@ dbRouter.post('/sales-orders/bulk-status', requirePermission('sales', 'edit'), a
     if (ids.length === 0) return res.status(400).json({ error: 'ids is required' })
     if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
     let updated = 0
+    let invoicesCreated = 0
+    const newInvoices: string[] = []
     for (const id of ids) {
       const [row] = await db!.update(s.salesOrders).set({ status }).where(eq(s.salesOrders.id, id)).returning()
       if (row) {
         updated++
         await insertOrderEvent(id, 'Status Change', `Bulk status moved to ${status}`, actorFromRequest(req).userId ?? 'system')
-        if (status === 'fulfilled') void import('../statusNotifications').then((m) => m.notifyOrderFulfilled(row)).catch(() => undefined)
+        if (status === 'fulfilled') {
+          void import('../statusNotifications').then((m) => m.notifyOrderFulfilled(row)).catch(() => undefined)
+          // Receiving the order raises its sales invoice automatically.
+          const invoiceNumber = await autoInvoiceFulfilledOrder(row, actorFromRequest(req))
+          if (invoiceNumber) { invoicesCreated++; newInvoices.push(invoiceNumber) }
+        }
       }
     }
     recordCrud('sales-orders', 'Updated', req, { bulkStatus: status, updated })
-    res.json({ updated, status })
+    res.json({ updated, status, invoicesCreated, newInvoices })
   } catch (err) {
     logger.error({ err }, 'bulk status failed')
     res.status(500).json({ error: 'Bulk status update failed' })
@@ -1636,7 +1794,10 @@ dbRouter.post('/shipments/dispatch', requirePermission('sales', 'edit'), async (
     }
     // Keep order fulfillment in sync
     if (order.status !== 'cancelled') {
-      await db!.update(s.salesOrders).set({ fulfillment: 'fulfilled', status: order.status === 'imported' ? 'processing' : order.status }).where(eq(s.salesOrders.id, orderId))
+      const [updated] = await db!.update(s.salesOrders).set({ fulfillment: 'fulfilled', status: order.status === 'imported' ? 'processing' : order.status }).where(eq(s.salesOrders.id, orderId)).returning()
+      // Dispatch means the goods went out — raise the sales invoice
+      // automatically (idempotent, same pipeline as the manual button).
+      if (updated) await autoInvoiceFulfilledOrder(updated, actorFromRequest(req))
     }
     await insertOrderEvent(orderId, 'Dispatched', `Dispatched via ${courier ?? 'courier'}${trackingNumber ? ` — tracking ${trackingNumber}` : ''}`, actorFromRequest(req).userId ?? 'system')
     // Customer notification with tracking details
@@ -1851,6 +2012,8 @@ dbRouter.post('/purchase-orders/from-reorder', requirePermission('purchase', 'cr
       }, 0)
       const weight = list.reduce((a, p) => a + Number(p.grossWeight ?? p.netWeight ?? 0) * Math.max(1, Math.floor(qty / Math.max(list.length, 1))), 0)
       const value = list.reduce((a, p) => a + Number(p.sellingPrice ?? 0) * Math.max(1, Math.floor(qty / Math.max(list.length, 1))), 0)
+      const subtotal = Math.round(value * 100) / 100
+      const gstAmount = round2((subtotal * 3) / 100)
 
       const [row] = await db!.insert(s.purchaseOrders).values({
         id: randomUUID(),
@@ -1859,7 +2022,11 @@ dbRouter.post('/purchase-orders/from-reorder', requirePermission('purchase', 'cr
         items: list.length,
         qty,
         weight: Math.round(weight * 100) / 100,
-        value: Math.round(value * 100) / 100,
+        value: subtotal,
+        gst: 3,
+        gstAmount,
+        discount: 0,
+        grandTotal: round2(subtotal + gstAmount),
         status: 'draft',
         date: new Date().toISOString(),
       }).returning()
@@ -2160,6 +2327,85 @@ dbRouter.get('/purchase-orders/:id/with-items', requirePermission('purchase', 'v
   }
 })
 
+// Shared GST math for a PO: subtotal (from lines or the stored value) plus
+// the order's gst rate/discount → { gstAmount, grandTotal }.
+function poMoneyTotals(subtotal: number, gstRate: number, discount: number) {
+  const gstAmount = round2((subtotal * gstRate) / 100)
+  return { gstAmount, grandTotal: round2(subtotal + gstAmount - discount) }
+}
+
+// GST rate for a stored PO row. NULL predates the GST columns (or was set
+// explicitly) — fall back to the 3% default. Never use num() here: num(null, 3)
+// returns 0 because Number(null) is a finite 0, which would silently zero the
+// rate on every legacy edit.
+function poGstRate(stored: unknown): number {
+  return stored == null || stored === '' ? 3 : num(stored, 3)
+}
+
+// Full edit of a purchase order: header fields (supplier, status, dates,
+// notes, GST rate, discount) plus optional replacement lines. Registered
+// before the generic /:resource loop so it — not the generic handler — owns
+// PATCH /purchase-orders/:id. Totals (items/qty/weight/value, gst amount,
+// grand total) are ALWAYS derived server-side so the header can never drift
+// from the lines.
+dbRouter.patch('/purchase-orders/:id', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { normalizeOrderLines, orderLineTotals, saveOrderLines } = await import('../purchases')
+    const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Purchase order not found' })
+
+    const body = sanitize(req.body ?? {}, s.purchaseOrders)
+    delete body.id
+    // Numbers are system-minted with a unique index — never client-editable.
+    delete body.number
+    // Derived fields are recomputed below, never taken from the client.
+    delete body.items
+    delete body.qty
+    delete body.weight
+    delete body.value
+    delete body.gstAmount
+    delete body.grandTotal
+
+    const rawGst = (req.body ?? {}).gst
+    const gst = rawGst === undefined || rawGst === null || rawGst === '' ? poGstRate(order.gst) : Number(rawGst)
+    const rawDiscount = (req.body ?? {}).discount
+    const discount = rawDiscount === undefined || rawDiscount === null || rawDiscount === '' ? num(order.discount, 0) : Number(rawDiscount)
+    if (!Number.isFinite(gst) || gst < 0 || gst > 100) return res.status(400).json({ error: 'gst must be a percentage between 0 and 100' })
+    if (!Number.isFinite(discount) || discount < 0) return res.status(400).json({ error: 'discount must be 0 or more' })
+
+    // Lines are only replaced when an array was sent (count-shaped `items: 3`
+    // from legacy bodies is ignored — it is a derived field, not line data).
+    const rawLines = Array.isArray(req.body?.lines)
+      ? req.body.lines
+      : Array.isArray(req.body?.items)
+        ? req.body.items
+        : undefined
+    let lines: Awaited<ReturnType<typeof normalizeOrderLines>> | null = null
+    if (rawLines !== undefined) {
+      lines = normalizeOrderLines(rawLines)
+      if (lines.length === 0) return res.status(400).json({ error: 'At least one line item is required' })
+    }
+
+    const base = lines ? orderLineTotals(lines) : { items: order.items, qty: order.qty, weight: order.weight, value: order.value }
+    const subtotal = num(base.value, 0)
+    const { gstAmount, grandTotal } = poMoneyTotals(subtotal, gst, discount)
+
+    const [updated] = await db!
+      .update(s.purchaseOrders)
+      .set({ ...body, gst, discount, gstAmount, grandTotal, ...base })
+      .where(eq(s.purchaseOrders.id, order.id))
+      .returning()
+    let savedLines: number | undefined
+    if (lines) savedLines = await saveOrderLines(order.id, lines)
+    recordCrud('purchase-orders', 'Updated', req, updated)
+    res.json({ ...stripHash(updated), ...(lines ? { lines } : {}), ...(savedLines !== undefined ? { linesSaved: savedLines } : {}) })
+  } catch (err) {
+    logger.error({ err }, 'purchase order update failed')
+    res.status(500).json({ error: 'Failed to update purchase order' })
+  }
+})
+
 // Replace a PO's lines. Orders only become stock when the purchase invoice is
 // recorded, so this never touches inventory.
 dbRouter.patch('/purchase-orders/:id/lines', requirePermission('purchase', 'edit'), async (req, res) => {
@@ -2171,9 +2417,12 @@ dbRouter.patch('/purchase-orders/:id/lines', requirePermission('purchase', 'edit
     const lines = normalizeOrderLines(req.body?.items ?? req.body?.lines)
     if (lines.length === 0) return res.status(400).json({ error: 'At least one line item is required' })
     const totals = orderLineTotals(lines)
+    // Recompute the GST breakdown too — the stored rate/discount apply to the
+    // new subtotal so the header totals can never go stale after a line edit.
+    const money = poMoneyTotals(num(totals.value, 0), poGstRate(order.gst), num(order.discount, 0))
     const [updated] = await db!
       .update(s.purchaseOrders)
-      .set(totals)
+      .set({ ...totals, ...money })
       .where(eq(s.purchaseOrders.id, order.id))
       .returning()
     const saved = await saveOrderLines(order.id, lines)
@@ -3249,6 +3498,81 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
       return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
     }
     res.status(400).json({ error: 'Failed to update product' })
+  }
+})
+
+// Set a product's count at ONE location, straight from the product edit
+// dialog. Unlike POST /inventory/stock-count, the baseline here mirrors
+// applyStockMovement's pre-ledger adoption rule: a product that has never
+// been through the ledger counts against products.stock instead of a missing
+// level row, which would double-count it. Each call posts a count_adjust
+// movement, so the ledger still explains the new balance.
+dbRouter.patch('/products/:id/stock', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock, shopifyId: s.products.shopifyId })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+    const sku = String(product.sku ?? '').trim()
+    if (!sku) return res.status(400).json({ error: 'Product has no SKU — stock cannot be tracked' })
+
+    const target = Math.floor(Number(req.body?.stock))
+    if (!Number.isFinite(target) || target < 0) {
+      return res.status(400).json({ error: 'stock must be a whole number of 0 or more' })
+    }
+
+    const locationId = await resolveMovementLocation(String(req.body?.locationId ?? ''))
+    const [level] = await db!
+      .select({ qty: s.stockLevels.qty })
+      .from(s.stockLevels)
+      .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, locationId)))
+      .limit(1)
+    let current = stockAtLocation(level?.qty)
+    if (!level) {
+      const [anywhere] = await db!
+        .select({ locationId: s.stockLevels.locationId })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.productId, product.id))
+        .limit(1)
+      if (!anywhere && locationId === DEFAULT_LOCATION_ID) current = stockAtLocation(product.stock)
+    }
+
+    const delta = target - current
+    if (delta === 0) {
+      return res.json({ ok: true, changed: false, stock: stockAtLocation(product.stock), previous: current, locationId })
+    }
+    const next = await applyStockMovement({
+      sku,
+      qty: delta,
+      type: 'count_adjust',
+      locationId,
+      refType: 'product_edit',
+      note: `stock set to ${target} from product edit (was ${current} at ${locationId})`,
+      createdBy: actorFromRequest(req).userId ?? 'system',
+    })
+    // Push the new balance to Shopify for genuinely listed products — editing
+    // a stock count in the product dialog must move the store too, not just
+    // the ledger. Best-effort and awaited (same pattern as the stock-count
+    // endpoint's pushToShopify): the local count already stands on failure.
+    // Unlisted / placeholder-linked SKUs are skipped so a plain local edit
+    // never triggers a Shopify round-trip.
+    let shopifyPush: Awaited<ReturnType<typeof pushInventoryToShopify>> | null = null
+    const shopifyId = String(product.shopifyId ?? '').trim()
+    const linked = shopifyId !== '' && !shopifyId.startsWith('#')
+    if (next !== null && linked) {
+      try {
+        shopifyPush = await pushInventoryToShopify([product.id])
+      } catch (err) {
+        shopifyPush = { ok: false, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Shopify push failed'] }
+      }
+    }
+    res.json({ ok: true, changed: true, stock: next ?? target, previous: current, locationId, shopifyPush })
+  } catch (err) {
+    logger.error({ err }, 'product stock update failed')
+    res.status(400).json({ error: 'Failed to update stock' })
   }
 })
 

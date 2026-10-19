@@ -187,6 +187,10 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         daily_summary boolean,
         order_imports boolean,
         login_lockout_enabled boolean DEFAULT false,
+        lockout_threshold integer DEFAULT 5,
+        lockout_duration_minutes integer DEFAULT 15,
+        rate_schedule jsonb,
+        scheduled_rate_changes jsonb,
         shopify_store_url_encrypted text,
         shopify_access_token_encrypted text,
         shopify_api_version text,
@@ -506,6 +510,12 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         qty integer,
         weight numeric,
         value numeric,
+        gst numeric DEFAULT 3,
+        gst_amount numeric,
+        discount numeric DEFAULT 0,
+        grand_total numeric,
+        notes text,
+        expected_date timestamp,
         status text,
         date timestamp
       )`)
@@ -1274,6 +1284,10 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     // lockout), off by default. Existing installs get the column as false,
     // which keeps today's behaviour (no lockout) until it is turned on.
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS login_lockout_enabled boolean DEFAULT false`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_threshold integer DEFAULT 5`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_duration_minutes integer DEFAULT 15`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS rate_schedule jsonb`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS scheduled_rate_changes jsonb`,
     `INSERT INTO inventory_locations (id, name, type) VALUES ('LOC-DEFAULT', 'Main Store', 'store') ON CONFLICT DO NOTHING`,
       `CREATE TABLE IF NOT EXISTS loyalty_transactions (
         id text PRIMARY KEY,
@@ -1566,6 +1580,12 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         qty integer,
         weight numeric,
         value numeric,
+        gst numeric DEFAULT 3,
+        gst_amount numeric,
+        discount numeric DEFAULT 0,
+        grand_total numeric,
+        notes text,
+        expected_date timestamp,
         status text,
         date timestamp
       )`,
@@ -1683,6 +1703,20 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_id text`,
       `CREATE INDEX IF NOT EXISTS products_supplier_id_idx ON products (supplier_id)`,
       `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS supplier_id text`,
+      // Purchase order detail page: GST breakdown (3% default), discount,
+      // grand total, notes and expected delivery date. Existing rows get the
+      // default rate and a computed GST/grand total so old POs display the
+      // same way new ones do.
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS gst numeric DEFAULT 3`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS gst_amount numeric`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS discount numeric DEFAULT 0`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS grand_total numeric`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS notes text`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS expected_date timestamp`,
+      `UPDATE purchase_orders SET gst = 3 WHERE gst IS NULL`,
+      `UPDATE purchase_orders SET gst_amount = round(coalesce(value, 0) * 0.03, 2) WHERE gst_amount IS NULL`,
+      `UPDATE purchase_orders SET discount = 0 WHERE discount IS NULL`,
+      `UPDATE purchase_orders SET grand_total = round(coalesce(value, 0) + coalesce(gst_amount, 0) - coalesce(discount, 0), 2) WHERE grand_total IS NULL`,
     ]
     for (const stmt of upgrades) {
       await sql.unsafe(stmt).catch(() => undefined)

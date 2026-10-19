@@ -1,6 +1,6 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useEffect, useMemo, useState } from 'react'
-import { Loader2, RefreshCw, Receipt, Plus, Trash2, Link2 } from 'lucide-react'
+import { Loader2, RefreshCw, Receipt, Plus, Pencil, Trash2, Link2 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -35,6 +35,48 @@ export default function Bookings() {
   const [items, setItems] = useState<BookingItem[]>([{ ...EMPTY_ITEM }])
   const [advance, setAdvance] = useState('')
   const [saving, setSaving] = useState(false)
+
+  // Edit form state (unconverted bookings only — the backend rejects edits
+  // once the booking has been invoiced).
+  const [editTarget, setEditTarget] = useState<SalesOrder | null>(null)
+  const [editCustomer, setEditCustomer] = useState('')
+  const [editItems, setEditItems] = useState<BookingItem[]>([{ ...EMPTY_ITEM }])
+  const [editAdvance, setEditAdvance] = useState('')
+  const [editSaving, setEditSaving] = useState(false)
+
+  const openEdit = (b: SalesOrder) => {
+    setEditTarget(b)
+    setEditCustomer(b.customer ?? '')
+    setEditItems(
+      (b.lineItems ?? []).length > 0
+        ? b.lineItems!.map((li) => ({ product: li.title ?? '', sku: li.sku ?? '', qty: li.quantity || 1, price: li.price || 0 }))
+        : [{ ...EMPTY_ITEM }],
+    )
+    setEditAdvance(String(b.advancePaid ?? 0))
+  }
+
+  const submitEdit = async () => {
+    if (!editTarget) return
+    if (!editCustomer.trim()) { toast.error('Customer name is required.'); return }
+    const valid = editItems.filter((it) => it.product.trim() && it.qty > 0)
+    if (valid.length === 0) { toast.error('Add at least one item with a product name and quantity.'); return }
+    setEditSaving(true)
+    try {
+      await dbApi.updateBooking(editTarget.id, {
+        customer: editCustomer.trim(),
+        items: valid.map((it) => ({ product: it.product.trim(), sku: it.sku.trim() || undefined, qty: it.qty, price: Number(it.price) || 0 })),
+        advanceAmount: Number(editAdvance) || 0,
+        discount: Number(editTarget.discount) || 0,
+      })
+      toast.success('Booking updated')
+      setEditTarget(null)
+      void load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Update failed')
+    } finally {
+      setEditSaving(false)
+    }
+  }
 
   const load = async () => {
     setLoading(true)
@@ -152,6 +194,9 @@ export default function Bookings() {
       cell: ({ row }) =>
         !row.original.invoice ? (
           <div className="flex gap-1.5">
+            <Button size="sm" variant="ghost" title="Edit booking" onClick={() => openEdit(row.original)}>
+              <Pencil className="h-3.5 w-3.5" />
+            </Button>
             <Button size="sm" variant="outline" onClick={() => convert(row.original)} disabled={converting === row.original.id}>
               {converting === row.original.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Receipt className="h-3.5 w-3.5" />}
               Convert
@@ -243,6 +288,48 @@ export default function Bookings() {
             <Button variant="outline" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={createBooking} disabled={saving}>
               {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Create booking
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
+        <DialogContent size="lg">
+          <DialogHeader>
+            <DialogTitle>Edit booking {editTarget?.internalId || ''}</DialogTitle>
+            <DialogDescription>Update the customer, items or advance. Only available before the booking is converted to an invoice.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <p className="mb-1 text-xs font-medium">Customer name *</p>
+              <Input value={editCustomer} onChange={(e) => setEditCustomer(e.target.value)} placeholder="e.g. Priya Sharma" />
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-medium">Items *</p>
+              {editItems.map((it, i) => (
+                <div key={i} className="flex flex-wrap items-center gap-2">
+                  <Input className="min-w-0 w-full flex-1 sm:w-auto" placeholder="Product" value={it.product} onChange={(e) => setEditItems((arr) => arr.map((x, j) => (j === i ? { ...x, product: e.target.value } : x)))} />
+                  <Input className="w-28" placeholder="SKU" value={it.sku} onChange={(e) => setEditItems((arr) => arr.map((x, j) => (j === i ? { ...x, sku: e.target.value } : x)))} />
+                  <Input className="w-16" type="number" min={1} value={it.qty} onChange={(e) => setEditItems((arr) => arr.map((x, j) => (j === i ? { ...x, qty: Number(e.target.value) || 1 } : x)))} />
+                  <Input className="w-24" type="number" min={0} placeholder="₹" value={it.price || ''} onChange={(e) => setEditItems((arr) => arr.map((x, j) => (j === i ? { ...x, price: Number(e.target.value) || 0 } : x)))} />
+                  <Button variant="ghost" size="icon" onClick={() => setEditItems((arr) => arr.filter((_, j) => j !== i))} disabled={editItems.length === 1}>
+                    <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                  </Button>
+                </div>
+              ))}
+              <Button variant="outline" size="sm" onClick={() => setEditItems((arr) => [...arr, { ...EMPTY_ITEM }])}>
+                <Plus className="h-3.5 w-3.5" /> Add item
+              </Button>
+            </div>
+            <div>
+              <p className="mb-1 text-xs font-medium">Advance collected (₹)</p>
+              <Input type="number" min={0} value={editAdvance} onChange={(e) => setEditAdvance(e.target.value)} placeholder="0" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button size="sm" onClick={() => void submitEdit()} disabled={editSaving}>
+              {editSaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />} Save changes
             </Button>
           </DialogFooter>
         </DialogContent>

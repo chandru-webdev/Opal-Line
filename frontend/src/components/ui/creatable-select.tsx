@@ -86,8 +86,10 @@ export function CreatableSelect({
             className,
           )}
         >
-          <span className={cn('truncate', !selected && 'text-muted-foreground/80')}>
-            {selected ? selected.label : (placeholder ?? 'Select or type…')}
+          <span className={cn('truncate', !selected && !value && 'text-muted-foreground/80')}>
+            {/* A custom (typed) value has no matching option — show it as-is
+                instead of falling back to the placeholder. */}
+            {selected ? selected.label : (value ? value : (placeholder ?? 'Select or type…'))}
           </span>
           <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
         </button>

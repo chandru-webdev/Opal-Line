@@ -380,14 +380,42 @@ function reportEncryptedMigration({ migrated, failed }) {
   }
 }
 
+/**
+ * backend/pgsql is ~1 GB and NOT in git, so a fresh checkout on another
+ * machine has no server at all. Fetch the portable PostgreSQL once (the same
+ * binaries the desktop installer bundles) instead of dying — this is what
+ * makes `npm run dev` work out of the box on new systems. Returns true when
+ * a usable server was fetched into backend/pgsql.
+ */
+async function ensurePortablePostgresOnce() {
+  if (process.platform !== 'win32') return false
+  try {
+    console.log('[dev] No PostgreSQL found — downloading the portable server into backend/pgsql (~330 MB, one time)…')
+    const { ensurePortablePostgres } = await import('./portable-pg.cjs')
+    await ensurePortablePostgres(join(ROOT, 'backend', 'pgsql'), {
+      log: (m) => console.log(`[dev]${m.trimEnd()}`),
+    })
+    return true
+  } catch (err) {
+    console.log(`[dev] Portable PostgreSQL download failed: ${err?.message ?? err}`)
+    return false
+  }
+}
+
 async function provisionDatabase() {
-  const binDir = findPgBinDir()
+  let binDir = findPgBinDir()
+  if (!binDir && (await ensurePortablePostgresOnce())) {
+    binDir = findPgBinDir()
+  }
   if (!binDir) {
     die(
       'No PostgreSQL found.\n' +
       '    Install PostgreSQL 15+ (https://www.postgresql.org/download/), or put the\n' +
       '    portable server in backend/pgsql/bin, or set DATABASE_URL in backend/.env,\n' +
-      '    then re-run npm run dev.',
+      '    then re-run npm run dev.' +
+      (process.platform === 'win32'
+        ? '\n    (If the automatic portable-server download just failed, check the internet\n     connection and re-run npm run dev.)'
+        : ''),
     )
   }
   const bin = (name) => join(binDir, `${name}${EXE}`)

@@ -828,12 +828,22 @@ export async function createInvoiceForOrderRow(order: typeof schema.salesOrders.
       await deductStock(tx, it.sku, it.qty, orderLocationId)
     }
     await tx.update(schema.salesOrders).set({ invoice: number }).where(eq(schema.salesOrders.id, order.id))
-  })
-  // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
-  void import('./loyalty').then(({ earnForInvoice }) =>
-    earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
-  )
-  return number
+  })    // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
+    void import('./loyalty').then(({ earnForInvoice }) =>
+      earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
+    )
+    // E-invoicing: in `automatic` mode the IRN must be generated for invoices
+    // raised by THIS pipeline (fulfilment, email sync) too — not only for
+    // invoices created through POST /invoices. Fire-and-forget, same rule as
+    // the manual route: a gateway failure must never fail the invoice.
+    void import('./einvoice')
+      .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
+        if ((await resolveEInvoiceMode()) !== 'automatic') return
+        const result = await generateEInvoiceForInvoice(invoiceId)
+        if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
+      })
+      .catch(() => undefined)
+    return number
 }
 
 /**

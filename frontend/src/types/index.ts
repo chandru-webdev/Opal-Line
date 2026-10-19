@@ -28,10 +28,13 @@ export interface AppSettings {
   dailySummary: boolean
   orderImports: boolean
   /**
-   * Account lockout after 5 failed sign-in attempts (15 minutes). Off by
-   * default (testing) — toggled from Settings → Security → Login lockout.
+   * Account lockout after repeated failed sign-ins. Off by default
+   * (testing); the attempts/minutes below are editable from
+   * Settings → Security → Login lockout (defaults 5 / 15).
    */
   loginLockoutEnabled?: boolean
+  lockoutThreshold?: number
+  lockoutDurationMinutes?: number
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }
@@ -291,12 +294,25 @@ export interface SilverRateAutoStatus {
   lastRate: number | null
   lastError: string | null
   fetching: boolean
-  schedule: string
+  /** Configured run days/time for the auto-update (Asia/Kolkata). */
+  schedule: { days: number[]; time: string }
   apiUrlConfigured: boolean
   /** Always true — staff rate changes cannot bypass approval. */
   approvalRequired: boolean
   /** Admin / Super Admin: may apply rate changes and fetch the spot rate. */
   isApprover: boolean
+}
+
+/** A one-off rate change queued from the Silver Rate page (pending only). */
+export interface PendingRateChange {
+  id: string
+  /** New 92.5% silver rate in ₹/gm. */
+  rate: number
+  /** When it applies — ISO-8601 instant (displayed in IST). */
+  applyAt: string
+  requestedBy: string | null
+  /** Optional short reason shown on the queued row ("weekend rate"). */
+  note?: string | null
 }
 
 export interface LowStockItem {
@@ -438,6 +454,8 @@ export interface Invoice {
   customerState?: string
   customerPincode?: string
   customerGstin?: string
+  /** DB column name on sales_invoices; the API returns this key. */
+  buyerGstin?: string | null
   customerStateCode?: string
   items: InvoiceItem[]
   silverValue: number
@@ -452,6 +470,7 @@ export interface Invoice {
   paymentId?: string
   status: 'paid' | 'draft' | 'issued' | 'overdue' | 'cancelled' | 'refunded'
   date: string
+  dueDate?: string | null
   /** GST e-invoice fields, present once an IRN has been generated. */
   irn?: string | null
   irnDate?: string | null
@@ -782,7 +801,16 @@ export interface PurchaseOrder {
   items: number
   qty: number
   weight: number
+  /** Line-item subtotal, before GST and discount. */
   value: number
+  /** GST rate in percent (defaults to 3). */
+  gst?: number | null
+  gstAmount?: number | null
+  discount?: number | null
+  /** value + gstAmount − discount. */
+  grandTotal?: number | null
+  notes?: string | null
+  expectedDate?: string | null
   status: 'open' | 'received' | 'cancelled' | 'draft' | 'closed'
   date: string
   lines?: PurchaseOrderItem[]

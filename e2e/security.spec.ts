@@ -1,4 +1,35 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { expect, request, test } from '@playwright/test'
+
+/**
+ * Best-effort cleanup of a probe identifier's lockout counter so repeated
+ * local runs start from a clean slate. Uses the same DATABASE_URL resolution
+ * as global-setup and never fails the test — a leftover row is ignored
+ * while lockout is off (the shipped default this suite restores).
+ */
+async function clearProbeAttempts(identifier: string): Promise<void> {
+  let url = process.env.DATABASE_URL?.trim() || ''
+  if (!url && process.env.APPDATA) {
+    const pwFile = join(process.env.APPDATA, 'Opal Line Billing', '.pg-password')
+    try {
+      if (existsSync(pwFile)) {
+        const pw = readFileSync(pwFile, 'utf8').trim()
+        if (pw) url = `postgres://postgres:${encodeURIComponent(pw)}@127.0.0.1:47193/opal_line`
+      }
+    } catch { /* fall through */ }
+  }
+  if (!url) return
+  try {
+    const postgres = (await import('postgres')).default
+    const sql = postgres(url, { max: 1, connect_timeout: 5 })
+    try {
+      await sql`DELETE FROM login_attempts WHERE identifier = ${identifier}`
+    } finally {
+      await sql.end({ timeout: 5 })
+    }
+  } catch { /* best effort */ }
+}
 
 /**
  * Security regression suite for the Opal Line Billing backend.
@@ -152,10 +183,13 @@ test.describe('anonymous requests', () => {
     expect(h['ratelimit-limit'] ?? h['ratelimit-policy'] ?? h['x-ratelimit-limit']).toBeTruthy()
   })
 
-  test('repeated failed logins lock the account', async () => {
+  test('repeated failed logins lock the account (editable threshold honoured)', async () => {
     // Lockout is a per-install switch that ships OFF (Settings → Security →
-    // Login lockout, default false). Enable it for this test, then restore
-    // the default so later tests and manual runs see the shipped behaviour.
+    // Login lockout, default false). This test enables it with a CUSTOM
+    // rule — 3 attempts / 10 minutes — to prove the editable Settings values
+    // are what the login path actually enforces, then restores the shipped
+    // defaults (off, 5 / 15) so later tests and manual runs see the shipped
+    // behaviour.
     //
     // Two hard-won details: the settings endpoint is state-changing, so the
     // CSRF header is required (without it the PUT 403s and the lockout
@@ -168,20 +202,38 @@ test.describe('anonymous requests', () => {
       const settings = '/api/v1/db/settings'
       const { csrfToken } = (await (await ctx.get('/api/v1/csrf-token')).json()) as { csrfToken: string }
       const headers = { 'x-csrf-token': csrfToken }
-      const enable = await ctx.put(settings, { headers, data: { loginLockoutEnabled: true } })
+      const enable = await ctx.put(settings, {
+        headers,
+        data: { loginLockoutEnabled: true, lockoutThreshold: 3, lockoutDurationMinutes: 10 },
+      })
       expect(enable.status(), 'enabling the lockout must succeed').toBeLessThan(300)
+      // The stored rule must be exactly what was asked for (the server clamps
+      // out-of-range values, so this also pins the editable bounds).
+      const row = (await (await ctx.get(settings)).json()) as {
+        lockoutThreshold: number
+        lockoutDurationMinutes: number
+      }
+      expect(row.lockoutThreshold, 'custom attempts value is stored as-is').toBe(3)
+      expect(row.lockoutDurationMinutes, 'custom minutes value is stored as-is').toBe(10)
       try {
         const data = { username: 'e2e-lockout-probe', password: 'definitely-wrong' }
-        let last = 0
-        for (let i = 0; i < 6; i++) {
-          const res = await ctx.post('/api/v1/auth/login', { data })
-          last = res.status()
-        }
-        // account lockout (5 failures / 15 min) or IP rate limit must kick in
-        expect(last).toBe(429)
+        // With a threshold of 3 the first failures are ordinary 401s…
+        const first = await ctx.post('/api/v1/auth/login', { data })
+        expect(first.status(), 'first failure is a plain 401').toBe(401)
+        const second = await ctx.post('/api/v1/auth/login', { data })
+        expect(second.status(), 'second failure is still under the threshold').toBe(401)
+        const third = await ctx.post('/api/v1/auth/login', { data })
+        expect(third.status(), 'third failure records the third attempt').toBe(401)
+        // …and the next attempt is locked — not after the shipped 5.
+        const fourth = await ctx.post('/api/v1/auth/login', { data })
+        expect(fourth.status(), 'account locks once the CUSTOM threshold is reached').toBe(429)
       } finally {
-        const restore = await ctx.put(settings, { headers, data: { loginLockoutEnabled: false } })
-        expect(restore.status(), 'restoring the default must succeed').toBeLessThan(300)
+        const restore = await ctx.put(settings, {
+          headers,
+          data: { loginLockoutEnabled: false, lockoutThreshold: 5, lockoutDurationMinutes: 15 },
+        })
+        expect(restore.status(), 'restoring the defaults must succeed').toBeLessThan(300)
+        await clearProbeAttempts('e2e-lockout-probe')
       }
     } finally {
       await ctx.dispose()
