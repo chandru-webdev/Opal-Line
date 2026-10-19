@@ -1,7 +1,7 @@
 import { toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ColumnDef } from '@/lib/table'
-import { Building2, Loader2, MapPin, Package, Plus, Search, Warehouse } from 'lucide-react'
+import { Building2, Loader2, MapPin, Package, Pencil, Plus, Search, Warehouse } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -80,6 +80,48 @@ export default function StockLocationsPage() {
     [summary],
   )
 
+  // Edit a location's details — stock stays attached to the location id, so
+  // renaming never moves units.
+  const [editTarget, setEditTarget] = useState<InventoryLocation | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
+  const [editForm, setEditForm] = useState({ name: '', type: 'store', city: '', manager: '' })
+
+  const openEdit = useCallback((loc: InventoryLocation) => {
+    setEditTarget(loc)
+    setEditForm({
+      name: loc.name ?? '',
+      type: loc.type ?? 'store',
+      city: loc.city ?? '',
+      manager: loc.manager ?? '',
+    })
+  }, [])
+
+  const submitEdit = async () => {
+    if (!editTarget) return
+    const name = editForm.name.trim()
+    if (!name) {
+      toast.error('Give the location a name')
+      return
+    }
+    setEditSaving(true)
+    try {
+      const patch = {
+        name,
+        type: editForm.type,
+        city: editForm.city.trim(),
+        manager: editForm.manager.trim(),
+      }
+      await dbApi.update('inventory/locations', editTarget.id, patch)
+      toast.success('Location updated')
+      setEditTarget(null)
+      load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Update failed — a location with that name may already exist')
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
   const columns = useMemo<ColumnDef<InventoryLocation>[]>(
     () => [
       {
@@ -126,8 +168,23 @@ export default function StockLocationsPage() {
         meta: { align: 'right' as const },
         cell: ({ row }) => <span className="tabular-nums text-foreground">{formatCurrency(summary[row.original.id]?.valueAtCost ?? 0)}</span>,
       },
+      {
+        id: 'actions',
+        header: '',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Edit ${row.original.name}`}
+            onClick={() => openEdit(row.original)}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </Button>
+        ),
+      },
     ],
-    [summary],
+    [summary, openEdit],
   )
 
   return (
@@ -185,6 +242,50 @@ export default function StockLocationsPage() {
           <DataTable columns={columns} data={filtered} loading={loading} emptyMessage="No locations match your search" />
         </CardContent>
       </Card>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
+        <DialogContent className="max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>Edit Location</DialogTitle>
+            <DialogDescription>Update the location's details. Stock held here is unaffected.</DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="col-span-2 space-y-1.5">
+              <Label htmlFor="edit-loc-name">Name</Label>
+              <Input
+                id="edit-loc-name"
+                value={editForm.name}
+                onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="e.g. Andheri Branch"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-loc-type">Type</Label>
+              <Select
+                id="edit-loc-type"
+                options={LOCATION_TYPES}
+                value={editForm.type}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, type: v }))}
+                placeholder="Type"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-loc-city">City</Label>
+              <Input id="edit-loc-city" value={editForm.city} onChange={(e) => setEditForm((f) => ({ ...f, city: e.target.value }))} placeholder="Optional" />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="edit-loc-manager">Manager</Label>
+              <Input id="edit-loc-manager" value={editForm.manager} onChange={(e) => setEditForm((f) => ({ ...f, manager: e.target.value }))} placeholder="Optional" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving || !editForm.name.trim()}>
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

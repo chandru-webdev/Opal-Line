@@ -4,7 +4,7 @@ import { db, schema } from '../db/client'
 import { CONSTANTS } from '../constants'
 import { logger } from '../logger'
 import { computeInputGst, computeTcs, netPayable } from '../gst'
-import { LOCKOUT_THRESHOLD } from '../lockout'
+import { getLockoutPolicy } from './auth'
 import { routeParam } from '../lib/routeParams'
 import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
 
@@ -540,9 +540,15 @@ dashboardRouter.get('/dashboard/security', async (req, res) => {
       gte(schema.auditLogs.timestamp, range.from),
       sql`${schema.auditLogs.timestamp} < ${range.to}`,
     )
+    // "Locked" must use the install's configured threshold (Settings →
+    // Security → Login lockout); when lockout is off nothing is enforced,
+    // so the widget reports zero.
+    const policy = await getLockoutPolicy()
     const [failedLogins, locked, recent] = await Promise.all([
       db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(inRange),
-      db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(sql`${schema.loginAttempts.count} >= ${LOCKOUT_THRESHOLD}`),
+      policy.enabled
+        ? db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(sql`${schema.loginAttempts.count} >= ${policy.threshold}`)
+        : Promise.resolve([{ n: 0 }]),
       db!
         .select({ entity: schema.auditLogs.entity, details: schema.auditLogs.changes, timestamp: schema.auditLogs.timestamp })
         .from(schema.auditLogs)

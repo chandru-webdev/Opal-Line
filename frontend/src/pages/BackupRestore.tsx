@@ -46,7 +46,7 @@ function BackupRestoreContent() {
   const [deleting, setDeleting] = useState<string | null>(null)
   const [cleanupBusy, setCleanupBusy] = useState(false)
   const [notifBusy, setNotifBusy] = useState<string | null>(null)
-  const [autoStatus, setAutoStatus] = useState<{ enabled: boolean; scheduleLabel: string; nextRunAt: string; lastBackup: { fileName: string; exportedAt: string | null; sizeBytes: number } | null; backupCount: number } | null>(null)
+  const [autoStatus, setAutoStatus] = useState<{ enabled: boolean; scheduleLabel: string; nextRunAt: string; lastBackup: { fileName: string; exportedAt: string | null; sizeBytes: number } | null; backupCount: number; localDir?: string | null; lastLocalCopy?: string | null } | null>(null)
   const [everythingBusy, setEverythingBusy] = useState(false)
   const [zipBusy, setZipBusy] = useState(false)
 
@@ -378,6 +378,17 @@ function BackupRestoreContent() {
                   <p className="font-mono text-[12px]">{autoStatus.lastBackup.fileName}</p>
                   <p className="text-xs text-muted-foreground">
                     {formatDateTime(autoStatus.lastBackup.exportedAt ?? '')} · {(autoStatus.lastBackup.sizeBytes / 1024).toFixed(0)} KB
+                  </p>
+                </div>
+              )}
+              {autoStatus.localDir && (
+                <div className="sm:col-span-3">
+                  <p className="text-xs text-muted-foreground">Daily copy saved to local files</p>
+                  <p className="break-all font-mono text-[12px]">{autoStatus.localDir}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {autoStatus.lastLocalCopy
+                      ? `Latest copy: ${autoStatus.lastLocalCopy} (keeps last 30)`
+                      : 'No local copy yet — written after the next 7:00 PM run.'}
                   </p>
                 </div>
               )}

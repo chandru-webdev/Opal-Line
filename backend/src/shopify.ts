@@ -7,6 +7,7 @@ import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, Syn
 import { CONSTANTS } from './constants'
 import { logger } from './logger'
 import { recordAudit } from './activity'
+import { applyStockMovement } from './stock'
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -971,7 +972,29 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     const applied = await applyLiveCatalog(live, rows, pricingRate, {
       insert: async (values) => (await database.insert(schema.products).values(values).returning())[0],
       update: async (existing, patch) => {
-        await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
+        const sku = String(existing.sku ?? '').trim()
+        const delta = Number(patch.stock) - Number(existing.stock ?? 0)
+        if (sku && patch.stock != null && Number.isFinite(delta) && delta !== 0) {
+          // Stock never lands as a raw column write on a pull: record the
+          // change as a `shopify_sync` ledger movement so stock_levels
+          // (availability), stock_movements (audit) and the products.stock
+          // rollup stay in agreement. The semantics are unchanged — it is
+          // still a SET: the movement delta is Shopify's count minus the
+          // current local value.
+          const { stock: _pulled, ...rest } = patch
+          await applyStockMovement({
+            sku,
+            qty: delta,
+            type: 'shopify_sync',
+            refType: 'shopify_pull',
+            note: `Inventory pull → ${Number(patch.stock)} on Shopify`,
+            createdBy: 'system',
+          })
+          await database.update(schema.products).set(rest).where(eq(schema.products.id, existing.id))
+        } else {
+          // No stock change (or unknown SKU / non-finite count): plain write.
+          await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
+        }
       },
     })
     created = applied.created

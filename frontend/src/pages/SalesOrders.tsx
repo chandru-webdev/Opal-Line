@@ -1,4 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
+import { ProductDialog } from '@/components/product-dialog'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -166,6 +167,8 @@ export default function SalesOrdersPage() {
   const [orders, setOrders] = useState<SalesOrder[]>([])
   const [customers, setCustomers] = useState<Customer[]>([])
   const [products, setProducts] = useState<Product[]>([])
+  // Line key whose "New product…" row opened the product dialog (null = closed).
+  const [newProductLineKey, setNewProductLineKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('')
@@ -294,7 +297,7 @@ export default function SalesOrdersPage() {
     setBulkBusy(true)
     try {
       const r = await dbApi.bulkOrderStatus(selectedOrders.map((o) => o.id), status)
-      toast.success(`${r.updated} order(s) updated to ${r.status}`)
+      toast.success(`${r.updated} order(s) updated to ${r.status}${r.invoicesCreated ? ` · ${r.invoicesCreated} invoice(s) created` : ''}`)
       setSelectedOrders([])
       reload()
     } catch (err) {
@@ -1187,9 +1190,20 @@ export default function SalesOrdersPage() {
                           <SearchableSelect
                             placeholder="Select product"
                             searchPlaceholder="Search products..."
-                            options={products.map((p) => ({ value: p.id, label: p.name, keywords: p.sku, subtitle: p.sku }))}
+                            options={[
+                              ...products.map((p) => ({ value: p.id, label: p.name, keywords: p.sku, subtitle: p.sku })),
+                              { value: '__new_product__', label: 'New product…', subtitle: 'Add it without leaving this order' },
+                            ]}
                             value={li.productId}
-                            onValueChange={(v) => selectProduct(li.key, v)}
+                            onValueChange={(v) => {
+                              // Manual-entry escape hatch: open the product
+                              // dialog instead of selecting a line.
+                              if (v === '__new_product__') {
+                                setNewProductLineKey(li.key)
+                                return
+                              }
+                              selectProduct(li.key, v)
+                            }}
                           />
                         </div>
                         <div className="w-20">
@@ -1486,6 +1500,28 @@ export default function SalesOrdersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ProductDialog
+        open={newProductLineKey !== null}
+        onOpenChange={(open) => { if (!open) setNewProductLineKey(null) }}
+        mode="add"
+        onSaved={(product) => {
+          const key = newProductLineKey
+          setNewProductLineKey(null)
+          if (!key) return
+          // Wire the new product straight into the line that opened the
+          // dialog (fields taken from the saved product itself, so no
+          // re-fetch has to land first), then refresh the picker list.
+          setLineItems((prev) =>
+            prev.map((li) =>
+              li.key === key
+                ? { ...li, productId: product.id, title: product.name, sku: product.sku ?? li.sku, price: product.sellingPrice ?? li.price }
+                : li,
+            ),
+          )
+          dbApi.getProducts().then(setProducts).catch(() => {})
+        }}
+      />
     </div>
   )
 }

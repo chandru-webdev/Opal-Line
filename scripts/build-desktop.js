@@ -21,13 +21,12 @@
 const { execSync, execFileSync } = require('child_process')
 const fs = require('fs')
 const path = require('path')
-const https = require('https')
+// Download/extract/prune for the portable server — shared with scripts/dev.mjs,
+// which fetches the same binaries on demand for fresh checkouts.
+const { PG_VERSION, ensurePortablePostgres: fetchPortablePostgres } = require('./portable-pg.cjs')
 
 const ROOT = path.resolve(__dirname, '..')
 const PG_DIR = path.join(ROOT, 'backend', 'pgsql')
-const PG_VERSION = '16.4'
-// EnterpriseDB binaries (zip): windows x64 portables
-const PG_URL = `https://get.enterprisedb.com/postgresql/postgresql-${PG_VERSION}-1-windows-x64-binaries.zip`
 
 function run(cmd, opts = {}) {
   console.log(`  > ${cmd}`)
@@ -52,79 +51,13 @@ function copyDir(src, dest, skip = []) {
   }
 }
 
-function downloadTo(url, dest) {
-  return new Promise((resolveP, rejectP) => {
-    const file = fs.createWriteStream(dest)
-    const go = (u, redirects) => {
-      https.get(u, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume()
-          if (redirects > 5) return rejectP(new Error('Too many redirects'))
-          return go(res.headers.location, redirects + 1)
-        }
-        if (res.statusCode !== 200) return rejectP(new Error(`HTTP ${res.statusCode} for ${u}`))
-        res.pipe(file)
-        file.on('finish', () => file.close(resolveP))
-      }).on('error', rejectP)
-    }
-    go(url, 0)
-  })
-}
-
-// The EnterpriseDB "binaries" zip is a full development distribution: it
-// ships pgAdmin 4 (~16,600 files), StackBuilder, server headers, the full docs
-// tree and debug symbols. None of it is used at runtime — we only ever exec
-// bin/initdb.exe + bin/pg_ctl.exe and let them load lib/ and share/. Shipping
-// it verbatim added ~700 MB to the installer and made electron-builder
-// code-sign ~20,000 files one at a time (a >1 hour build).
-const PG_PRUNE_DIRS = ['pgAdmin 4', 'StackBuilder', 'doc', 'include', 'symbols']
-
-function prunePortablePostgres() {
-  let removed = 0
-  for (const dir of PG_PRUNE_DIRS) {
-    const target = path.join(PG_DIR, dir)
-    if (fs.existsSync(target)) {
-      fs.rmSync(target, { recursive: true, force: true })
-      removed++
-    }
-  }
-  if (removed > 0) console.log(`  Pruned ${removed} unused PostgreSQL director${removed === 1 ? 'y' : 'ies'} (pgAdmin 4, StackBuilder, doc, include, symbols).`)
-}
-
 async function ensurePortablePostgres() {
-  const pgBin = path.join(PG_DIR, 'bin', 'pg_ctl.exe')
-  if (fs.existsSync(pgBin)) {
-    console.log('  PostgreSQL already bundled.')
-    prunePortablePostgres()
-    fs.writeFileSync(path.join(ROOT, 'backend', 'pgsql-present.flag'), new Date().toISOString())
-    return true
-  }
-  console.log(`  Downloading portable PostgreSQL ${PG_VERSION} (~330 MB)…`)
-  const zip = path.join(ROOT, 'pg-binaries.tmp.zip')
   try {
-    await downloadTo(PG_URL, zip)
-    console.log('  Extracting…')
-    // PowerShell Expand-Archive keeps the top-level pgsql/ folder
-    execSync(
-      `powershell -NoProfile -Command "Expand-Archive -Force -LiteralPath '${zip}' -DestinationPath '${ROOT}\\pg-tmp'"`,
-      { stdio: 'inherit', timeout: 10 * 60 * 1000 },
-    )
-    const extracted = path.join(ROOT, 'pg-tmp', 'pgsql')
-    if (!fs.existsSync(path.join(extracted, 'bin', 'pg_ctl.exe'))) {
-      throw new Error('unexpected archive layout')
-    }
-    mkdirp(path.dirname(PG_DIR))
-    fs.renameSync(extracted, PG_DIR)
-    fs.rmSync(zip, { force: true })
-    fs.rmSync(path.join(ROOT, 'pg-tmp'), { recursive: true, force: true })
-    console.log('  PostgreSQL bundled at backend/pgsql')
-    prunePortablePostgres()
+    await fetchPortablePostgres(PG_DIR, { log: console.log })
     fs.writeFileSync(path.join(ROOT, 'backend', 'pgsql-present.flag'), new Date().toISOString())
     return true
   } catch (err) {
     console.warn(`  ⚠️  Could not bundle PostgreSQL (${err.message}).`)
-    console.warn('     Installer will still build; users need PostgreSQL or DATABASE_URL at runtime.')
-    try { fs.rmSync(zip, { force: true }) } catch {}
     fs.rmSync(path.join(ROOT, 'backend', 'pgsql-present.flag'), { force: true })
     return false
   }
@@ -218,9 +151,23 @@ async function main() {
   const drizzleDest = path.join(backendDist, 'drizzle')
   if (fs.existsSync(drizzleSrc)) copyDir(drizzleSrc, drizzleDest)
 
-  // Step 3: Portable PostgreSQL (optional but recommended)
+  // Step 3: Portable PostgreSQL. REQUIRED by default: backend/pgsql is not in
+  // git, so a target PC has nothing else to fall back on — an installer built
+  // without it fails on every user's machine with "No PostgreSQL database is
+  // available". Pass --no-postgres to deliberately build a bundle that needs
+  // an external PostgreSQL or DATABASE_URL instead.
   console.log('\n3️⃣  Bundling PostgreSQL...')
+  const noPgFlag = process.argv.includes('--no-postgres')
   const hasPg = await ensurePortablePostgres()
+  if (!hasPg && !noPgFlag) {
+    throw new Error(
+      'Portable PostgreSQL could not be bundled — the installer would then fail on\n' +
+      ' every target PC with "No PostgreSQL database is available".\n' +
+      '  Fix the download (internet access to get.enterprisedb.com) and retry, or\n' +
+      '  pass --no-postgres to build a bundle that requires an external PostgreSQL.',
+    )
+  }
+  if (!hasPg) console.warn('  ⚠️  --no-postgres: building WITHOUT a bundled database.')
 
   // PostgreSQL's exes link against the VC++ 2015-2022 runtime, which fresh
   // Windows machines may not have installed. Ship the redistributable DLLs
@@ -252,6 +199,17 @@ async function main() {
   // Step 5: Build installer
   console.log('\n5️⃣  Building Windows installer...')
   run('npx electron-builder --config electron/electron-builder.yml --win')
+
+  // Belt and braces: the installer must actually contain the server. A build
+  // that silently dropped pgsql (filter mistake, stale flag file) would only
+  // be discovered on a user's PC as "No PostgreSQL found".
+  if (hasPg) {
+    const shipped = path.join(ROOT, 'dist-electron', 'win-unpacked', 'resources', 'pgsql', 'bin', 'pg_ctl.exe')
+    if (!fs.existsSync(shipped)) {
+      throw new Error(`Build finished but ${shipped} is missing — the installer would ship without PostgreSQL.`)
+    }
+    console.log('  ✔ Verified: bundled PostgreSQL is inside the installer (win-unpacked/resources/pgsql).')
+  }
 
   console.log('\n✅ Build complete!')
   const { version } = require(path.join(ROOT, 'package.json'))

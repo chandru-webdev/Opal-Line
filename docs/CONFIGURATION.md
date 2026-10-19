@@ -225,6 +225,28 @@ Rate lifecycle: *Silver Rate page* or the scheduler updates the rate → all
 product selling prices recompute → matched Shopify variants get the new price
 pushed → a sync-log entry records the change.
 
+The scheduler's run days/time are editable per install from the *Silver Rate
+page → Edit schedule* (any subset of days including weekends, plus a time in
+Asia/Kolkata; default every day at 09:00). Weekend runs are allowed — MCX is
+closed Saturdays and Sundays, so on those days the fetch returns the last
+traded rate or fails (visible in the card's last-fetch status), and manual
+entry remains available.
+
+**One-off scheduled changes** live on the same page (*Scheduled Rate
+Changes* card) behind a guided dialog: set the rate (with ±adjustments and a
+product price-impact preview), pick the date & time (quick picks like
+*Tomorrow 9:00 AM*, *Saturday 10:00 AM*, or any custom instant), add an
+optional short note, and confirm — it is applied automatically at that
+instant, like pressing "Approve & Update Shopify" at that moment. The
+weekend workflow is scheduling Saturday's rate on Friday afternoon. Admin /
+Super Admin only (scheduling is pre-approval), at most 20 queued; queued
+rows show the rate, a countdown and the note, and each can be **edited in
+place** (rate, time, note) or cancelled until it runs. Every outcome is
+written to the activity log ("Scheduled Silver Rate Change Applied", with
+the note). The queue is persisted (settings.scheduled_rate_changes) so
+changes survive a restart, and an overdue change found at startup is applied
+right away.
+
 ## 10. Paths, logging, uploads (desktop/embedded use)
 
 | Variable | Example | Purpose |
@@ -449,11 +471,17 @@ approval and rejection is written to the activity log with the actor's name.
   npm run auth:reset -- someusername    # a different account
   ```
   Do **not** use `npm run db:seed` for this — it truncates every table.
-- **Account lockout (Settings → Security → Login lockout).** After 5 failed
-  sign-in attempts an account is locked for 15 minutes. The product ships
-  with this **disabled** (testing default) — failed attempts never lock an
-  account until an Admin / Super Admin switches it on from Settings. Each
-  install owns the setting (dev stack and desktop app are separate), every
+- **Account lockout (Settings → Security → Login lockout).** After a set
+  number of failed sign-in attempts an account is locked for a set time.
+  Both numbers are **editable from Settings** next to the switch — *Attempts
+  before lockout* (1–50, default 5) and *Lockout duration (minutes)*
+  (1–1440, default 15) — and the values are stored per install in the
+  settings row (`lockout_threshold`, `lockout_duration_minutes`); the server
+  clamps anything out of range, so a bad value can never disable protection
+  or lock accounts out for a week. The product ships with lockout
+  **disabled** (testing default) — failed attempts never lock an account
+  until an Admin / Super Admin switches it on from Settings. Each install
+  owns the setting (dev stack and desktop app are separate), every
   successful use is audited in the activity log, and switching it off starts
   counters fresh on the next attempt.
 - E2E tests abort with a clear 429 message when the login budget is exhausted.

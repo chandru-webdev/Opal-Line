@@ -358,22 +358,25 @@ export interface PurchaseOrderLineInput {
 }
 
 /**
- * Normalise + total purchase-order lines. Amount is rate × weight, falling
- * back to whatever was sent so a plain "qty only" order still saves.
+ * Normalise + total purchase-order lines. Amount is qty × weight × rate — the
+ * weight column holds the PER-PIECE weight and rate is ₹ per gram (jewellery /
+ * bullion pricing), falling back to whatever was sent so a plain "qty only"
+ * order still saves.
  */
 export function normalizeOrderLines(raw: unknown): PurchaseOrderLineInput[] {
   if (!Array.isArray(raw)) return []
   return raw
     .map((it) => {
       const item = it && typeof it === 'object' ? (it as Record<string, unknown>) : {}
+      const qty = Math.max(1, Math.floor(Number(item.qty ?? 1) || 1))
       const weight = Number(item.weight ?? 0) || 0
       const rate = Number(item.rate ?? 0) || 0
       const amount =
-        weight > 0 && rate > 0 ? round2(weight * rate) : round2(Number(item.amount ?? 0) || 0)
+        weight > 0 && rate > 0 ? round2(qty * weight * rate) : round2(Number(item.amount ?? 0) || 0)
       return {
         product: String(item.product ?? item.title ?? '').trim(),
         sku: String(item.sku ?? '').trim(),
-        qty: Math.max(1, Math.floor(Number(item.qty ?? 1) || 1)),
+        qty,
         weight,
         rate,
         amount,
@@ -386,7 +389,8 @@ export function orderLineTotals(lines: PurchaseOrderLineInput[]) {
   return {
     items: lines.length,
     qty: lines.reduce((a, l) => a + l.qty, 0),
-    weight: round2(lines.reduce((a, l) => a + l.weight, 0)),
+    // Header weight is the TOTAL grams: each line's weight is per-piece.
+    weight: round2(lines.reduce((a, l) => a + l.qty * l.weight, 0)),
     value: round2(lines.reduce((a, l) => a + l.amount, 0)),
   }
 }
@@ -595,7 +599,14 @@ export async function reconcileOrder(orderId: string): Promise<OrderReceipt | nu
   const orderedQty = orderedLines.length > 0
     ? orderedLines.reduce((a, l) => a + (Number(l.qty ?? 0) || 0), 0)
     : Number(order.qty ?? 0) || 0
-  const orderedWeight = orderedLines.length > 0 ? sum(orderedLines, 'weight') : Number(order.weight ?? 0) || 0
+  const orderedWeight = orderedLines.length > 0
+    ? round2(
+        orderedLines.reduce(
+          (a, l) => a + (Math.max(1, Math.floor(Number(l.qty ?? 1) || 1)) * (Number(l.weight ?? 0) || 0)),
+          0,
+        ),
+      )
+    : Number(order.weight ?? 0) || 0
   const receivedQty = sum(live, 'qty')
   const receivedWeight = sum(live, 'weight')
 

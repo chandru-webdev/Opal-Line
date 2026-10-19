@@ -1,10 +1,9 @@
+import { eq } from 'drizzle-orm'
 import { db, schema } from './db/client'
 import { applySilverRate } from './shopify'
 import { logger } from './logger'
 import { createScheduler } from './lib/scheduler'
-
-export const SILVER_RATE_HOUR = 9
-export const SILVER_RATE_MINUTE = 0
+import { nextScheduledRun, parseRateSchedule, type SilverRateSchedule } from './lib/rateSchedule'
 
 const IST_TIMEZONE = 'Asia/Kolkata'
 
@@ -23,16 +22,21 @@ function istFileStamp(date = new Date()): string {
   return `${get('year')}-${get('month')}-${get('day')}-${get('hour')}-${get('minute')}-${get('second')}`
 }
 
+// The install's configured run days/time (Settings → Silver Rate →
+// schedule). Loaded from the settings row at startup, refreshed after every
+// run and whenever the schedule is changed over the API — the scheduler's
+// `msUntilNextRun` is synchronous, so it reads this cache.
+let currentSchedule: SilverRateSchedule = parseRateSchedule(null)
+
 function msUntilNextRun(now = new Date()): number {
-  const next = new Date(now)
-  next.setHours(SILVER_RATE_HOUR, SILVER_RATE_MINUTE, 0, 0)
-  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1)
-  return next.getTime() - now.getTime()
+  return Math.max(0, nextScheduledRun(now, currentSchedule).getTime() - now.getTime())
 }
 
 /** Result of the last auto/manual spot-rate fetch, for the settings UI. */
 export interface SilverRateSchedulerStatus {
   enabled: boolean
+  /** The configured run days/time this install uses. */
+  schedule: SilverRateSchedule
   nextRunAt: string
   lastRunAt: string | null
   lastResult: 'success' | 'failed' | 'skipped' | null
@@ -44,6 +48,7 @@ export interface SilverRateSchedulerStatus {
 
 const status: SilverRateSchedulerStatus = {
   enabled: false,
+  schedule: currentSchedule,
   nextRunAt: new Date(Date.now() + msUntilNextRun()).toISOString(),
   lastRunAt: null,
   lastResult: null,
@@ -55,7 +60,8 @@ const status: SilverRateSchedulerStatus = {
 export function getSchedulerStatus(): SilverRateSchedulerStatus {
   return {
     ...status,
-    nextRunAt: new Date(Date.now() + msUntilNextRun()).toISOString(),
+    schedule: currentSchedule,
+    nextRunAt: nextScheduledRun(new Date(), currentSchedule).toISOString(),
     enabled: scheduler.armed,
     fetching: status.fetching,
   }
@@ -118,6 +124,9 @@ export async function runSilverRateUpdate(): Promise<{ ok: boolean; rate: number
       return { ok: false, rate: null, error: 'Database is not configured' }
     }
     const [settings] = await db.select().from(schema.settings).limit(1)
+    // Re-read the configured days/time each pass, so a schedule saved by any
+    // process (or before a restart) is honoured without extra plumbing.
+    currentSchedule = parseRateSchedule(settings?.rateSchedule)
     if (!settings?.autoUpdateMcx) {
       status.lastResult = 'skipped'
       return { ok: false, rate: null, error: 'Auto-update is disabled in settings' } // feature disabled — nothing to do
@@ -154,13 +163,57 @@ const scheduler = createScheduler({
   run: () => runSilverRateUpdate(),
 })
 
+/** Load the install's configured schedule (settings row) into the cache. */
+export async function loadRateSchedule(): Promise<SilverRateSchedule> {
+  if (db) {
+    try {
+      const [row] = await db
+        .select({ rateSchedule: schema.settings.rateSchedule })
+        .from(schema.settings)
+        .where(eq(schema.settings.id, 'app'))
+        .limit(1)
+      currentSchedule = parseRateSchedule(row?.rateSchedule)
+    } catch (err) {
+      logger.warn({ err }, 'Silver rate schedule: could not read settings, using default (daily 09:00)')
+    }
+  }
+  return currentSchedule
+}
+
+/**
+ * Persist a new run schedule (Settings → Silver Rate), reload the cache and
+ * re-arm the timer so the change takes effect immediately. Invalid input is
+ * normalised by parseRateSchedule — a bad row can never stop the schedule
+ * from running entirely.
+ */
+export async function applyRateSchedule(raw: unknown): Promise<SilverRateSchedule> {
+  currentSchedule = parseRateSchedule(raw)
+  if (db) {
+    await db.update(schema.settings).set({ rateSchedule: currentSchedule }).where(eq(schema.settings.id, 'app'))
+  }
+  scheduler.schedule()
+  logger.info({ schedule: currentSchedule }, 'Silver rate auto-update schedule updated')
+  return currentSchedule
+}
+
 export function startSilverRateScheduler(): void {
   if (scheduler.armed) return
-  scheduler.schedule()
-  logger.info(
-    { next: istFileStamp(new Date(Date.now() + msUntilNextRun())), timezone: IST_TIMEZONE },
-    'Silver rate auto-update scheduled (daily 9:00 AM)',
-  )
+  // Pick up the install's configured days/time first; arm either way so a
+  // slow/failed settings read never leaves the auto-update unscheduled.
+  void loadRateSchedule()
+    .catch(() => {})
+    .finally(() => {
+      if (scheduler.armed) return
+      scheduler.schedule()
+      logger.info(
+        {
+          next: istFileStamp(nextScheduledRun(new Date(), currentSchedule)),
+          timezone: IST_TIMEZONE,
+          schedule: currentSchedule,
+        },
+        'Silver rate auto-update scheduled',
+      )
+    })
 }
 
 export function stopSilverRateScheduler(): void {
