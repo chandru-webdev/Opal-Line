@@ -19,7 +19,6 @@ export const MODULES: RbacModule[] = [
 export const MODULE_KEYS = MODULES.map((m) => m.key)
 
 const all: ModulePermission = { view: true, create: true, edit: true, delete: true }
-const viewOnly: ModulePermission = { view: true, create: false, edit: false, delete: false }
 
 export const emptyPermissions = (): Permissions => {
   const out: Permissions = {}
@@ -27,60 +26,19 @@ export const emptyPermissions = (): Permissions => {
   return out
 }
 
+/**
+ * Default module permissions for a role.
+ *
+ * Only the Super Admin role ships with access. Every other role starts with
+ * no modules at all: a super admin turns modules on per user (Users & Roles →
+ * Permissions) or per custom role. The old per-role templates (Admin =
+ * everything, Manager = sales + inventory, …) handed every new user broad
+ * access without anyone deciding it, which is exactly what this removes.
+ */
 export function defaultRolePermissions(name: string): Permissions {
   const p = emptyPermissions()
-
-  switch (name) {
-    case 'Super Admin':
-      for (const m of MODULES) p[m.key] = { ...all }
-      break
-    case 'Admin':
-      // The bootstrap owner is created with this role, so it must be able to do
-      // everything an owner needs — including deleting a user or a custom role.
-      // It previously had system.delete = false, which made the Users page's
-      // Delete button always fail with 403 and left stray roles undeletable.
-      for (const m of MODULES) p[m.key] = { ...all }
-      break
-    case 'Manager':
-      p.dashboard = { ...viewOnly }
-      p.sales = { ...all }
-      p.inventory = { ...all }
-      p.purchase = { view: true, create: true, edit: true, delete: false }
-      p['silver-rate'] = { ...all }
-      p.accounts = { ...viewOnly }
-      p.shopify = { view: true, create: false, edit: false, delete: false }
-      break
-    case 'Accounts':
-      p.accounts = { ...all }
-      p.sales = { view: true, create: false, edit: true, delete: false }
-      p.purchase = { ...viewOnly }
-      p.reports = { ...viewOnly }
-      p.dashboard = { ...viewOnly }
-      p.shopify = { view: true, create: false, edit: false, delete: false }
-      break
-    case 'Purchase':
-      p.purchase = { ...all }
-      p.inventory = { view: true, create: false, edit: true, delete: false }
-      p.reports = { ...viewOnly }
-      p.dashboard = { ...viewOnly }
-      p.shopify = { view: true, create: false, edit: false, delete: false }
-      break
-    case 'Sales':
-      p.sales = { ...all }
-      p.dashboard = { ...viewOnly }
-      p.inventory = { ...viewOnly }
-      p.shopify = { view: true, create: false, edit: false, delete: false }
-      break
-    case 'Shopify Manager':
-      p.shopify = { ...all }
-      p.inventory = { view: true, create: false, edit: true, delete: false }
-      p.dashboard = { ...viewOnly }
-      break
-    case 'Customer Support':
-      p.sales = { view: true, create: false, edit: true, delete: false }
-      p.dashboard = { ...viewOnly }
-      p.shopify = { view: true, create: false, edit: false, delete: false }
-      break
+  if (name === 'Super Admin') {
+    for (const m of MODULES) p[m.key] = { ...all }
   }
   return p
 }
@@ -110,11 +68,64 @@ export async function computeUserPermissions(userId: string): Promise<UserPermis
   if (!db) return null
   const [user] = await db.select().from(schema.users).where(eq(schema.users.id, userId)).limit(1)
   if (!user) return null
+  // A Super Admin has full access by definition: neither the stored role row
+  // nor a personal override may ever narrow it (self-lockout guard — module
+  // grants are this role's decisions to make, not its own constraints).
+  if (user.role === 'Super Admin') {
+    const full = defaultRolePermissions('Super Admin')
+    return { userId: user.id, role: user.role, rolePermissions: full, overrides: null, effective: full }
+  }
   const role = await getRoleByName(user.role)
   const rolePermissions: Permissions = (role?.permissions as Permissions | null) ?? defaultRolePermissions(user.role)
   const overrides = (user.permissions as Permissions | null) ?? null
   const effective = mergePermissions(rolePermissions, overrides)
   return { userId: user.id, role: user.role, rolePermissions, overrides, effective }
+}
+
+/** True when the user's role is Super Admin. */
+export async function isSuperAdminUser(userId: string): Promise<boolean> {
+  if (!db) return false
+  const [user] = await db.select({ role: schema.users.role }).from(schema.users).where(eq(schema.users.id, userId)).limit(1)
+  return user?.role === 'Super Admin'
+}
+
+/** True when a role grants any module (its stored snapshot or its defaults). */
+export async function roleGrantsAnyModule(roleName: string): Promise<boolean> {
+  const role = await getRoleByName(roleName)
+  const perms: Permissions = (role?.permissions as Permissions | null) ?? defaultRolePermissions(roleName)
+  return MODULE_KEYS.some(
+    (k) => perms[k]?.view || perms[k]?.create || perms[k]?.edit || perms[k]?.delete,
+  )
+}
+
+/**
+ * Module access is the super admin's call: only a Super Admin may switch a
+ * module on for a user, define a role that carries permissions, or hand out
+ * the Super Admin role itself. Everything else in the system module (creating
+ * plain users, resetting passwords, …) stays with requirePermission('system', …).
+ */
+export function requireSuperAdmin(req: Request, res: Response, next: NextFunction) {
+  const userId = req.userId
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' })
+    return
+  }
+  if (!db) {
+    res.status(503).json({ error: 'Database unavailable, cannot verify permissions' })
+    return
+  }
+  isSuperAdminUser(userId)
+    .then((ok) => {
+      if (!ok) {
+        res.status(403).json({ error: 'Only a super admin can manage module access' })
+        return
+      }
+      next()
+    })
+    .catch((err) => {
+      logger.error({ err: { message: err.message } }, 'Super admin check failed')
+      res.status(500).json({ error: 'Permission check failed' })
+    })
 }
 
 export function requirePermission(moduleKey: string, action: keyof ModulePermission) {

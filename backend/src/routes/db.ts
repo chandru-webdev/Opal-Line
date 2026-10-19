@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, isNotNull } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import {
   barcodeFormatError,
@@ -15,7 +15,7 @@ import {
   scanCodeError,
 } from '../barcode'
 import { applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
-import { computeUserPermissions, requirePermission } from '../rbac'
+import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
   recoveryPasswordSchema,
@@ -136,6 +136,28 @@ async function prepareUserBody(body: Record<string, unknown>, isUpdate = false):
   if (isUpdate && password == null) delete cleaned.passwordHash
   delete cleaned.password
   return cleaned
+}
+
+/**
+ * Module access is the super admin's call. The generic user create/update
+ * routes must not smuggle it past the dedicated RBAC endpoints: writing the
+ * `permissions` column (grant or reset), assigning the Super Admin role, or
+ * assigning any role that carries module permissions all require a Super
+ * Admin requester. Plain roles with no modules stay assignable to any
+ * system-module editor.
+ */
+async function assertNoPrivilegeEscalation(
+  req: Request,
+  body: Record<string, unknown>,
+): Promise<string | null> {
+  const touchesPermissions = 'permissions' in body
+  const targetRole = typeof body.role === 'string' ? body.role : null
+  const privileged =
+    touchesPermissions ||
+    (targetRole !== null && (targetRole === 'Super Admin' || (await roleGrantsAnyModule(targetRole))))
+  if (!privileged) return null
+  if (await isSuperAdminUser(req.userId ?? '')) return null
+  return 'Only a super admin can grant module access or assign privileged roles'
 }
 
 /**
@@ -3097,17 +3119,25 @@ dbRouter.put('/settings', requirePermission('system', 'edit'), async (req, res) 
     for (const k of SETTINGS_SECRET_COLUMNS) delete body[k as keyof typeof body]
     // Same rule for the recovery password override: a settings round-trip must
     // preserve the stored value untouched (the dedicated endpoint manages it).
-    if (body.notificationSettings && typeof body.notificationSettings === 'object') {
-      const incoming = { ...(body.notificationSettings as Record<string, unknown>) }
-      delete incoming[RECOVERY_PASSWORD_KEY]
-      delete incoming[RECOVERY_PASSWORD_HASH_KEY]
+    // The two "Daily Summary" switches (Business Settings column + Notification
+    // Settings flag) drive the same email, so a write to either one updates both.
+    const wantsNsUpdate = !!(body.notificationSettings && typeof body.notificationSettings === 'object')
+    if (wantsNsUpdate || typeof body.dailySummary === 'boolean') {
       const [current] = await db!.select({ ns: s.settings.notificationSettings }).from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
       const existingNs = (current?.ns ?? null) as Record<string, unknown> | null
+      const incoming: Record<string, unknown> = wantsNsUpdate
+        ? { ...(body.notificationSettings as Record<string, unknown>) }
+        : { ...existingNs }
+      delete incoming[RECOVERY_PASSWORD_KEY]
+      delete incoming[RECOVERY_PASSWORD_HASH_KEY]
       if (existingNs && RECOVERY_PASSWORD_KEY in existingNs) {
         incoming[RECOVERY_PASSWORD_KEY] = existingNs[RECOVERY_PASSWORD_KEY]
       }
       if (existingNs && RECOVERY_PASSWORD_HASH_KEY in existingNs) {
         incoming[RECOVERY_PASSWORD_HASH_KEY] = existingNs[RECOVERY_PASSWORD_HASH_KEY]
+      }
+      if (typeof body.dailySummary === 'boolean') {
+        incoming.dailySummaryEnabled = body.dailySummary
       }
       body.notificationSettings = incoming
     }
@@ -3424,60 +3454,14 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
         error: 'Stock is managed by the stock ledger. Use a stock count for the location, or a transfer.',
       })
     }
-    // Barcode identity. A supplied code is validated and must not already belong
-    // to another product; an explicit empty value clears it. It is handled HERE
-    // rather than in the generic CRUD loop below because these product routes
-    // shadow that loop — logic added to the loop never runs (see the note above).
-    let barcodeAction: { set: string | null } | undefined
-    if ('barcode' in body) {
-      const raw = normalizeBarcode(body.barcode)
-      if (raw) {
-        const fmtError = barcodeFormatError(raw)
-        if (fmtError) return res.status(400).json({ error: fmtError })
-        barcodeAction = { set: raw }
-      } else {
-        barcodeAction = { set: null }
-      }
-      delete body.barcode
-    }
-
-    if (Object.keys(body).length === 0 && !barcodeAction) {
-      return res.status(400).json({ error: 'No valid fields provided' })
-    }
-
-    const id = routeParam(req.params.id)
-    const row = await db!.transaction(async (tx) => {
-      if (barcodeAction) {
-        // Serialise writers on the same code so two concurrent edits cannot
-        // both pass the duplicate check before either row is visible.
-        const lockKey = barcodeAction.set ? `bc:${barcodeAction.set}` : `bc:clear:${id}`
-        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`)
-        if (barcodeAction.set) {
-          const [dup] = await tx
-            .select({ id: s.products.id })
-            .from(s.products)
-            .where(and(eq(s.products.barcode, barcodeAction.set), ne(s.products.id, id)))
-            .limit(1)
-          if (dup) throw new Error(duplicateBarcodeMessage(barcodeAction.set))
-        }
-        body.barcode = barcodeAction.set
-      }
-      const [updated] = await tx.update(s.products).set(body).where(eq(s.products.id, id)).returning()
-      return updated ?? null
-    })
+    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+    const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
-    const msg = errorText(err)
     logger.error({ err }, 'product update failed')
-    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
-    res.status(400).json({
-      error:
-        msg.includes('duplicate') || msg.includes('unique')
-          ? 'That SKU is already used by another product'
-          : 'Failed to update product',
-    })
+    res.status(400).json({ error: 'Failed to update product' })
   }
 })
 
@@ -3498,17 +3482,6 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
     if (!body.id) body.id = randomUUID()
-
-    // Barcode identity: validate a supplied code, otherwise mint one. Generation
-    // only runs when the caller sent no barcode, so a value a user typed in is
-    // never overwritten. (This lives here because the generic CRUD loop below is
-    // shadowed by this route — see the note above.)
-    const requested = normalizeBarcode(body.barcode)
-    if (requested) {
-      const fmtError = barcodeFormatError(requested)
-      if (fmtError) return res.status(400).json({ error: fmtError })
-    }
-    delete body.barcode
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
@@ -3550,13 +3523,7 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   } catch (err) {
     const msg = errorText(err)
     logger.error({ err }, 'product create failed')
-    if (msg.includes('Barcode')) return res.status(400).json({ error: msg })
-    res.status(400).json({
-      error:
-        msg.includes('duplicate') || msg.includes('unique')
-          ? 'A product with that SKU already exists'
-          : 'Failed to create product',
-    })
+    res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
   }
 })
 
@@ -3676,6 +3643,10 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {})
           : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber
@@ -3709,6 +3680,10 @@ for (const [name, table] of Object.entries(resources)) {
         : isUser
           ? await prepareUserBody(req.body ?? {}, true)
           : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
       if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
         body.accountNumberEncrypted = encrypt(body.accountNumber)
         delete body.accountNumber
@@ -4205,7 +4180,10 @@ dbRouter.put('/settings/notifications', requirePermission('system', 'edit'), asy
     const [row] = await db!.select().from(schema.settings).where(sql`${schema.settings.id} = 'app'`).limit(1)
     const existing = (row as any)?.notificationSettings ?? {}
     const merged = { ...existing, ...body }
-    await db!.update(schema.settings).set({ notificationSettings: merged } as any).where(sql`${schema.settings.id} = 'app'`)
+    // Mirror the switch onto the legacy Business Settings column (same email).
+    const setClause: Record<string, unknown> = { notificationSettings: merged }
+    if (typeof body.dailySummaryEnabled === 'boolean') setClause.dailySummary = body.dailySummaryEnabled
+    await db!.update(schema.settings).set(setClause as any).where(sql`${schema.settings.id} = 'app'`)
     const actor = actorFromRequest(req)
     void recordActivity({ action: 'Updated Notification Settings', module: 'system', entity: 'Notifications', details: Object.keys(body).join(', '), userId: actor.userId, ip: actor.ip })
     res.json(merged)

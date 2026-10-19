@@ -15,10 +15,10 @@ import {
   Gem,
   IndianRupee,
   Landmark,
+  Minus,
   Package,
   PackageX,
   Plus,
-  Printer,
   Repeat,
   ShieldAlert,
   ShoppingBag,
@@ -32,7 +32,6 @@ import {
 } from 'lucide-react'
 import { useAuth } from '@/auth/auth-context'
 import { PageHeader } from '@/components/ui/page-header'
-import { printCurrentPage } from '@/lib/printTemplate'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -57,7 +56,11 @@ import type {
   SalesOverviewPoint,
   SilverRate,
   SilverRatePoint,
+  TopCategory,
   TopProduct,
+  PeriodKey,
+  DateRange,
+  RangeQuery,
 } from '@/types'
 import type { ShopifyStatus } from '@/types/shopify'
 import { compactCurrency, formatCurrency, formatDate, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
@@ -117,36 +120,54 @@ export default function DashboardPage() {
   const [silverHistory, setSilverHistory] = useState<SilverRatePoint[]>([])
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
-  const [security, setSecurity] = useState<{ failedLogins24h: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
+  const [security, setSecurity] = useState<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
   const [aging, setAging] = useState<ReceivablesAging | null>(null)
   const [expandedBucket, setExpandedBucket] = useState<AgingBucket['key'] | null>(null)
   const [bucketInvoices, setBucketInvoices] = useState<Partial<Record<AgingBucket['key'], AgingInvoice[] | 'loading'>>>({})
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
+  const [topCategory, setTopCategory] = useState<TopCategory[]>([])
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null)
   const [loading, setLoading] = useState(true)
-  const [period, setPeriod] = useState<PeriodKey>('week')
-  const [customRange, setCustomRange] = useState<DateRange>(() => defaultRange())
+  const [period, setPeriod] = useState<PeriodKey>(() => loadStoredRange()?.period ?? 'today')
+  const [customRange, setCustomRange] = useState<DateRange>(() => loadStoredRange()?.range ?? defaultRange())
 
+  // Persist the page-wide range in sessionStorage: it survives in-app
+  // navigation and a reload, and clears when the app closes.
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(RANGE_STORAGE_KEY, JSON.stringify({ period, range: customRange }))
+    } catch {
+      /* storage unavailable — the range just won't persist */
+    }
+  }, [period, customRange])
+
+  // One range drives every widget here. The non-range widgets (silver rate, low
+  // stock, aging, system status) are fetched alongside and don't change with it.
   useEffect(() => {
     let cancelled = false
+    const range: RangeQuery = period === 'custom' ? { period, start: customRange.start, end: customRange.end } : { period }
     Promise.all([
-      dbApi.getDashboardKpis().catch(() => []),
-      dbApi.getDashboardSummary().catch(() => ({ totalProducts: 0, activeProducts: 0, totalCustomers: 0, activeCustomers: 0, totalSuppliers: 0, activeSuppliers: 0, totalStockQty: 0, totalStockWeight: 0, todayExpenses: 0, pendingPayments: 0 })),
-      dbApi.getTopProducts().catch(() => []),
-      dbApi.getPaymentStatus().catch(() => ({ segments: [], total: 0 })),
+      dbApi.getDashboardKpis(range).catch(() => []),
+      dbApi.getDashboardSummary(range).catch(() => ({ totalProducts: 0, activeProducts: 0, totalCustomers: 0, activeCustomers: 0, totalSuppliers: 0, activeSuppliers: 0, totalStockQty: 0, totalStockWeight: 0, todayExpenses: 0, rangeExpenses: 0, pendingPayments: 0 })),
+      dbApi.getSalesOverview(range).catch(() => []),
+      dbApi.getTopProducts(range).catch(() => []),
+      dbApi.getTopCategory(range).catch(() => []),
+      dbApi.getPaymentStatus(range).catch(() => ({ segments: [], total: 0 })),
       dbApi.getSilverRate().catch(() => null),
       dbApi.getSilverRateHistory().catch(() => []),
       dbApi.getLowStock().catch(() => []),
-      dbApi.getRecentActivities().catch(() => []),
-      dbApi.getAnalyticsStats().catch(() => []),
-      dbApi.getDashboardSecurity().catch(() => null),
+      dbApi.getRecentActivities(range).catch(() => []),
+      dbApi.getAnalyticsStats(range).catch(() => []),
+      dbApi.getDashboardSecurity(range).catch(() => null),
       dbApi.getReceivablesAging().catch(() => null),
       shopifyApi.getStatus().catch(() => null),
-    ]).then(([k, s, tp, ps, sr, sh, ls, ac, an, sec, ag, ss]) => {
+    ]).then(([k, s, so, tp, tc, ps, sr, sh, ls, ac, an, sec, ag, ss]) => {
       if (cancelled) return
       setKpis(k)
       setSummary(s)
+      setSalesData(so)
       setTopProducts(tp)
+      setTopCategory(tc)
       setPaymentStatus(ps)
       setSilverRate(sr)
       setSilverHistory(sh)
@@ -163,37 +184,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true
     }
-  }, [])
-
-  useEffect(() => {
-    let cancelled = false
-    const request =
-      period === 'custom' ? dbApi.getSalesOverview('custom', customRange) : dbApi.getSalesOverview(period)
-    request
-      .then((data) => {
-        if (!cancelled) setSalesData(data)
-      })
-      .catch(() => {
-        if (!cancelled) setSalesData([])
-      })
-    return () => {
-      cancelled = true
-    }
   }, [period, customRange])
-
-  // Print the dashboard as a standalone snapshot: a print-scoped stylesheet
-  // (index.css) unwraps the app shell while the "print-dashboard" body class
-  // is present. printCurrentPage resolves when the dialog/silent job is done
-  // (the desktop app prints to the default printer with no dialog), then the
-  // class comes off again.
-  const printDashboard = async () => {
-    document.body.classList.add('print-dashboard')
-    try {
-      await printCurrentPage()
-    } finally {
-      document.body.classList.remove('print-dashboard')
-    }
-  }
 
   // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
   // a bucket the first time it is expanded.
@@ -218,10 +209,6 @@ export default function DashboardPage() {
         subtitle="Here's what's happening with your ecommerce business today."
         actions={
           <div className="no-print flex items-center gap-2">
-            <Button variant="outline" size="sm" className="gap-1.5" onClick={printDashboard}>
-              <Printer className="h-3.5 w-3.5" />
-              Print / PDF
-            </Button>
             <PeriodSelect
               value={period}
               onChange={setPeriod}
@@ -259,7 +246,8 @@ export default function DashboardPage() {
                   value={kpi.value}
                   trend={kpi.trend}
                   delta={kpi.delta}
-                  support={kpi.deltaLabel}
+                  deltaLabel={kpi.deltaLabel}
+                  support={kpi.rangeLabel}
                   accent={kpi.accent as 'purple'}
                 />
               ))}
@@ -286,14 +274,10 @@ export default function DashboardPage() {
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Sales Overview</CardTitle>
-                <PeriodSelect
-                  value={period}
-                  onChange={setPeriod}
-                  range={customRange}
-                  onRangeChange={setCustomRange}
-                  variant="pill"
-                />
+                <div>
+                  <CardTitle className="text-sm">Sales Overview</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">{periodRangeLabel(period, customRange)}</p>
+                </div>
               </CardHeader>
               <CardContent>
                 <SalesOverviewChart data={salesData} />
@@ -401,6 +385,44 @@ export default function DashboardPage() {
           </div>
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <Card className="xl:col-span-1">
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                  View All <ArrowRight className="h-3.5 w-3.5" />
+                </Button>
+              </CardHeader>
+              <CardContent>
+                {topCategory.length > 0 ? (
+                  <div className="space-y-3">
+                    {topCategory.map((c) => {
+                      const max = topCategory[0]?.revenue || 1
+                      return (
+                        <div key={c.category} className="space-y-1">
+                          <div className="flex items-center justify-between gap-2 text-[12px]">
+                            <span className="truncate font-medium text-foreground">{c.category}</span>
+                            <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(c.revenue)}</span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                            <div className="h-full rounded-full bg-primary-500" style={{ width: `${Math.max(4, Math.round((c.revenue / max) * 100))}%` }} />
+                          </div>
+                          <p className="text-[10.5px] text-muted-foreground">
+                            {formatNumber(c.qty)} pcs · {formatWeight(c.weight)}
+                          </p>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={Tag}
+                    title="No category sales yet"
+                    description="Sales grouped by product category appear here once invoices are raised."
+                  />
+                )}
+              </CardContent>
+            </Card>
+
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
@@ -594,7 +616,7 @@ export default function DashboardPage() {
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security (24h)
+                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
@@ -602,8 +624,8 @@ export default function DashboardPage() {
                   <>
                     <div className="grid grid-cols-2 gap-3">
                       <div className="rounded-lg border p-3">
-                        <p className="text-2xl font-bold text-foreground">{security.failedLogins24h}</p>
-                        <p className="text-[11px] text-muted-foreground">Failed logins (24h)</p>
+                        <p className="text-2xl font-bold text-foreground">{security.failedLogins}</p>
+                        <p className="text-[11px] text-muted-foreground">Failed logins · {periodRangeLabel(period, customRange)}</p>
                       </div>
                       <div className="rounded-lg border p-3">
                         <p className={`text-2xl font-bold ${security.lockedAccounts > 0 ? 'text-destructive' : 'text-foreground'}`}>{security.lockedAccounts}</p>
@@ -684,11 +706,25 @@ export default function DashboardPage() {
 
 const formatNumber = (v: number) => v.toLocaleString('en-IN')
 
-type PeriodKey = 'today' | 'week' | 'month' | 'year' | 'custom'
+const RANGE_STORAGE_KEY = 'opal-line.dashboard.range'
 
-interface DateRange {
-  start: string
-  end: string
+function loadStoredRange(): { period: PeriodKey; range: DateRange } | null {
+  try {
+    const raw = sessionStorage.getItem(RANGE_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { period?: PeriodKey; range?: DateRange }
+    if (!parsed.period || !parsed.range?.start || !parsed.range?.end) return null
+    if (parsed.period === 'custom') {
+      const s = parseISODate(parsed.range.start)
+      const e = parseISODate(parsed.range.end)
+      if (!s || !e || e < s) return null
+      return { period: parsed.period, range: { start: parsed.range.start, end: parsed.range.end } }
+    }
+    const ok = ['today', 'week', 'month', 'year'].includes(parsed.period)
+    return ok ? { period: parsed.period as PeriodKey, range: parsed.range } : null
+  } catch {
+    return null
+  }
 }
 
 const PERIODS: { key: PeriodKey; label: string }[] = [
@@ -888,19 +924,28 @@ function AnalyticsCard({ stat }: { stat: AnalyticsStat }) {
     <Card className="p-4 shadow-kpi">
       <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{stat.label}</p>
       <p className="mt-1.5 text-base font-bold tabular-nums text-foreground">{stat.value}</p>
-      {stat.trend ? (
+      {stat.delta ? (
         <span
           className={cn(
-            'mt-1 inline-flex items-center gap-0.5 text-[11px] font-semibold',
-            stat.trend === 'up' ? 'text-success-700' : 'text-red-600 dark:text-red-400',
+            'mt-1 flex items-center gap-0.5 text-[11px] font-semibold',
+            stat.trend === 'up' && 'text-success-700',
+            stat.trend === 'down' && 'text-red-600 dark:text-red-400',
+            stat.trend === 'flat' && 'text-muted-foreground',
           )}
         >
-          {stat.trend === 'up' ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
+          {stat.trend === 'up' ? (
+            <ArrowUpRight className="h-3 w-3" />
+          ) : stat.trend === 'down' ? (
+            <ArrowDownRight className="h-3 w-3" />
+          ) : (
+            <Minus className="h-3 w-3" />
+          )}
           {stat.delta}
+          {stat.prevLabel ? <span className="font-normal text-muted-foreground">· {stat.prevLabel}</span> : null}
         </span>
-      ) : (
-        <span className="mt-1 block text-[11px] text-muted-foreground">At current silver rate</span>
-      )}
+      ) : stat.rangeLabel ? (
+        <span className="mt-1 block text-[11px] text-muted-foreground">{stat.rangeLabel}</span>
+      ) : null}
     </Card>
   )
 }

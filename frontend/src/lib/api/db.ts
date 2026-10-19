@@ -48,6 +48,7 @@ import type {
   StockTransfer,
   Supplier,
   SyncLog,
+  TopCategory,
   TopProduct,
   User,
   ConnectionSettings,
@@ -61,6 +62,26 @@ import type {
 import { istDateKey } from '@/lib/format'
 import { request, list, maybe, withItems, PAGED } from './core'
 import type { SearchResults, SalesInvoiceRow } from './core'
+
+/** A dashboard date range as the endpoints accept it. */
+type DashboardRangeInput = { period: string; start?: string; end?: string }
+
+/** Build the `period`/`start`/`end` query for a dashboard range. */
+function rangePath(path: string, range?: DashboardRangeInput | string): string {
+  if (!range) return path
+  const q =
+    typeof range === 'string'
+      ? new URLSearchParams({ period: range })
+      : (() => {
+          const params = new URLSearchParams({ period: range.period })
+          if (range.period === 'custom') {
+            if (range.start) params.set('start', range.start)
+            if (range.end) params.set('end', range.end)
+          }
+          return params
+        })()
+  return `${path}?${q.toString()}`
+}
 
 export const dbApi = {
   getSilverRate: async (): Promise<SilverRate> => {
@@ -101,10 +122,10 @@ export const dbApi = {
     request('/silver/auto-rate/fetch-now', { method: 'POST' }),
   toggleSilverRateAuto: (enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> =>
     request('/silver/auto-rate/toggle', { method: 'POST', body: JSON.stringify({ enabled }) }),
-  getDashboardKpis: async (): Promise<KpiCardData[]> => {
+  getDashboardKpis: async (range?: DashboardRangeInput): Promise<KpiCardData[]> => {
     const rows = await request<
-      Array<{ key: string; label: string; value: string; delta: string | null; deltaLabel: string | null; icon: string; trend: 'up' | 'down' | 'flat'; accent: string }>
-    >('/db/dashboard/kpis')
+      Array<{ key: string; label: string; value: string; delta: string | null; deltaLabel: string | null; rangeLabel: string | null; icon: string; trend: 'up' | 'down' | 'flat'; accent: string }>
+    >(rangePath('/db/dashboard/kpis', range))
     return rows.map((r) => ({
       key: r.key,
       label: r.label,
@@ -112,11 +133,12 @@ export const dbApi = {
       trend: r.trend,
       delta: r.delta ?? undefined,
       deltaLabel: r.deltaLabel ?? undefined,
+      rangeLabel: r.rangeLabel ?? undefined,
       icon: r.icon,
       accent: (r.accent as KpiCardData['accent']) ?? 'slate',
     }))
   },
-  getDashboardSummary: () =>
+  getDashboardSummary: (range?: DashboardRangeInput) =>
     request<{
       totalProducts: number
       activeProducts: number
@@ -127,21 +149,18 @@ export const dbApi = {
       totalStockQty: number
       totalStockWeight: number
       todayExpenses: number
+      rangeExpenses: number
       pendingPayments: number
-    }>('/db/dashboard/summary'),
-  getSalesOverview: (period = 'week', range?: { start?: string; end?: string }): Promise<SalesOverviewPoint[]> => {
-    const q = new URLSearchParams({ period })
-    if (range?.start) q.set('start', range.start)
-    if (range?.end) q.set('end', range.end)
-    return request(`/db/dashboard/sales-overview?${q.toString()}`)
-  },
-  getTopProducts: (): Promise<TopProduct[]> => request('/db/dashboard/top-products'),
+    }>(rangePath('/db/dashboard/summary', range)),
+  getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
+  getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),
+  getTopCategory: (range?: DashboardRangeInput): Promise<TopCategory[]> => request(rangePath('/db/dashboard/top-category', range)),
   getProductMargins: (months = 12): Promise<{ months: number; rows: Array<{ sku: string; name: string; qty: number; revenue: number; cost: number; profit: number; marginPct: number }>; totals: { revenue: number; cost: number; profit: number; marginPct: number } }> =>
     request(`/db/reports/product-margins?months=${months}`),
   getProfitAnalytics: (months = 12): Promise<ProfitAnalytics> =>
     request(`/db/dashboard/profit?months=${months}`),
-  getPaymentStatus: (): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
-    request('/db/dashboard/payment-status'),
+  getPaymentStatus: (range?: DashboardRangeInput): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
+    request(rangePath('/db/dashboard/payment-status', range)),
   getReceivablesAging: (): Promise<ReceivablesAging> => request('/db/dashboard/aging'),
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
@@ -156,12 +175,12 @@ export const dbApi = {
       })
   },
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
-  getRecentActivities: (): Promise<Activity[]> => request('/db/dashboard/activities'),
-  getDashboardSecurity: (): Promise<{ failedLogins24h: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> }> =>
-    request('/db/dashboard/security'),
+  getRecentActivities: (range?: DashboardRangeInput): Promise<Activity[]> => request(rangePath('/db/dashboard/activities', range)),
+  getDashboardSecurity: (range?: DashboardRangeInput): Promise<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> }> =>
+    request(rangePath('/db/dashboard/security', range)),
   getNotificationFeed: () =>
     request<{ items: Array<{ type: string; title: string; detail: string | null; at: string | null; href: string }>; counts: { total: number; lowStock: number; alerts: number } }>('/db/notifications/feed'),
-  getAnalyticsStats: (): Promise<AnalyticsStat[]> => request('/db/dashboard/analytics'),
+  getAnalyticsStats: (range?: DashboardRangeInput): Promise<AnalyticsStat[]> => request(rangePath('/db/dashboard/analytics', range)),
   getInventoryOverview: () =>
     request<{
       totalProducts: number

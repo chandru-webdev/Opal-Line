@@ -5,6 +5,7 @@ import { desc, eq, gte, isNotNull, lte, ne, sql, and } from 'drizzle-orm'
 import { exportScopeData, backupDirectory } from './routes/backup'
 import { logger } from './logger'
 import { notifyBackupComplete, notifyLowStock, notifyDailySummary } from './notifications'
+import { loadNotificationPrefs, resolveOwnerRecipient } from './notificationPrefs'
 import { db, getRawClient } from './db/client'
 import * as schema from './db/schema'
 import { escapeHtml } from './htmlEscape'
@@ -187,14 +188,20 @@ function msUntilNextSummary(now = new Date()): number {
   return next.getTime() - now.getTime()
 }
 
-async function runDailySummary(): Promise<void> {
+export async function runDailySummary(): Promise<void> {
   try {
     if (!db) return
     const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-    if (settingsRow && settingsRow.dailySummary === false) return
-    const recipient = process.env.NOTIFICATION_EMAIL?.trim() || settingsRow?.email?.trim()
+    // Both switches control this email: the Notification Settings toggle and
+    // the legacy Business Settings toggle (kept in sync on write; either can disable).
+    const prefs = await loadNotificationPrefs()
+    if (!prefs.dailySummaryEnabled || (settingsRow && settingsRow.dailySummary === false)) {
+      logger.info('Daily summary email skipped — disabled in notification settings')
+      return
+    }
+    const recipient = resolveOwnerRecipient(prefs, settingsRow?.email)
     if (!recipient) {
-      logger.debug('Daily summary skipped — no NOTIFICATION_EMAIL or settings.email')
+      logger.debug('Daily summary skipped — no recipient address configured')
       return
     }
     const sent = await sendDailySummaryEmail(recipient)

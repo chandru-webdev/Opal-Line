@@ -110,6 +110,7 @@ export default function ProductsPage() {
   const [purity, setPurity] = useState('')
   const [stockStatus, setStockStatus] = useState('')
   const [addOpen, setAddOpen] = useState(false)
+  const [editTarget, setEditTarget] = useState<Product | null>(null)
   const [bulkMode, setBulkMode] = useState<'csv' | 'images' | null>(null)
   const [selectedProducts, setSelectedProducts] = useState<Product[]>([])
   const [viewProduct, setViewProduct] = useState<Product | null>(null)
@@ -578,10 +579,30 @@ export default function ProductsPage() {
         open={addOpen}
         onOpenChange={setAddOpen}
         mode="add"
+        products={products}
+        onEditProduct={(p) => {
+          setAddOpen(false)
+          setEditTarget(p)
+        }}
         onSaved={(product, pushed) => {
           setPushMessage(pushed
             ? { ok: true, text: `Created "${product.name}" and pushed to Shopify.` }
             : { ok: true, text: `Created "${product.name}".` })
+          load()
+        }}
+      />
+
+      <ProductDialog
+        open={editTarget !== null}
+        onOpenChange={(o) => { if (!o) setEditTarget(null) }}
+        mode="edit"
+        product={editTarget}
+        products={products}
+        onSaved={(product, pushed) => {
+          setEditTarget(null)
+          setPushMessage(pushed
+            ? { ok: true, text: `Updated "${product.name}" and pushed to Shopify.` }
+            : { ok: true, text: `Updated "${product.name}".` })
           load()
         }}
       />
@@ -594,7 +615,7 @@ export default function ProductsPage() {
       />
 
       <Dialog open={viewProduct !== null} onOpenChange={(open) => { if (!open) setViewProduct(null) }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               {productImageSrc(viewProduct ?? {}) ? (
@@ -642,7 +663,7 @@ export default function ProductsPage() {
       </Dialog>
 
       <Dialog open={reorderFor !== null} onOpenChange={(open) => { if (!open) setReorderFor(null) }}>
-        <DialogContent className="max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Quick Reorder — {reorderFor?.name}</DialogTitle>
             <DialogDescription>Add stock for {reorderFor?.sku}</DialogDescription>

@@ -367,7 +367,7 @@ export default function PaymentsPage() {
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>Add Payment</DialogTitle>
             <DialogDescription>Record a manual payment or adjustment.</DialogDescription>

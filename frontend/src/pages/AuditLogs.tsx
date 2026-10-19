@@ -199,13 +199,13 @@ export default function AuditLogsPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No audit events found"
-            onRowClick={(l) => setViewLog(l)}
+            onRowClick={setViewLog}
           />
         </CardContent>
       </Card>
 
       <Dialog open={viewLog !== null} onOpenChange={(open) => { if (!open) setViewLog(null) }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent size="lg">
           <DialogHeader>
             <DialogTitle>{viewLog?.action}</DialogTitle>
             <DialogDescription>{viewLog ? formatDateTime(viewLog.timestamp) : ''}</DialogDescription>

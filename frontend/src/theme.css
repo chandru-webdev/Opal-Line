@@ -141,14 +141,23 @@
       transform: scale(1);
     }
   }
+  /* No translate here on purpose: DialogContent centers itself with
+     Tailwind v4's -translate-x-1/2 -translate-y-1/2, which sets the
+     standalone `translate` property. A `transform: translate(-50%, -50%)`
+     in the keyframes would STACK on top of it during the animation
+     (translate applies first, then transform), shifting the dialog by
+     -100% of its own size — it flashed at the top-left, then snapped to
+     center when the animation ended. Animating only opacity + scale
+     keeps the position stable; scale composes after the translate and
+     scales around the centered box. */
   @keyframes dialog-in {
     from {
       opacity: 0;
-      transform: translate(-50%, -50%) scale(0.96);
+      transform: scale(0.96);
     }
     to {
       opacity: 1;
-      transform: translate(-50%, -50%) scale(1);
+      transform: scale(1);
     }
   }
   @keyframes slide-in-right {

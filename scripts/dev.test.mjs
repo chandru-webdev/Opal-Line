@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
-import { envFileValue, upsertEnvValue, parseDbUrl, appDataDir } from './dev.mjs'
+import { envFileValue, upsertEnvValue, parseDbUrl, appDataDir, isLegacySharedDbUrl, isOwnDevDbUrl, migrateEncryptedEnvValues } from './dev.mjs'
 
 // Pure-helper tests for the `npm run dev` bootstrap. No database, no network:
 // provisioning itself is exercised live by running `npm run dev`.
@@ -51,6 +51,109 @@ test('upsertEnvValue adds and replaces without disturbing the rest of the file',
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('isLegacySharedDbUrl recognizes only the desktop-app cluster URL', () => {
+  // The exact shape dev.mjs itself used to write (old shared setup):
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), true)
+  assert.equal(isLegacySharedDbUrl('postgres://postgres:pw@127.0.0.1:47193/opal_line'), true)
+  // Hand-maintained URLs must never be migrated:
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47194/opal_line'), false, 'dev cluster URL is current, not legacy')
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@db.example.com:47193/opal_line'), false, 'remote host')
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/other_db'), false, 'different database')
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:5432/opal_line'), false, 'different port')
+})
+
+test('isOwnDevDbUrl recognizes only the dev cluster this script provisions', () => {
+  assert.equal(isOwnDevDbUrl('postgresql://postgres:pw@127.0.0.1:47194/opal_line'), true, 'our own dev URL')
+  assert.equal(isOwnDevDbUrl('postgresql://postgres@127.0.0.1:47194/opal_line'), true, 'password-less variant')
+  assert.equal(isOwnDevDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), false, "desktop app's cluster is handoff, not ours")
+  assert.equal(isOwnDevDbUrl('postgresql://postgres:pw@db.example.com:47194/opal_line'), false, 'same port elsewhere is not ours')
+  assert.equal(isOwnDevDbUrl('not a url'), false)
+  assert.equal(isLegacySharedDbUrl('not a url'), false)
+})
+
+// encV1 helpers mirroring backend/src/lib/crypto.ts (aes-256-gcm,
+// iv[16]+tag[16]+ciphertext base64) so the migration test can craft values.
+const { randomBytes, createCipheriv, createDecipheriv } = await import('node:crypto')
+function encV1(keyHex, plaintext) {
+  const iv = randomBytes(16)
+  const c = createCipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), iv)
+  const enc = Buffer.concat([c.update(plaintext, 'utf8'), c.final()])
+  return 'encV1:' + Buffer.concat([iv, c.getAuthTag(), enc]).toString('base64')
+}
+function decV1(keyHex, value) {
+  const buf = Buffer.from(value.slice('encV1:'.length), 'base64')
+  const d = createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), buf.subarray(0, 16))
+  d.setAuthTag(buf.subarray(16, 32))
+  return d.update(buf.subarray(32), undefined, 'utf8') + d.final('utf8')
+}
+
+test('migrateEncryptedEnvValues re-homes encV1 secrets under the current key', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'opal-encmig-'))
+  try {
+    const appKey = randomBytes(32).toString('hex')
+    const appKeyFile = join(dir, 'app-key')
+    const currentKeyFile = join(dir, 'dev-key')
+    writeFileSync(appKeyFile, appKey)
+    const envPath = join(dir, '.env')
+    writeFileSync(envPath, [
+      'DATABASE_URL=postgresql://x',
+      `SHOPIFY_STORE_URL=${encV1(appKey, 'https://opal.myshopify.com')}`,
+      `SHOPIFY_ACCESS_TOKEN=${encV1(appKey, 'shpat_secret_value')}`,
+      'PLAIN_LINE=keep-me',
+    ].join('\n'))
+
+    const first = migrateEncryptedEnvValues({ envPath, currentKeyFile, sourceKeyFile: appKeyFile })
+    assert.deepEqual(first.migrated.sort(), ['SHOPIFY_ACCESS_TOKEN', 'SHOPIFY_STORE_URL'])
+    assert.deepEqual(first.failed, [])
+
+    // Dev key file was created; values decrypt with it to the original plaintext.
+    const devKey = readFileSync(currentKeyFile, 'utf8').trim()
+    const out = readFileSync(envPath, 'utf8')
+    assert.match(out, /^SHOPIFY_STORE_URL=encV1:/m)
+    assert.equal(decV1(devKey, out.match(/^SHOPIFY_STORE_URL=(.*)$/m)[1]), 'https://opal.myshopify.com')
+    assert.equal(decV1(devKey, out.match(/^SHOPIFY_ACCESS_TOKEN=(.*)$/m)[1]), 'shpat_secret_value')
+    assert.match(out, /^PLAIN_LINE=keep-me$/m, 'non-secret lines untouched')
+    assert.match(out, /^DATABASE_URL=postgresql:\/\/x$/m)
+
+    // Idempotent: a second run migrates nothing and leaves values intact.
+    const before = readFileSync(envPath, 'utf8')
+    const second = migrateEncryptedEnvValues({ envPath, currentKeyFile, sourceKeyFile: appKeyFile })
+    assert.deepEqual(second.migrated, [])
+    assert.equal(readFileSync(envPath, 'utf8'), before)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('migrateEncryptedEnvValues leaves already-current values and reports unopenable ones', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'opal-encmig2-'))
+  try {
+    const currentKey = randomBytes(32).toString('hex')
+    const currentKeyFile = join(dir, 'dev-key')
+    const sourceKeyFile = join(dir, 'app-key') // different key, does NOT open this value
+    writeFileSync(currentKeyFile, currentKey)
+    writeFileSync(sourceKeyFile, randomBytes(32).toString('hex'))
+    const envPath = join(dir, '.env')
+    const already = encV1(currentKey, 'already-mine')
+    const foreign = encV1(randomBytes(32).toString('hex'), 'nobody-can-open')
+    writeFileSync(envPath, `A=${already}\nB=${foreign}`)
+
+    const r = migrateEncryptedEnvValues({ envPath, currentKeyFile, sourceKeyFile })
+    assert.deepEqual(r.migrated, [])
+    assert.deepEqual(r.failed, ['B'], 'unopenable under either key is reported, not dropped')
+    const out = readFileSync(envPath, 'utf8')
+    assert.equal(out.split('\n')[0], `A=${already}`, 'current-key value byte-for-byte untouched')
+    assert.equal(out.split('\n')[1], `B=${foreign}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('appDataDir defaults to the desktop app folder; accepts a sibling name', () => {
+  // The dev stack must NOT share the desktop app's folder.
+  assert.notEqual(appDataDir('Opal Line Billing Dev'), appDataDir())
 })
 
 test('appDataDir resolves to the desktop app data folder for this platform', () => {

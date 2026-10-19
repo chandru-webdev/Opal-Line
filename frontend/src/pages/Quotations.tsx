@@ -27,14 +27,7 @@ import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi, backupApi } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
 import type { AppSettings, Quotation } from '@/types'
@@ -312,7 +305,7 @@ export default function QuotationsPage() {
     }
   }
 
-  const convert = async (q: Quotation) => {
+  const convert = useCallback(async (q: Quotation) => {
     if (!(await confirmDialog({ title: `Convert ${q.number} into a tax invoice?`, description: 'Stock will be deducted and an invoice number generated.', confirmLabel: 'Convert' }))) return
     setConvertingId(q.id)
     setMessage(null)
@@ -325,7 +318,12 @@ export default function QuotationsPage() {
     } finally {
       setConvertingId(null)
     }
-  }
+  }, [load])
+
+  // Stable DataTable row handler: an inline lambda would change identity every
+  // render and defeat the table memo, re-rendering all rows on each dialog
+  // keystroke (felt as input lag).
+  const convertRow = useCallback((q: Quotation) => { void convert(q) }, [convert])
 
   const convertToOrder = async (q: Quotation) => {
     if (!(await confirmDialog({ title: `Convert ${q.number} into a sales order?`, description: 'Creates a confirmed order without stock movement — invoicing happens when the order is fulfilled.', confirmLabel: 'Convert' }))) return
@@ -669,19 +667,29 @@ export default function QuotationsPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No quotations found"
-            onRowClick={(q) => setViewQuote(q)}
-            onRowDoubleClick={(q) => convert(q)}
+            onRowClick={setViewQuote}
+            onRowDoubleClick={convertRow}
           />
         </CardContent>
       </Card>
 
       {/* Create dialog */}
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-h-[calc(100vh-4rem)] max-w-2xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>New Quotation</DialogTitle>
-            <DialogDescription>Create a pre-sale estimate. Nothing is billed until you convert it.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="2xl"
+        title="New Quotation"
+        description="Create a pre-sale estimate. Nothing is billed until you convert it."
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              Create Quotation
+            </Button>
+          </>
+        }
+      >
           <div className="grid gap-3">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Customer name *">
@@ -766,24 +774,32 @@ export default function QuotationsPage() {
 
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button size="sm" onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Create Quotation
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* View dialog */}
-      <Dialog open={viewQuote !== null} onOpenChange={(open) => { if (!open) setViewQuote(null) }}>
-        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-2xl flex-col gap-0 overflow-visible p-0">
-          <DialogHeader className="shrink-0 space-y-1.5 border-b border-border/60 px-5 py-4 pr-12">
-            <DialogTitle>Quotation {viewQuote?.number}</DialogTitle>
-            <DialogDescription>{viewQuote ? formatDate(viewQuote.date) : ''}</DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <AppDialog
+        open={viewQuote !== null}
+        onOpenChange={(open) => { if (!open) setViewQuote(null) }}
+        size="2xl"
+        title={<>Quotation {viewQuote?.number}</>}
+        description={viewQuote ? formatDate(viewQuote.date) : ''}
+        footer={
+          viewQuote && viewQuote.status !== 'converted' && viewQuote.status !== 'cancelled' ? (
+            <div className="flex flex-wrap gap-2">
+              <PrintTemplatePicker docType="quotation" onSelect={(config) => printQuotation(viewQuote, config)} />
+              <Button variant="outline" className="flex-1" size="sm" onClick={() => printQuotation(viewQuote)}>
+                <Printer className="h-4 w-4" /> Print / PDF
+              </Button>
+              <Button variant="outline" className="flex-1" size="sm" onClick={() => backupApi.downloadQuotationPDF(viewQuote.id)}>
+                <Download className="h-4 w-4" /> Download PDF
+              </Button>
+              <Button className="flex-1" size="sm" disabled={convertingId === viewQuote.id} onClick={() => { const q = viewQuote; setViewQuote(null); void convert(q) }}>
+                <Wallet className="h-4 w-4" /> Convert to Invoice
+              </Button>
+            </div>
+          ) : undefined
+        }
+      >
           {viewQuote && (
             <div className="space-y-3 text-sm">
               <div className="flex justify-between"><span className="text-muted-foreground">Customer</span><span className="font-medium">{viewQuote.customer ?? '—'}</span></div>
@@ -813,23 +829,7 @@ export default function QuotationsPage() {
               {viewQuote.notes && <p className="rounded-md bg-muted/50 p-2 text-xs text-muted-foreground">{viewQuote.notes}</p>}
             </div>
           )}
-          </div>
-          {viewQuote && viewQuote.status !== 'converted' && viewQuote.status !== 'cancelled' && (
-            <div className="flex shrink-0 flex-wrap gap-2 border-t border-border/60 px-5 py-3">
-              <PrintTemplatePicker docType="quotation" onSelect={(config) => printQuotation(viewQuote, config)} />
-              <Button variant="outline" className="flex-1" size="sm" onClick={() => printQuotation(viewQuote)}>
-                <Printer className="h-4 w-4" /> Print / PDF
-              </Button>
-              <Button variant="outline" className="flex-1" size="sm" onClick={() => backupApi.downloadQuotationPDF(viewQuote.id)}>
-                <Download className="h-4 w-4" /> Download PDF
-              </Button>
-              <Button className="flex-1" size="sm" disabled={convertingId === viewQuote.id} onClick={() => { const q = viewQuote; setViewQuote(null); convert(q) }}>
-                <Wallet className="h-4 w-4" /> Convert to Invoice
-              </Button>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

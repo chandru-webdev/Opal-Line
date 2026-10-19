@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, request, test } from '@playwright/test'
 
 /**
  * Security regression suite for the Opal Line Billing backend.
@@ -152,15 +152,40 @@ test.describe('anonymous requests', () => {
     expect(h['ratelimit-limit'] ?? h['ratelimit-policy'] ?? h['x-ratelimit-limit']).toBeTruthy()
   })
 
-  test('repeated failed logins lock the account', async ({ request }) => {
-    const data = { username: 'e2e-lockout-probe', password: 'definitely-wrong' }
-    let last = 0
-    for (let i = 0; i < 6; i++) {
-      const res = await request.post('/api/v1/auth/login', { data })
-      last = res.status()
+  test('repeated failed logins lock the account', async () => {
+    // Lockout is a per-install switch that ships OFF (Settings → Security →
+    // Login lockout, default false). Enable it for this test, then restore
+    // the default so later tests and manual runs see the shipped behaviour.
+    //
+    // Two hard-won details: the settings endpoint is state-changing, so the
+    // CSRF header is required (without it the PUT 403s and the lockout
+    // silently stays off), and the bare `request` fixture does not pick up
+    // the config's storageState here — build an authenticated context
+    // explicitly (global setup has written e2e/.auth/state.json by now).
+    const baseURL = process.env.E2E_BASE_URL ?? 'http://127.0.0.1:47195'
+    const ctx = await request.newContext({ baseURL, storageState: 'e2e/.auth/state.json' })
+    try {
+      const settings = '/api/v1/db/settings'
+      const { csrfToken } = (await (await ctx.get('/api/v1/csrf-token')).json()) as { csrfToken: string }
+      const headers = { 'x-csrf-token': csrfToken }
+      const enable = await ctx.put(settings, { headers, data: { loginLockoutEnabled: true } })
+      expect(enable.status(), 'enabling the lockout must succeed').toBeLessThan(300)
+      try {
+        const data = { username: 'e2e-lockout-probe', password: 'definitely-wrong' }
+        let last = 0
+        for (let i = 0; i < 6; i++) {
+          const res = await ctx.post('/api/v1/auth/login', { data })
+          last = res.status()
+        }
+        // account lockout (5 failures / 15 min) or IP rate limit must kick in
+        expect(last).toBe(429)
+      } finally {
+        const restore = await ctx.put(settings, { headers, data: { loginLockoutEnabled: false } })
+        expect(restore.status(), 'restoring the default must succeed').toBeLessThan(300)
+      }
+    } finally {
+      await ctx.dispose()
     }
-    // account lockout (5 failures / 15 min) or IP rate limit must kick in
-    expect(last).toBe(429)
   })
 
   test('frontend bundle ships without source maps', async ({ request }) => {

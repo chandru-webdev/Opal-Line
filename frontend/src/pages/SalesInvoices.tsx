@@ -1,5 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
 import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Plus, Printer, Search, Undo2, X } from 'lucide-react'
@@ -12,14 +12,8 @@ import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { DataTable } from '@/components/ui/data-table'
 import { printCurrentPage } from '@/lib/printTemplate'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -109,6 +103,21 @@ export default function SalesInvoicesPage() {
       setDuplicatingId(null)
     }
   }
+
+  // Stable DataTable row handlers: inline lambdas would change identity every
+  // render and defeat the table memo, re-rendering all rows on each keystroke
+  // in the view dialog (felt as input lag).
+  const openInvoice = useCallback((inv: Invoice) => {
+    setViewInvoice(inv)
+    setInvoiceItems(inv.items ?? [])
+    if (!inv.items?.length) {
+      dbApi.getInvoiceById(inv.id).then((full) => {
+        if (full) setInvoiceItems(full.items ?? [])
+      }).catch(() => {})
+    }
+  }, [])
+
+  const openInvoicePage = useCallback((inv: Invoice) => navigate(`/sales/invoices/${inv.id}`), [navigate])
 
   const columns = useMemo<ColumnDef<Invoice>[]>(
     () => [
@@ -297,16 +306,8 @@ export default function SalesInvoicesPage() {
           </div>
 
           <DataTable
-            onRowDoubleClick={(inv) => navigate(`/sales/invoices/${inv.id}`)}
-            onRowClick={(inv) => {
-              setViewInvoice(inv)
-              setInvoiceItems(inv.items ?? [])
-              if (!inv.items?.length) {
-                dbApi.getInvoiceById(inv.id).then((full) => {
-                  if (full) setInvoiceItems(full.items ?? [])
-                }).catch(() => {})
-              }
-            }}
+            onRowDoubleClick={openInvoicePage}
+            onRowClick={openInvoice}
             columns={columns}
             data={filtered}
             loading={loading}
@@ -315,13 +316,49 @@ export default function SalesInvoicesPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={viewInvoice !== null} onOpenChange={(open) => { if (!open) setViewInvoice(null) }}>
-        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-2xl flex-col gap-0 overflow-visible p-0 print-dialog">
-          <DialogHeader className="shrink-0 space-y-1.5 border-b border-border/60 px-5 py-4 pr-12">
-            <DialogTitle>{viewInvoice?.number}</DialogTitle>
-            <DialogDescription>{viewInvoice ? `Linked order ${viewInvoice.shopifyOrder || '—'} · ${formatDate(viewInvoice.date ?? '')}` : ''}</DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <AppDialog
+        open={viewInvoice !== null}
+        onOpenChange={(open) => { if (!open) setViewInvoice(null) }}
+        size="2xl"
+        className="print-dialog"
+        footerClassName="no-print"
+        title={viewInvoice?.number}
+        description={viewInvoice ? `Linked order ${viewInvoice.shopifyOrder || '—'} · ${formatDate(viewInvoice.date ?? '')}` : ''}
+        footer={
+          <DialogFooter className="flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
+            <Button variant="outline" onClick={() => void printCurrentPage()}>
+              <Printer className="h-4 w-4" /> Print / PDF
+            </Button>
+            {(() => {
+              const inv = viewInvoice
+              if (!inv) return null
+              const phone = inv.customerPhone || customers.find((c) => c.name === inv.customer)?.phone || ''
+              if (!phone) return null
+              return (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    const digits = phone.replace(/\D/g, '')
+                    const withCc = digits.length === 10 ? '91' + digits : digits
+                    const text = encodeURIComponent(
+                      `Invoice ${inv.number}\nCustomer: ${inv.customer}\nAmount: ₹${inv.grandTotal.toLocaleString('en-IN')}\nStatus: ${inv.paymentStatus}\n\n— Opal Line`,
+                    )
+                    window.open(`https://wa.me/${withCc}?text=${text}`, '_blank')
+                  }}
+                >
+                  <MessageCircle className="h-4 w-4" /> WhatsApp
+                </Button>
+              )
+            })()}
+            <Button asChild className="ml-auto">
+              <Link to={`/sales/invoices/${viewInvoice?.id ?? ''}`}>
+                <Eye className="h-4 w-4" /> Open Full Page
+              </Link>
+            </Button>
+          </DialogFooter>
+        }
+      >
           {viewInvoice ? (
             <div className="space-y-0.5 text-sm">
               <DetailRow label="Customer" value={viewInvoice.customer || '—'} />
@@ -361,41 +398,7 @@ export default function SalesInvoicesPage() {
               ) : null}
             </div>
           ) : null}
-          </div>
-          <DialogFooter className="no-print shrink-0 flex-wrap gap-2 border-t border-border/60 px-5 py-3">
-            <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
-            <Button variant="outline" onClick={() => void printCurrentPage()}>
-              <Printer className="h-4 w-4" /> Print / PDF
-            </Button>
-            {(() => {
-              const inv = viewInvoice
-              if (!inv) return null
-              const phone = inv.customerPhone || customers.find((c) => c.name === inv.customer)?.phone || ''
-              if (!phone) return null
-              return (
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    const digits = phone.replace(/\D/g, '')
-                    const withCc = digits.length === 10 ? '91' + digits : digits
-                    const text = encodeURIComponent(
-                      `Invoice ${inv.number}\nCustomer: ${inv.customer}\nAmount: ₹${inv.grandTotal.toLocaleString('en-IN')}\nStatus: ${inv.paymentStatus}\n\n— Opal Line`,
-                    )
-                    window.open(`https://wa.me/${withCc}?text=${text}`, '_blank')
-                  }}
-                >
-                  <MessageCircle className="h-4 w-4" /> WhatsApp
-                </Button>
-              )
-            })()}
-            <Button asChild className="ml-auto">
-              <Link to={`/sales/invoices/${viewInvoice?.id ?? ''}`}>
-                <Eye className="h-4 w-4" /> Open Full Page
-              </Link>
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

@@ -41,6 +41,8 @@ interface StatCardProps {
   value: string
   trend?: 'up' | 'down' | 'flat'
   delta?: string
+  /** Context for the delta, e.g. "vs yesterday" or "vs last week". */
+  deltaLabel?: string
   support?: string
   accent?: keyof typeof accentStyles
   className?: string
@@ -52,6 +54,7 @@ export function StatCard({
   value,
   trend,
   delta,
+  deltaLabel,
   support,
   accent = 'purple',
   className,
@@ -88,6 +91,7 @@ export function StatCard({
             {delta ?? '—'}
           </span>
         ) : null}
+        {deltaLabel ? <span className="text-xs text-muted-foreground">{deltaLabel}</span> : null}
         {support ? <span className="text-xs text-muted-foreground">{support}</span> : null}
       </div>
     </div>

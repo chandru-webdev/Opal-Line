@@ -70,17 +70,40 @@ portable server placed in `backend/pgsql`).
 
 ```bash
 npm install              # installs both workspaces (hoisted to root)
-npm run dev              # first run provisions the local PostgreSQL (port 47193),
+npm run dev              # first run provisions a dev-only PostgreSQL (port 47194),
                          # writes backend/.env, then starts backend 47191 + UI 47195
 ```
 
-On first run the backend also bootstraps the schema and the admin user (same
-data directory as the desktop app). Prefer your own server or a cloud database
-(Neon/Supabase)? Create `backend/.env` from `backend/.env.example` with your
-`DATABASE_URL` first — `npm run dev` then leaves it alone. Add Shopify creds
-there too, or set them later in the UI.
+On first run the backend also bootstraps the schema and the admin user. The
+dev stack is **fully separate from the installed desktop app**: its own
+PostgreSQL cluster (port 47194, data under `%APPDATA%/Opal Line Billing Dev`
+on Windows), its own uploads/backups/encryption key, its own users and
+sessions — logging into the dev UI never logs the desktop app out, and vice
+versa. Both stacks can run at the same time. Prefer your own server or a cloud
+database (Neon/Supabase)? Create `backend/.env` from `backend/.env.example`
+with your `DATABASE_URL` first — `npm run dev` then leaves it alone. Add
+Shopify creds there too, or set them later in the UI.
 
-Default seeded login: **admin / Opal@2026** (change it in Users & Roles).
+### Login not working on a fresh clone?
+
+Every checkout bootstraps **its own database** — credentials do not travel
+between machines:
+
+| Setup | Username | Password |
+|---|---|---|
+| Fresh clone (just `npm run dev`) | `admin` | `Opal@2026` (first login forces a change) |
+| After `npm run db:seed` (demo data) | `arjun` | `Opal@2026` |
+
+A password that works on a teammate's machine will not work on yours. If
+login still fails: check the `npm run dev` output — a first-run bootstrap
+prints the initial-admin banner — and confirm the API is up with
+`curl http://127.0.0.1:47191/api/v1/health` (it should return
+`"database":{"healthy":true,...}`). Repeated failed attempts hit a
+15-minute lockout **when it is switched on** — the product ships with login
+lockout **disabled** for testing; enable it per install in **Settings →
+Security → Login lockout**.
+
+💡 Dev-mode DB check: after `npm run db:seed`, run `curl http://127.0.0.1:47191/api/v1/health` — it should return `"database":{"healthy":true,...}` confirming the API can reach PostgreSQL.
 
 Run pieces separately: `npm run dev:server` (backend only) or `npm run dev:web`
 (frontend only). All configuration — env vars, in-app settings, Shopify,
@@ -189,19 +212,11 @@ bootstraps the schema (45 tables), the generated admin logs in, and
 dependency is needed on the target machine.
 
 Note: NSIS remembers the last chosen install directory (e.g. from a previous
-`/allusers` test run) and a silent install will reuse it — if the script fails
+/`allusers` test run) and a silent install will reuse it — if the script fails
 on path checks, uninstall via the existing *Uninstall Opal Line Billing*
 entry first, then re-run.
 
-### Run the desktop app from source
 
-```bash
-npm run electron:dev     # backend + Vite + Electron window, one command
-```
-
-The window loads the dev UI at `http://localhost:47195`, so hot reload works
-in the desktop shell too. It runs alongside plain `npm run dev` — the browser
-and the desktop window share one database.
 
 ### Build the installer yourself
 
