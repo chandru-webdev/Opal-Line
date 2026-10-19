@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { desc, eq, inArray, isNull, like, or, sql } from 'drizzle-orm'
+import { desc, eq, inArray, isNotNull, isNull, like, or, sql } from 'drizzle-orm'
 import { config, isConfigured, normalizeShopDomain } from './config'
 import { db, schema } from './db/client'
 import type { SyncCustomer, SyncLogEntry, SyncOrder, SyncPrice, SyncProduct, SyncResource, SyncStore } from './types'
@@ -2172,12 +2172,31 @@ export async function getLatestSilverRate(): Promise<{ rate: number; purity: num
       .orderBy(desc(schema.silverRates.updatedAt))
       .limit(1)
     const latest = rows[0]
-    if (!latest) return null
+    if (latest) {
+      return {
+        rate: Number(latest.rate ?? 0),
+        purity: Number(latest.purity ?? 0),
+        previousRate: Number(latest.previousRate ?? 0),
+        updatedAt: String(latest.updatedAt ?? ''),
+      }
+    }
+    // Read-only fallback: no rate change has ever been persisted, but the
+    // products already carry a rate from the last product sync. Surface it so
+    // the header and dashboard show the real current rate instead of a blank
+    // value / perpetual "Loading…". Nothing is written to the database.
+    const [productRow] = await db
+      .select({ silverRate: schema.products.silverRate, purity: schema.products.purity, createdAt: schema.products.createdAt })
+      .from(schema.products)
+      .where(isNotNull(schema.products.silverRate))
+      .orderBy(desc(schema.products.createdAt))
+      .limit(1)
+    const fallbackRate = Number(productRow?.silverRate ?? 0)
+    if (!fallbackRate || fallbackRate <= 0) return null
     return {
-      rate: Number(latest.rate ?? 0),
-      purity: Number(latest.purity ?? 0),
-      previousRate: Number(latest.previousRate ?? 0),
-      updatedAt: String(latest.updatedAt ?? ''),
+      rate: fallbackRate,
+      purity: Number(productRow?.purity ?? 0) || 92.5,
+      previousRate: fallbackRate,
+      updatedAt: String(productRow?.createdAt ?? ''),
     }
   } catch {
     return null
@@ -2852,6 +2871,8 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
     let imported = 0
     let updated = 0
     const errors: string[] = []
+    // Orders whose auto-invoice failed this run (reported in Sync Logs).
+    const invoiceFailures: string[] = []
 
     for (const o of raw) {
       const orderNumber = String(o.name ?? '').replace(/^#/, '')
@@ -3076,6 +3097,48 @@ export async function importShopifyOrders(): Promise<ShopifyOrdersImportResult> 
           // Customer upsert must never break the order import.
         }
       }
+
+      // Raise a tax invoice for paid orders so the dashboard's invoice-derived
+      // widgets (sales, invoices, top products/category, payment status) have
+      // data. Refunded and cancelled orders are skipped entirely, so a voided
+      // order never becomes revenue. This is idempotent: an order that already
+      // carries an invoice number is left alone, so re-syncing backfills the
+      // existing paid orders exactly once. The import already moved stock on
+      // insert, so the invoice must not move it again.
+      if (payment === 'paid' && mapImportedStatus(o) !== 'cancelled') {
+        try {
+          const [orderRow] = await db
+            .select()
+            .from(schema.salesOrders)
+            .where(eq(schema.salesOrders.shopifyId, shopifyId))
+            .limit(1)
+          if (orderRow && !orderRow.invoice) {
+            const { createInvoiceForOrderRow } = await import('./orderEmailIngest')
+            await createInvoiceForOrderRow(orderRow, { deductStock: false })
+          }
+        } catch (err) {
+          // The import itself succeeded — record the failure in Sync Logs
+          // instead of raising, so a missed invoice is visible and retryable
+          // rather than silently absent from the dashboard.
+          const msg = err instanceof Error ? err.message : String(err)
+          invoiceFailures.push(`${shopifyId}: ${msg}`)
+          logger.warn({ shopifyId, err: msg }, 'Shopify order import: auto-invoice failed')
+        }
+      }
+    }
+
+    // Surface auto-invoice failures in Sync Logs (System → Shopify → Sync
+    // Logs). The orders themselves imported fine, so this is a per-order
+    // warning, not a failed sync.
+    if (invoiceFailures.length > 0) {
+      await persistLog({
+        entity: 'Invoice',
+        direction: 'out',
+        action: 'Auto-Invoice',
+        status: 'failed',
+        error: `${invoiceFailures.length} order(s) not invoiced: ${invoiceFailures.slice(0, 5).join('; ')}`,
+        retry: true,
+      })
     }
 
     await persistLog({
