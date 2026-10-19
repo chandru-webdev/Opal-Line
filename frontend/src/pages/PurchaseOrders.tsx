@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { dbApi } from '@/lib/api'
+import { toast } from '@/components/ui/confirm'
 import { exportTable } from '@/lib/export'
 import type { Product, PurchaseOrder, PurchaseOrderReceipt, Supplier } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
@@ -263,11 +264,15 @@ export default function PurchaseOrdersPage() {
     setSaving(true)
     setError('')
     try {
+      // The backend raises (or refreshes) the order's purchase invoice whenever
+      // its lines are saved — surface the invoice number in the success toast.
+      let autoInvoice: string | undefined
+      const wasEditing = Boolean(editingId)
       if (editingId) {
         // One call: header fields + replacement lines. Totals (subtotal,
         // GST amount, grand total) are recomputed server-side. Discount,
         // notes and status are not sent — the stored values stay untouched.
-        await dbApi.updatePurchaseOrder(editingId, {
+        const res = await dbApi.updatePurchaseOrder(editingId, {
           supplier: form.supplier,
           supplierId: form.supplierId || null,
           // Date-only strings are stored as-is (the quotations validUntil
@@ -276,7 +281,8 @@ export default function PurchaseOrdersPage() {
           expectedDate: form.expectedDate || null,
           gst: gstRate,
           lines: linePayload,
-        })
+        }) as PurchaseOrder & { autoInvoice?: string }
+        autoInvoice = res.autoInvoice
       } else {
         const count = orders.length + 1
         const created = await dbApi.create<PurchaseOrder>('purchase-orders', {
@@ -293,12 +299,21 @@ export default function PurchaseOrdersPage() {
           status: 'open',
         })
         // Lines second: this endpoint recomputes value + GST + grand total
-        // from them, using the gst stored by the create above.
-        await dbApi.setPurchaseOrderLines(created.id, linePayload)
+        // from them, using the gst stored by the create above — and raises
+        // the linked purchase invoice automatically.
+        const linesRes = await dbApi.setPurchaseOrderLines(created.id, linePayload) as PurchaseOrder & { autoInvoice?: string }
+        autoInvoice = linesRes.autoInvoice
       }
       setDialogOpen(false)
       setEditingId(null)
       load()
+      if (autoInvoice) {
+        toast.success(
+          wasEditing
+            ? `Purchase order updated — invoice ${autoInvoice} refreshed`
+            : `Purchase order created — purchase invoice ${autoInvoice} raised automatically`,
+        )
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : editingId ? 'Failed to update purchase order' : 'Failed to create purchase order')
     } finally {
@@ -647,7 +662,7 @@ export default function PurchaseOrdersPage() {
       </Dialog>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent hideClose size="lg" className="gap-0 overflow-hidden p-0 sm:max-w-[500px]">
+        <DialogContent hideClose size="lg" className="gap-0 p-0 sm:max-w-[500px]">
           {/* Header — light divider underneath */}
           <div className="flex items-center justify-between gap-3 border-b border-gray-200 px-5 py-4">
             <div className="min-w-0">
