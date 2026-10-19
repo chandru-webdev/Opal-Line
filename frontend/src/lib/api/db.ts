@@ -18,6 +18,7 @@ import type {
   BankAccount,
   Customer,
   Expense,
+  FinancialSummary,
   GstReportResult,
   Invoice,
   InventoryLocation,
@@ -164,6 +165,11 @@ export const dbApi = {
   getPaymentStatus: (range?: DashboardRangeInput): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
     request(rangePath('/db/dashboard/payment-status', range)),
   getReceivablesAging: (): Promise<ReceivablesAging> => request('/db/dashboard/aging'),
+  // The Financial Analytics section owns its range (defaults to Last 12
+  // Months server-side when no period is passed) and is independent of the
+  // page-wide filter.
+  getDashboardFinancial: (range?: DashboardRangeInput | string): Promise<FinancialSummary> =>
+    request(rangePath('/db/dashboard/financial', range)),
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
   getSilverRateHistory: async (): Promise<SilverRatePoint[]> => {

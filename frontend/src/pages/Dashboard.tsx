@@ -40,6 +40,7 @@ import { Badge } from '@/components/ui/badge'
 import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
 import { SilverRateChart } from '@/components/charts/silver-rate-chart'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
@@ -399,6 +400,9 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
             ))}
 
           {summary ? <OperationalStrip summary={summary} /> : null}
+
+          {/* Self-fetching: independent of the page-wide range above. */}
+          <FinancialAnalytics />
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-1">

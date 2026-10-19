@@ -11,7 +11,7 @@
  * business-day reporting the rest of the app uses.
  */
 
-export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'last3m' | 'last6m' | 'last12m' | 'month' | 'year' | 'custom'
 
 export interface DashboardRange {
   key: PeriodKey
@@ -34,7 +34,7 @@ export type RangeResult =
   | { ok: true; range: DashboardRange }
   | { ok: false; status: number; error: string }
 
-const PERIODS: readonly PeriodKey[] = ['today', 'week', 'last7', 'last30', 'month', 'year', 'custom']
+const PERIODS: readonly PeriodKey[] = ['today', 'week', 'last7', 'last30', 'last3m', 'last6m', 'last12m', 'month', 'year', 'custom']
 
 const pad = (n: number) => String(n).padStart(2, '0')
 
@@ -143,6 +143,28 @@ export function resolveDashboardRange(query: Record<string, unknown>, now: Date 
         prevFrom: naive(addDays(from, -30)), prevTo: naive(addDays(to, -30)),
         prevLabel: 'vs previous 30 days',
         days: 30, bucket: 'day',
+      },
+    }
+  }
+
+  // Rolling N-month presets for the Financial Analytics section: whole calendar
+  // months from the 1st (N-1 months back) through tomorrow, so a "Last 12
+  // Months" view always shows exactly 12 monthly buckets ending this month.
+  if (key === 'last3m' || key === 'last6m' || key === 'last12m') {
+    const months = key === 'last3m' ? 3 : key === 'last6m' ? 6 : 12
+    const from = new Date(today.getFullYear(), today.getMonth() - (months - 1), 1)
+    const to = addDays(today, 1)
+    const prevFrom = new Date(today.getFullYear(), today.getMonth() - (months * 2 - 1), 1)
+    // Previous window ends where the current one begins (half-open [from, to)).
+    const prevTo = from
+    return {
+      ok: true,
+      range: {
+        key, label: `Last ${months} Months`,
+        from: naive(from), to: naive(to),
+        prevFrom: naive(prevFrom), prevTo: naive(prevTo),
+        prevLabel: `vs previous ${months} months`,
+        days: daysBetween(from, to), bucket: 'month',
       },
     }
   }

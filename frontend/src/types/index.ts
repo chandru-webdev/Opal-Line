@@ -206,6 +206,70 @@ export interface ReceivablesAging {
   overdueCount: number
 }
 
+/** One expense category's total within the selected range. */
+export interface ExpenseCategorySlice {
+  category: string
+  amount: number
+  /** Share of the range's total expenses, in percent. */
+  share: number
+}
+
+/** One bucket of the Financial Analytics chart series (aligned with the Sales
+ * Overview buckets). Income is invoiced less returns for the bucket; expense
+ * is recorded expenses for the same bucket. */
+export interface FinancialPoint {
+  key: string
+  label: string
+  date: string
+  income: number
+  expense: number
+}
+
+/** Receivable aging band — days past the effective due date (invoice due date,
+ * or invoice date + 30 days when no due date is set). */
+export interface FinancialAgingBand {
+  key: 'current' | 'over30' | 'over60' | 'over90' | 'over120' | 'older'
+  label: string
+  value: number
+  count: number
+}
+
+/** Point-in-time receivable picture (independent of the selected range):
+ * every non-voided invoice's invoiced total, how much of it has been received
+ * (successful payments), and how the still-open remainder is aging. */
+export interface FinancialReceivable {
+  paid: number
+  outstanding: number
+  invoicedTotal: number
+  invoiceCount: number
+  aging: FinancialAgingBand[]
+}
+
+/** Range keys the Financial Analytics section can request on its own. */
+export type FinancialRangeKey = 'last30' | 'last3m' | 'last6m' | 'last12m' | 'year'
+
+/** Range-aware figures behind the dashboard Financial Analytics section. */
+export interface FinancialSummary {
+  label: string
+  prevLabel: string
+  sales: number
+  returns: number
+  invoiceCount: number
+  netRevenue: number
+  netRevenueDelta: string
+  netRevenueTrend: Trend
+  income: number
+  expense: number
+  expenseCount: number
+  expenseDelta: string
+  expenseTrend: Trend
+  net: number
+  expenses: ExpenseCategorySlice[]
+  topExpense: ExpenseCategorySlice | null
+  points: FinancialPoint[]
+  receivable: FinancialReceivable
+}
+
 export interface AgingInvoice {
   id: string
   number: string

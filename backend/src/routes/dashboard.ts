@@ -6,7 +6,7 @@ import { logger } from '../logger'
 import { computeInputGst, computeTcs, netPayable } from '../gst'
 import { LOCKOUT_THRESHOLD } from '../lockout'
 import { routeParam } from '../lib/routeParams'
-import { resolveDashboardRange, type DashboardRange } from '../lib/dashboardRange'
+import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
 
 export const dashboardRouter = Router()
 
@@ -51,8 +51,10 @@ const BUSINESS_NAME_RE = 'house|jewels|llp|pvt|ltd|exports|trading|industries|fi
 const NOT_VOIDED = sql`coalesce(${schema.salesInvoices.status}, '') not in ('cancelled', 'refunded')`
 
 /** Resolve the page-wide range from the request, or send a 400 and return null. */
-function rangeFromQuery(req: { query: unknown }, res: Response): DashboardRange | null {
-  const resolved = resolveDashboardRange(req.query as Record<string, unknown>)
+function rangeFromQuery(req: { query: unknown }, res: Response, defaultPeriod?: string): DashboardRange | null {
+  const query = req.query as Record<string, unknown>
+  const withDefault = defaultPeriod && query.period === undefined ? { ...query, period: defaultPeriod } : query
+  const resolved = resolveDashboardRange(withDefault)
   if (!resolved.ok) {
     res.status(resolved.status).json({ error: resolved.error })
     return null
@@ -247,6 +249,20 @@ export async function returnBuckets(format: string, range: { from: string; to: s
       sql`${schema.salesReturns.date} < ${range.to}`,
       sql`coalesce(${schema.salesReturns.status}, '') <> 'cancelled'`,
     ))
+    .groupBy(sql`1`)
+  const map = new Map<string, number>()
+  for (const r of rows) map.set(String(r.bucket ?? ''), num(r.amount))
+  return map
+}
+
+/** Expenses grouped into the same chart buckets as sales (no status filter —
+ * every recorded expense counts against its period). */
+async function expenseBuckets(format: string, range: { from: string; to: string }) {
+  const bucketSql = sql`to_char(${schema.expenses.date}, ${format})`
+  const rows = await db!
+    .select({ bucket: bucketSql, amount: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
+    .from(schema.expenses)
+    .where(and(gte(schema.expenses.date, range.from), sql`${schema.expenses.date} < ${range.to}`))
     .groupBy(sql`1`)
   const map = new Map<string, number>()
   for (const r of rows) map.set(String(r.bucket ?? ''), num(r.amount))
@@ -601,6 +617,191 @@ dashboardRouter.get('/dashboard/inventory-overview', async (_req, res) => {
       inventoryValue: round2(products.reduce((a, p) => a + num(p.stock) * num(p.sellingPrice), 0)),
       lowStock: products.filter((p) => num(p.stock) <= num(p.reorderLevel)).length,
       outOfStock: products.filter((p) => num(p.stock) === 0).length,
+    })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FINANCIAL ANALYTICS: net revenue, income vs expense, top expense (range-aware)
+// ─────────────────────────────────────────────────────────────────────────────
+
+dashboardRouter.get('/dashboard/financial', async (req, res) => {
+  if (!requireDb(res)) return
+  // The Financial Analytics section owns its range (default Last 12 Months)
+  // and is independent of the page-wide filter.
+  const range = rangeFromQuery(req, res, 'last12m')
+  if (!range) return
+  try {
+    const invAgg = async (from: string, to: string) => {
+      const rows = await db!
+        .select({
+          total: sql<number>`coalesce(sum(grand_total), 0)`,
+          count: sql<number>`count(*)`,
+        })
+        .from(schema.salesInvoices)
+        .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
+      const r = rows[0]
+      return { total: num(r.total), count: Number(r.count) }
+    }
+    // Expenses grouped by category for the window: total/count for the
+    // income-vs-expense tile, top categories for the "Top Expense" tile.
+    // One extra row beyond the display cap lets us fold the remainder into
+    // "Other" so the slices always sum to the window total.
+    const expenseAgg = async (from: string, to: string) => {
+      const inWindow = and(gte(schema.expenses.date, from), sql`${schema.expenses.date} < ${to}`)
+      const [agg, cats] = await Promise.all([
+        db!
+          .select({ total: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)`, count: sql<number>`count(*)` })
+          .from(schema.expenses)
+          .where(inWindow),
+        db!
+          .select({
+            category: sql<string>`coalesce(nullif(${schema.expenses.category}, ''), 'Other')`,
+            amount: sql<number>`coalesce(sum(coalesce(${schema.expenses.amount}, 0)), 0)`,
+          })
+          .from(schema.expenses)
+          .where(inWindow)
+          .groupBy(sql`coalesce(nullif(${schema.expenses.category}, ''), 'Other')`)
+          .orderBy(sql`coalesce(sum(coalesce(${schema.expenses.amount}, 0)), 0) desc`)
+          .limit(7),
+      ])
+      return { total: num(agg[0]?.total), count: Number(agg[0]?.count ?? 0), cats }
+    }
+
+    const [cur, prev, curReturns, prevReturns, curExp, prevExp, salesMap, retMap, expMap, invTotals, openRows, paidRows] = await Promise.all([
+      invAgg(range.from, range.to),
+      invAgg(range.prevFrom, range.prevTo),
+      returnsTotal(range.from, range.to),
+      returnsTotal(range.prevFrom, range.prevTo),
+      expenseAgg(range.from, range.to),
+      expenseAgg(range.prevFrom, range.prevTo),
+      salesBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
+      returnBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
+      expenseBuckets(range.bucket === 'hour' ? 'HH24' : range.bucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD', range),
+      // Point-in-time receivables below: no range predicates on purpose.
+      db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)`, count: sql<number>`count(*)` })
+        .from(schema.salesInvoices)
+        .where(NOT_VOIDED),
+      db!
+        .select({ number: schema.salesInvoices.number, grandTotal: schema.salesInvoices.grandTotal, dueDate: schema.salesInvoices.dueDate, date: schema.salesInvoices.date })
+        .from(schema.salesInvoices)
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!
+        .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
+        .from(schema.payments)
+        .where(eq(schema.payments.status, 'success'))
+        .groupBy(schema.payments.invoice),
+    ])
+
+    // Net revenue uses the same basis as the Sales KPI: gross invoiced less
+    // approved returns with voided invoices excluded, floored at zero.
+    const netRevenue = Math.max(0, cur.total - curReturns)
+    const prevNetRevenue = Math.max(0, prev.total - prevReturns)
+    const netCmp = compare(netRevenue, prevNetRevenue)
+    const expCmp = compare(curExp.total, prevExp.total)
+
+    // Per-bucket series for the charts, aligned to the same buckets the Sales
+    // Overview chart uses. Income per bucket is invoiced less returns *without*
+    // a per-bucket floor so the points always sum back to the headline figure
+    // (the headline itself is floored at zero).
+    const points = enumerateBuckets(range).map((b) => ({
+      key: b.key,
+      label: b.label,
+      date: b.date,
+      income: round2((salesMap.get(b.key)?.revenue ?? 0) - (retMap.get(b.key) ?? 0)),
+      expense: round2(expMap.get(b.key) ?? 0),
+    }))
+
+    // Expense slices for the donut: top 5 categories, remainder folded into
+    // "Other" so shares always add up to the window's expense total.
+    const rawCats = curExp.cats.map((c) => ({ category: c.category, amount: round2(num(c.amount)) }))
+    const cappedCats = rawCats.length > 6
+      ? [...rawCats.slice(0, 5), { category: 'Other', amount: round2(Math.max(0, curExp.total - rawCats.slice(0, 5).reduce((a, c) => a + c.amount, 0))) }]
+      : rawCats
+    const slices = cappedCats.map((c) => ({
+      category: c.category,
+      amount: c.amount,
+      share: curExp.total > 0 ? round2((c.amount / curExp.total) * 100) : 0,
+    }))
+
+    // ── Receivable Summary (as of now, ignores the range) ──────────────────
+    // Outstanding = the unpaid part of every open invoice (unpaid or partly
+    // paid), excluding voided/cancelled ones. Aging bands are days past the
+    // effective due date: invoices without a due date fall back to invoice
+    // date + 30 days (the app has no payment-terms field to read).
+    const invoicedTotal = num(invTotals[0]?.total)
+    const invoicedCount = Number(invTotals[0]?.count ?? 0)
+    const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
+    const parseNaive = (s: string | null): Date | null => {
+      if (!s) return null
+      const body = s.includes('T') ? s : s.replace(' ', 'T')
+      const d = new Date(body)
+      return Number.isNaN(d.getTime()) ? null : d
+    }
+    const nowDay = localDayStart(0)
+    const today = new Date(nowDay.replace('T', ' '))
+    const DAY = 86400000
+    const AGING_BANDS = [
+      { key: 'current', label: 'Current' },
+      { key: 'over30', label: '>30 Days' },
+      { key: 'over60', label: '>60 Days' },
+      { key: 'over90', label: '>90 Days' },
+      { key: 'over120', label: '>120 Days' },
+      { key: 'older', label: 'Older' },
+    ] as const
+    const aging = AGING_BANDS.map((b) => ({ key: b.key, label: b.label, value: 0, count: 0 }))
+    let outstanding = 0
+    for (const row of openRows) {
+      const paid = paidByInvoice.get(row.number ?? '') ?? 0
+      const unpaid = Math.max(0, num(row.grandTotal) - paid)
+      outstanding += unpaid
+      // Effective due date: real due date, else invoice date + 30 days (the
+      // settings table has no payment-terms field), else today = not overdue.
+      let due = parseNaive(row.dueDate)
+      if (!due) {
+        const invoiceDate = parseNaive(row.date)
+        if (invoiceDate) {
+          invoiceDate.setDate(invoiceDate.getDate() + 30)
+          due = invoiceDate
+        }
+      }
+      if (!due) due = new Date(today)
+      const overdueDays = Math.floor((today.getTime() - due.getTime()) / DAY)
+      const bandIdx = overdueDays <= 30 ? 0 : overdueDays <= 60 ? 1 : overdueDays <= 90 ? 2 : overdueDays <= 120 ? 3 : overdueDays <= 365 ? 4 : 5
+      aging[bandIdx].value = round2(aging[bandIdx].value + unpaid)
+      aging[bandIdx].count += 1
+    }
+    outstanding = round2(outstanding)
+
+    res.json({
+      label: range.label,
+      prevLabel: range.prevLabel,
+      sales: round2(cur.total),
+      returns: round2(curReturns),
+      invoiceCount: cur.count,
+      netRevenue: round2(netRevenue),
+      netRevenueDelta: netCmp.delta,
+      netRevenueTrend: netCmp.trend,
+      income: round2(netRevenue),
+      expense: round2(curExp.total),
+      expenseCount: curExp.count,
+      expenseDelta: expCmp.delta,
+      expenseTrend: expCmp.trend,
+      // Operating result for the window: net revenue less recorded expenses.
+      // COGS is not part of this figure (that basis lives on the Profit page).
+      net: round2(netRevenue - curExp.total),
+      expenses: slices,
+      topExpense: slices.length > 0 ? slices[0] : null,
+      points,
+      receivable: {
+        paid: round2(Math.max(0, invoicedTotal - outstanding)),
+        outstanding,
+        invoicedTotal: round2(invoicedTotal),
+        invoiceCount: invoicedCount,
+        aging,
+      },
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
