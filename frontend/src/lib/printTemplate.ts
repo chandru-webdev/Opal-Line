@@ -47,6 +47,54 @@ export interface PrintDesignerConfig {
   thankYouNote: string
   declaration: string
   watermark: string | null
+  /** Barcode-label only: physical label size preset (mm). */
+  labelPreset: '50x25' | '50x22' | '35x22' | '50x10' | 'custom'
+  /** Custom label width in mm (used when labelPreset === 'custom'). */
+  labelWidthMm: number
+  /** Custom label height in mm (used when labelPreset === 'custom'). */
+  labelHeightMm: number
+  /** Print the front side of the label. */
+  labelShowFront: boolean
+  /** Print the back side of the label (second sheet / duplex pass). */
+  labelShowBack: boolean
+  /** Front-side field toggles. */
+  labelFrontCompany: boolean
+  labelFrontName: boolean
+  labelFrontRate: boolean
+  /** Back-side field toggles. */
+  labelBackSku: boolean
+  labelBackBarcode: boolean
+  labelBackName: boolean
+  labelFrontSku?: boolean
+  labelBackCompany?: boolean
+  labelBackProduct?: boolean
+  labelFrontFontSizeMm?: number
+  labelFrontFontAlign?: 'left' | 'center' | 'right'
+  labelFrontTextPosition?: 'top' | 'center' | 'bottom'
+  labelBackFontSizeMm?: number
+  labelBackFontAlign?: 'left' | 'center' | 'right'
+  labelBackTextPosition?: 'top' | 'center' | 'bottom'
+  labelBorder?: boolean
+  labelBackgroundColor?: string
+  labelRadiusMm?: number
+}
+
+export const LABEL_PRESETS: Record<Exclude<PrintDesignerConfig['labelPreset'], 'custom'>, { width: number; height: number }> = {
+  '50x25': { width: 50, height: 25 },
+  '50x22': { width: 50, height: 22 },
+  '35x22': { width: 35, height: 22 },
+  '50x10': { width: 50, height: 10 },
+}
+
+/** Resolve the active label size in mm (custom values are clamped to sane bounds). */
+export function resolveLabelSize(config: PrintDesignerConfig): { width: number; height: number } {
+  if (config.labelPreset === 'custom') {
+    return {
+      width: Math.min(130, Math.max(15, Number(config.labelWidthMm) || 50)),
+      height: Math.min(60, Math.max(8, Number(config.labelHeightMm) || 25)),
+    }
+  }
+  return LABEL_PRESETS[config.labelPreset]
 }
 
 export const DEFAULT_PRINT_CONFIG: PrintDesignerConfig = {
@@ -86,6 +134,29 @@ export const DEFAULT_PRINT_CONFIG: PrintDesignerConfig = {
   declaration:
     'We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct. Goods once sold will only be exchanged as per store policy. This is a computer-generated invoice.',
   watermark: null,
+  labelPreset: '50x25',
+  labelWidthMm: 50,
+  labelHeightMm: 25,
+  labelShowFront: true,
+  labelShowBack: true,
+  labelFrontCompany: true,
+  labelFrontName: true,
+  labelFrontRate: true,
+  labelBackSku: true,
+  labelBackBarcode: true,
+  labelBackName: false,
+  labelFrontSku: true,
+  labelBackCompany: true,
+  labelBackProduct: true,
+  labelFrontFontSizeMm: 0,
+  labelFrontFontAlign: 'right',
+  labelFrontTextPosition: 'bottom',
+  labelBackFontSizeMm: 0,
+  labelBackFontAlign: 'left',
+  labelBackTextPosition: 'top',
+  labelBorder: true,
+  labelBackgroundColor: '#ffffff',
+  labelRadiusMm: 1,
 }
 
 const IMAGE_DATAURL = 'data:image/'
@@ -145,6 +216,29 @@ export function mergePrintConfig(saved: unknown): PrintDesignerConfig {
     thankYouNote: typeof s.thankYouNote === 'string' ? s.thankYouNote : d.thankYouNote,
     declaration: typeof s.declaration === 'string' ? s.declaration : d.declaration,
     watermark: typeof s.watermark === 'string' && s.watermark.trim() !== '' ? s.watermark.trim() : null,
+    labelPreset: ['50x22', '35x22', '50x10', 'custom'].includes(String(s.labelPreset)) ? (s.labelPreset as PrintDesignerConfig['labelPreset']) : '50x25',
+    labelWidthMm: num(s.labelWidthMm, 15, 130, 50),
+    labelHeightMm: num(s.labelHeightMm, 8, 60, 25),
+    labelShowFront: s.labelShowFront !== false,
+    labelShowBack: s.labelShowBack !== false,
+    labelFrontCompany: s.labelFrontCompany !== false,
+    labelFrontName: s.labelFrontName !== false,
+    labelFrontRate: s.labelFrontRate !== false,
+    labelBackSku: s.labelBackSku !== false,
+    labelBackBarcode: s.labelBackBarcode !== false,
+    labelBackName: s.labelBackName === true,
+    labelFrontSku: s.labelFrontSku !== false,
+    labelBackCompany: s.labelBackCompany !== false,
+    labelBackProduct: s.labelBackProduct !== false,
+    labelFrontFontSizeMm: num(s.labelFrontFontSizeMm, 1, 10, 0),
+    labelFrontFontAlign: ['center', 'right'].includes(String(s.labelFrontFontAlign)) ? (s.labelFrontFontAlign as 'center' | 'right') : 'right',
+    labelFrontTextPosition: ['center', 'top'].includes(String(s.labelFrontTextPosition)) ? (s.labelFrontTextPosition as 'center' | 'top') : 'bottom',
+    labelBackFontSizeMm: num(s.labelBackFontSizeMm, 1, 10, 0),
+    labelBackFontAlign: ['center', 'right'].includes(String(s.labelBackFontAlign)) ? (s.labelBackFontAlign as 'center' | 'right') : 'left',
+    labelBackTextPosition: ['center', 'bottom'].includes(String(s.labelBackTextPosition)) ? (s.labelBackTextPosition as 'center' | 'bottom') : 'top',
+    labelBorder: s.labelBorder !== false,
+    labelBackgroundColor: hex(s.labelBackgroundColor, '#ffffff'),
+    labelRadiusMm: num(s.labelRadiusMm, 0, 5, 1),
   }
 }
 
@@ -187,7 +281,7 @@ export async function printDocuments(
 }
 
 export interface PrintDocExtras {
-  docType: 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list'
+  docType: 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list' | 'barcode-label'
   /** Sub-line under the business name in the header. */
   tagline?: string
   /** Extra key/value box (e.g. "Valid Until" on quotations). */
@@ -211,6 +305,7 @@ const FONTS: Record<PrintDesignerConfig['font'], string> = {
 }
 
 const fmt = (n: number) => n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
 const fmtDate = (iso: string) => {
   try {
     return new Date(iso).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
@@ -228,11 +323,107 @@ const lighten = (hex: string, amount: number): string => {
   return `#${mix(r)}${mix(g)}${mix(b)}`
 }
 
+interface LabelItem {
+  product: string
+  sku: string
+  barcode: string
+  rate: number
+  weight: number
+}
+
+function labelItemsFromDoc(doc: PrintDoc): LabelItem[] {
+  const raw = (doc.items ?? []) as Array<Record<string, unknown>>
+  const d = doc as any
+  const items = raw.map((i: any) => ({
+    product: String(i.product ?? i.name ?? i.description ?? d.productName ?? ''),
+    sku: String(i.sku ?? i.code ?? d.sku ?? ''),
+    barcode: String(i.barcode ?? d.barcode ?? ''),
+    rate: Number(i.sellingPrice ?? i.rate ?? i.amount ?? i.price ?? d.rate ?? 0),
+    weight: Number(i.weight ?? i.netWeight ?? 0),
+  }))
+  return items.length > 0
+    ? items
+    : [{
+        product: String(d.productName ?? '92.5 Sterling Silver Pendant'),
+        sku: String(d.sku ?? 'SL-PD-001'),
+        barcode: String(d.barcode ?? '8901234567890'),
+        rate: Number(d.rate ?? 3250),
+        weight: 2.8,
+      }]
+}
+
+/**
+ * Build an A4 sheet of barcode labels at true physical size.
+ *
+ * Every label is laid out in `mm` inside a CSS grid whose column/row count is
+ * derived from the real label dimensions, so 50×25, 50×22, 35×22, 50×10 and
+ * custom sizes all print at the exact size with no scaling. Front and back
+ * sides print as consecutive sheets so duplex printers can flip the stock.
+ */
+export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig, _extras: PrintDocExtras): string {
+  const c = config
+  const { width: lw, height: lh } = resolveLabelSize(c)
+  const items = labelItemsFromDoc(doc)
+  const companyName = doc.businessName || 'OPAL LINE JEWELS LLP'
+  const fontStack = FONTS[c.font]
+  const accent2 = c.accent2
+  const radius = `${Math.max(0, (c.labelRadiusMm ?? 1))}mm`
+
+  // Font sizes derived from the physical label height so every preset fits.
+  const fsFront = (c.labelFrontFontSizeMm && c.labelFrontFontSizeMm > 0) ? c.labelFrontFontSizeMm : Math.max(2.4, Math.min(3.6, lh * 0.16))
+  const fsBack = (c.labelBackFontSizeMm && c.labelBackFontSizeMm > 0) ? c.labelBackFontSizeMm : Math.max(2.2, Math.min(3.4, lh * 0.15))
+
+  const frontLabel = (it: LabelItem) => `
+    <div class="lbl">
+      <div class="lbl-inner lbl-front">
+        ${c.labelFrontSku !== false ? `<div class="sku">${escapeHtml(it.sku || '')}</div>` : ''}
+        ${c.labelFrontRate ? `<div class="rate">₹${fmt(it.rate)}</div>` : ''}
+      </div>
+    </div>`
+
+  const backLabel = (it: LabelItem) => `
+    <div class="lbl">
+      <div class="lbl-inner lbl-back">
+        ${c.labelBackCompany !== false ? `<div class="company">${escapeHtml(companyName)}</div>` : ''}
+        ${c.labelBackProduct !== false ? `<div class="pname">${escapeHtml(it.product)}</div>` : ''}
+      </div>
+    </div>`
+
+  const sideSheet = (render: (it: LabelItem) => string) => `
+    <div class="sheet">
+      ${render(items[0])}
+    </div>`
+
+  const sheets =
+    (c.labelShowFront ? sideSheet(frontLabel) : '') +
+    (c.labelShowBack ? sideSheet(backLabel) : '')
+
+  return `<!doctype html><html><head><title>Barcode Labels</title><style>
+      @page{margin:0;}
+      *{margin:0;padding:0;box-sizing:border-box;}
+      body{font-family:${fontStack};color:#232733;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;margin:0;padding:0;}
+      .sheet{width:${lw}mm;height:${lh}mm;padding:0;margin:0;page-break-after:avoid;display:flex;align-items:flex-start;justify-content:flex-start;}
+      .sheet:last-child{page-break-after:avoid;}
+      .lbl{width:${lw}mm;height:${lh}mm;${c.labelBorder !== false ? `border:0.15mm solid #00000055;` : 'border:none;'}border-radius:${radius};overflow:hidden;background:${c.labelBackgroundColor || '#ffffff'};flex:none;box-sizing:border-box;margin:0;}
+      .lbl-inner{width:100%;height:100%;display:flex;flex-direction:column;gap:0.3mm;box-sizing:border-box;padding:0.4mm 0.5mm;justify-content:center;align-items:center;}
+      .lbl-front{justify-content:center;align-items:center;}
+      .lbl-back{justify-content:center;align-items:center;}
+      .sku{font-size:${fsFront}mm;font-weight:800;color:${accent2};letter-spacing:.01em;text-align:center;line-height:1.1;word-break:break-word;}
+      .rate{font-size:${fsFront}mm;font-weight:900;color:${accent2};text-align:center;line-height:1.1;}
+      .company{font-size:${fsBack}mm;font-weight:800;color:${accent2};white-space:normal;overflow:visible;text-overflow:clip;letter-spacing:.01em;text-align:center;line-height:1.08;word-break:break-word;}
+      .pname{font-size:${fsBack}mm;font-weight:700;color:#1f2937;line-height:1.05;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;text-align:center;word-break:break-word;}
+      @media print{body{background:#fff;margin:0;padding:0;} .sheet{padding:0;margin:0;} .lbl{border-color:#000;}}
+      @media screen{body{display:flex;flex-wrap:wrap;gap:4mm;justify-content:center;align-items:flex-start;padding:6mm;background:#eef0f4;} .sheet{margin:0;}}
+    </style></head><body>${sheets}</body></html>`
+
+}
+
 /**
  * Build the complete printable HTML document (A4/Letter, print-CSS ready).
  * The returned string is opened in a print window or embedded in an iframe.
  */
 export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extras: PrintDocExtras): string {
+  if (extras.docType === 'barcode-label') return buildBarcodeLabelHtml(doc, config, extras)
   const c = config
   const items = doc.items ?? []
   const gstRate = Number(doc.gst) || 0

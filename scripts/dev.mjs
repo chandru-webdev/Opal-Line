@@ -121,9 +121,9 @@ async function tcpOpen(host, port, ms = 3000) {
 function findPgBinDir() {
   const candidates = [join(ROOT, 'backend', 'pgsql', 'bin')]
   if (process.platform === 'win32') {
-    for (const v of ['17', '16', '15']) {
-      candidates.push(`C:\\Program Files\\PostgreSQL\\${v}\\bin`)
-    }
+    for (const v of ['16', '18', '17', '15']) {
+  candidates.push(`C:\\Program Files\\PostgreSQL\\${v}\\bin`)
+}
   }
   for (const dir of candidates) {
     if (existsSync(join(dir, `pg_ctl${EXE}`))) return dir

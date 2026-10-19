@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CheckCircle2, Download, Printer, RotateCcw, Save, Trash2, Upload } from 'lucide-react'
+import { CheckCircle2, Download, Printer, RotateCcw, Save, Search, Trash2, Upload } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -9,18 +9,21 @@ import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { toast } from '@/components/ui/confirm'
-import { printTemplatesApi } from '@/lib/api'
+import { dbApi, printTemplatesApi } from '@/lib/api'
+import type { Product } from '@/types'
 import {
   DEFAULT_PRINT_CONFIG,
+  LABEL_PRESETS,
   buildPrintHtml,
   mergePrintConfig,
   openHtmlPreview,
+  resolveLabelSize,
   type PrintDesignerConfig,
   type PrintDoc,
   type PrintDocExtras,
 } from '@/lib/printTemplate'
 
-const DOC_TYPES = ['invoice', 'quotation', 'order', 'packing-slip', 'pick-list'] as const
+const DOC_TYPES = ['invoice', 'quotation', 'order', 'packing-slip', 'pick-list', 'barcode-label'] as const
 type DocType = (typeof DOC_TYPES)[number]
 
 const TAGLINES: Record<DocType, string> = {
@@ -29,6 +32,7 @@ const TAGLINES: Record<DocType, string> = {
   order: '92.5 Sterling Silver Jewellery',
   'packing-slip': '92.5 Sterling Silver Jewellery',
   'pick-list': '92.5 Sterling Silver Jewellery',
+  'barcode-label': '92.5 Sterling Silver Jewellery',
 }
 
 function ToggleRow({ title, description, checked, onCheckedChange }: { title: string; description: string; checked: boolean; onCheckedChange: (v: boolean) => void }) {
@@ -57,6 +61,22 @@ export default function PrintDesignerPage() {
   const [saving, setSaving] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
 
+  // ── Barcode-label editing state ─────────────────────────────────────
+  // The designer edits a working copy of the label's data (company, product,
+  // SKU, barcode, rate). "Fetch from ERP" fills it from a real product.
+  const [labelEdit, setLabelEdit] = useState({
+    companyName: 'OPAL LINE JEWELS LLP',
+    productName: '92.5 Sterling Silver Pendant',
+    sku: 'SL-PD-001',
+    barcode: '8901234567890',
+    rate: 3250,
+    weight: 2.8,
+  })
+  const [products, setProducts] = useState<Product[]>([])
+  const [productQuery, setProductQuery] = useState('')
+  const [showProductPicker, setShowProductPicker] = useState(false)
+  const isLabel = docType === 'barcode-label'
+
   useEffect(() => {
     printTemplatesApi.getSample(docType).then((r) => setSample(r.doc as unknown as PrintDoc)).catch(() => {})
     printTemplatesApi.getDefault(docType).then((r) => {
@@ -69,11 +89,42 @@ export default function PrintDesignerPage() {
     }).catch(() => {})
   }, [docType])
 
+  // Load the ERP catalogue once the barcode-label tab is opened so the
+  // product picker can fill real SKU/barcode/rate data.
+  useEffect(() => {
+    if (!isLabel || products.length > 0) return
+    dbApi.getProducts().then(setProducts).catch(() => {})
+  }, [isLabel, products.length])
+
   const set = <K extends keyof PrintDesignerConfig>(key: K, value: PrintDesignerConfig[K]) =>
     setConfig((c) => ({ ...c, [key]: value }))
 
   const setMargin = (key: keyof PrintDesignerConfig['margins'], value: number) =>
     setConfig((c) => ({ ...c, margins: { ...c.margins, [key]: value } }))
+
+  const applyProduct = (p: Product) => {
+    setLabelEdit({
+      companyName: labelEdit.companyName,
+      productName: p.name,
+      sku: p.sku,
+      barcode: p.barcode || p.sku,
+      rate: Number(p.sellingPrice) || 0,
+      weight: Number(p.netWeight) || 0,
+    })
+    setShowProductPicker(false)
+    setProductQuery('')
+    toast.info(`Loaded ${p.name} from inventory`)
+  }
+
+  const filteredProducts = useMemo(() => {
+    const q = productQuery.trim().toLowerCase()
+    const list = q
+      ? products.filter((p) =>
+          p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || (p.barcode || '').toLowerCase().includes(q),
+        )
+      : products
+    return list.slice(0, 40)
+  }, [products, productQuery])
 
   const readImage = (file: File, maxKb: number, apply: (dataUrl: string) => void) => {
     if (file.size > maxKb * 1024) {
@@ -86,6 +137,33 @@ export default function PrintDesignerPage() {
   }
 
   const html = useMemo(() => {
+    if (isLabel) {
+      // Barcode labels build from the editable working copy — live as the
+      // user types SKU / barcode / rate / names.
+      const labelDoc: PrintDoc = {
+        number: 'SO-2026-00789',
+        customer: 'Retail Customer',
+        businessName: labelEdit.companyName,
+        gst: 3,
+        gstAmount: 0,
+        discount: 0,
+        subtotal: 0,
+        grandTotal: 0,
+        date: new Date().toISOString(),
+        items: [
+          {
+            product: labelEdit.productName,
+            sku: labelEdit.sku,
+            barcode: labelEdit.barcode,
+            sellingPrice: labelEdit.rate,
+            rate: labelEdit.rate,
+            weight: labelEdit.weight,
+          },
+        ],
+      }
+      const extras: PrintDocExtras = { docType, tagline: TAGLINES[docType] }
+      return buildPrintHtml(labelDoc, config, extras)
+    }
     if (!sample) return null
     const extras: PrintDocExtras = {
       docType,
@@ -97,7 +175,7 @@ export default function PrintDesignerPage() {
       notes: 'notes' in sample && typeof sample.notes === 'string' ? sample.notes : undefined,
     }
     return buildPrintHtml(sample, config, extras)
-  }, [sample, config, docType])
+  }, [sample, config, docType, isLabel, labelEdit])
 
   // Live preview: write the built HTML into a sandboxed iframe on every change.
   useEffect(() => {
@@ -280,18 +358,22 @@ export default function PrintDesignerPage() {
         <Card>
           <CardContent className="space-y-4 p-4">
             <Tabs value={docType} onValueChange={(v) => setDocType(v as DocType)}>
-              <TabsList className="w-full">
-                <TabsTrigger value="invoice" className="flex-1">Invoice</TabsTrigger>
-                <TabsTrigger value="quotation" className="flex-1">Quotation</TabsTrigger>
-                <TabsTrigger value="order" className="flex-1">Order</TabsTrigger>
-                <TabsTrigger value="packing-slip" className="flex-1">Packing Slip</TabsTrigger>
-                <TabsTrigger value="pick-list" className="flex-1">Pick List</TabsTrigger>
-              </TabsList>
-              <TabsContent value="invoice" />
-              <TabsContent value="quotation" />
-              <TabsContent value="order" />
-              <TabsContent value="packing-slip" />
-              <TabsContent value="pick-list" />
+            <TabsList className="grid h-auto w-full grid-cols-3 gap-1.5 p-1.5">
+              <TabsTrigger value="invoice" className="w-full justify-center px-2 text-xs">Invoice</TabsTrigger>
+              <TabsTrigger value="quotation" className="w-full justify-center px-2 text-xs">Quotation</TabsTrigger>
+              <TabsTrigger value="order" className="w-full justify-center px-2 text-xs">Order</TabsTrigger>
+              <TabsTrigger value="packing-slip" className="w-full justify-center px-2 text-xs">Packing Slip</TabsTrigger>
+              <TabsTrigger value="pick-list" className="w-full justify-center px-2 text-xs">Pick List</TabsTrigger>
+              <TabsTrigger value="barcode-label" className="w-full justify-center px-2 text-xs">Barcode Label</TabsTrigger>
+            </TabsList>
+
+          <TabsContent value="invoice" />
+          <TabsContent value="quotation" />
+          <TabsContent value="order" />
+          <TabsContent value="packing-slip" />
+          <TabsContent value="pick-list" />
+          <TabsContent value="barcode-label" />
+
             </Tabs>
 
             <div className="space-y-1.5">
@@ -300,7 +382,182 @@ export default function PrintDesignerPage() {
             </div>
 
             <div className="max-h-[calc(100vh-320px)] space-y-4 overflow-y-auto pr-1">
-              <SectionTitle>Header</SectionTitle>
+              {isLabel ? (
+                <>
+                  <SectionTitle>Label size</SectionTitle>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">Preset (mm)</Label>
+                    <Select
+                      value={config.labelPreset}
+                      onValueChange={(v) => set('labelPreset', v as PrintDesignerConfig['labelPreset'])}
+                      options={[
+                        ...(Object.keys(LABEL_PRESETS) as Array<PrintDesignerConfig['labelPreset']>).map((k) => ({
+                          value: k,
+                          label: `${LABEL_PRESETS[k as keyof typeof LABEL_PRESETS].width} × ${LABEL_PRESETS[k as keyof typeof LABEL_PRESETS].height} mm`,
+                        })),
+                        { value: 'custom', label: 'Custom size…' },
+                      ]}
+                    />
+                  </div>
+                  {config.labelPreset === 'custom' ? (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Width (mm)</Label>
+                        <Input type="number" min={15} max={130} value={config.labelWidthMm} onChange={(e) => set('labelWidthMm', Number(e.target.value) || 50)} />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label className="text-xs text-muted-foreground">Height (mm)</Label>
+                        <Input type="number" min={8} max={60} value={config.labelHeightMm} onChange={(e) => set('labelHeightMm', Number(e.target.value) || 25)} />
+                      </div>
+                    </div>
+                  ) : null}
+                  <p className="text-[11px] text-muted-foreground">
+                    Prints at exactly {resolveLabelSize(config).width} × {resolveLabelSize(config).height} mm — no page margins or scaling.
+                  </p>
+
+                  <SectionTitle>Sides</SectionTitle>
+                  <ToggleRow title="Front side" description="SKU and Rate (price tag style)" checked={config.labelShowFront} onCheckedChange={(v) => set('labelShowFront', v)} />
+                  <ToggleRow title="Back side" description="Company name and Product name" checked={config.labelShowBack} onCheckedChange={(v) => set('labelShowBack', v)} />
+
+                  {config.labelShowFront ? (
+                    <>
+                      <SectionTitle>Front (Price Tag)</SectionTitle>
+                      <ToggleRow title="SKU" description="Show SKU on front" checked={!!config.labelFrontSku} onCheckedChange={(v) => set('labelFrontSku', v)} />
+                      <ToggleRow title="Rate" description="Show Rate (₹)" checked={config.labelFrontRate} onCheckedChange={(v) => set('labelFrontRate', v)} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">Text size (mm, 0 = auto)</Label>
+                          <Input type="number" min={0} max={10} step="0.1" value={config.labelFrontFontSizeMm ?? 0} onChange={(e) => set('labelFrontFontSizeMm', Number(e.target.value) || 0)} />
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">Alignment</Label>
+                          <Select
+                            value={config.labelFrontFontAlign ?? 'right'}
+                            onValueChange={(v) => set('labelFrontFontAlign', v as PrintDesignerConfig['labelFrontFontAlign'])}
+                            options={[
+                              { value: 'left', label: 'Left' },
+                              { value: 'center', label: 'Centre' },
+                              { value: 'right', label: 'Right' },
+                            ]}
+                          />
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {config.labelShowBack ? (
+                    <>
+                      <SectionTitle>Back</SectionTitle>
+                      <ToggleRow title="Company Name" description="Show business name on back" checked={!!config.labelBackCompany} onCheckedChange={(v) => set('labelBackCompany', v)} />
+                      <ToggleRow title="Product Name" description="Show product name on back" checked={!!config.labelBackProduct} onCheckedChange={(v) => set('labelBackProduct', v)} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">Text size (mm, 0 = auto)</Label>
+                          <Input type="number" min={0} max={10} step="0.1" value={config.labelBackFontSizeMm ?? 0} onChange={(e) => set('labelBackFontSizeMm', Number(e.target.value) || 0)} />
+                        </div>
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">Alignment</Label>
+                          <Select
+                            value={config.labelBackFontAlign ?? 'left'}
+                            onValueChange={(v) => set('labelBackFontAlign', v as PrintDesignerConfig['labelBackFontAlign'])}
+                            options={[
+                              { value: 'left', label: 'Left' },
+                              { value: 'center', label: 'Centre' },
+                              { value: 'right', label: 'Right' },
+                            ]}
+                          />
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  <SectionTitle>Label data</SectionTitle>
+                  <div className="rounded-lg border bg-muted/30 p-2.5">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="w-full"
+                      onClick={() => setShowProductPicker((v) => !v)}
+                    >
+                      <Search className="h-3.5 w-3.5" />
+                      {showProductPicker ? 'Close product search' : 'Fetch SKU / rate from inventory'}
+                    </Button>
+                    {showProductPicker ? (
+                      <div className="mt-2 space-y-1.5">
+                        <Input
+                          value={productQuery}
+                          onChange={(e) => setProductQuery(e.target.value)}
+                          placeholder="Search by product name, SKU or barcode…"
+                          autoFocus
+                        />
+                        <div className="max-h-44 overflow-y-auto rounded-md border bg-card">
+                          {filteredProducts.length === 0 ? (
+                            <p className="px-2.5 py-3 text-xs text-muted-foreground">No products found.</p>
+                          ) : (
+                            filteredProducts.map((p) => (
+                              <button
+                                key={p.id}
+                                type="button"
+                                className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-accent"
+                                onClick={() => applyProduct(p)}
+                              >
+                                <span className="truncate font-medium">{p.name}</span>
+                                <span className="shrink-0 font-mono text-muted-foreground">{p.sku}</span>
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">Company name</Label>
+                    <Input value={labelEdit.companyName} onChange={(e) => setLabelEdit((s) => ({ ...s, companyName: e.target.value }))} maxLength={120} />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-xs text-muted-foreground">Product name</Label>
+                    <Input value={labelEdit.productName} onChange={(e) => setLabelEdit((s) => ({ ...s, productName: e.target.value }))} maxLength={160} />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">SKU</Label>
+                      <Input value={labelEdit.sku} onChange={(e) => setLabelEdit((s) => ({ ...s, sku: e.target.value }))} maxLength={64} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Barcode</Label>
+                      <Input value={labelEdit.barcode} onChange={(e) => setLabelEdit((s) => ({ ...s, barcode: e.target.value }))} maxLength={64} placeholder="8901234567890" />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Rate (₹)</Label>
+                      <Input type="number" min={0} value={labelEdit.rate} onChange={(e) => setLabelEdit((s) => ({ ...s, rate: Number(e.target.value) || 0 }))} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Weight (g)</Label>
+                      <Input type="number" min={0} step="0.01" value={labelEdit.weight} onChange={(e) => setLabelEdit((s) => ({ ...s, weight: Number(e.target.value) || 0 }))} />
+                    </div>
+                  </div>
+
+                  <SectionTitle>Label styling</SectionTitle>
+                  <ToggleRow title="Border" description="Show label border" checked={config.labelBorder !== false} onCheckedChange={(v) => set('labelBorder', v)} />
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Background</Label>
+                      <div className="flex items-center gap-2">
+                        <input type="color" value={config.labelBackgroundColor || '#ffffff'} onChange={(e) => set('labelBackgroundColor', e.target.value)} className="h-9 w-10 cursor-pointer rounded-md border border-input bg-card p-1" aria-label="Background" />
+                        <Input value={config.labelBackgroundColor || '#ffffff'} onChange={(e) => set('labelBackgroundColor', e.target.value)} className="h-9 flex-1 font-mono text-xs" maxLength={7} />
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Corner radius (mm)</Label>
+                      <Input type="number" min={0} max={5} step="0.1" value={config.labelRadiusMm ?? 1} onChange={(e) => set('labelRadiusMm', Number(e.target.value) || 0)} />
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
               <div className="space-y-1.5">
                 <Label className="text-xs text-muted-foreground">Header style</Label>
                 <Select
@@ -409,10 +666,11 @@ export default function PrintDesignerPage() {
                     ]}
                   />
                 </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs text-muted-foreground">Corners (px)</Label>
-                  <Input type="number" min={0} max={16} value={config.cornerRadius} onChange={(e) => set('cornerRadius', Number(e.target.value) || 0)} />
-                </div>
+                    <div className="space-y-1.5">
+                      <Label className="text-xs text-muted-foreground">Corner radius (px)</Label>
+                      <Input type="number" min={0} max={16} value={config.cornerRadius} onChange={(e) => set('cornerRadius', Number(e.target.value) || 0)} />
+                    </div>
+
               </div>
               <div className="grid grid-cols-4 gap-2">
                 {(['top', 'right', 'bottom', 'left'] as const).map((m) => (
@@ -515,6 +773,8 @@ export default function PrintDesignerPage() {
                 <Label className="text-xs text-muted-foreground">Watermark</Label>
                 <Input value={config.watermark ?? ''} onChange={(e) => set('watermark', e.target.value || null)} placeholder="e.g. PAID" maxLength={40} />
               </div>
+                </>
+              )}
             </div>
           </CardContent>
         </Card>

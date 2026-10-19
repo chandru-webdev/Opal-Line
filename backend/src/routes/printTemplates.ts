@@ -17,7 +17,7 @@ import { routeParam } from '../lib/routeParams'
 
 export const printTemplatesRouter = Router()
 
-export const PRINT_DOC_TYPES = ['invoice', 'quotation', 'order', 'packing-slip', 'pick-list'] as const
+export const PRINT_DOC_TYPES = ['invoice', 'quotation', 'order', 'packing-slip', 'pick-list', 'barcode-label'] as const
 export type PrintDocType = (typeof PRINT_DOC_TYPES)[number]
 
 const MAX_CONFIG_BYTES = 128 * 1024
@@ -59,6 +59,32 @@ export interface PrintDesignerConfig {
   thankYouNote: string
   declaration: string
   watermark: string | null
+  /** Barcode-label only: physical label size preset (mm). */
+  labelPreset: '50x25' | '50x22' | '35x22' | '50x10' | 'custom'
+  /** Custom label width in mm (labelPreset === 'custom'). */
+  labelWidthMm: number
+  /** Custom label height in mm (labelPreset === 'custom'). */
+  labelHeightMm: number
+  labelShowFront: boolean
+  labelShowBack: boolean
+  labelFrontCompany: boolean
+  labelFrontName: boolean
+  labelFrontRate: boolean
+  labelBackSku: boolean
+  labelBackBarcode: boolean
+  labelBackName: boolean
+  labelFrontSku?: boolean
+  labelBackCompany?: boolean
+  labelBackProduct?: boolean
+  labelFrontFontSizeMm?: number
+  labelFrontFontAlign?: 'left' | 'center' | 'right'
+  labelFrontTextPosition?: 'top' | 'center' | 'bottom'
+  labelBackFontSizeMm?: number
+  labelBackFontAlign?: 'left' | 'center' | 'right'
+  labelBackTextPosition?: 'top' | 'center' | 'bottom'
+  labelBorder?: boolean
+  labelBackgroundColor?: string
+  labelRadiusMm?: number
 }
 
 export function defaultPrintConfig(_docType: PrintDocType): PrintDesignerConfig {
@@ -99,6 +125,29 @@ export function defaultPrintConfig(_docType: PrintDocType): PrintDesignerConfig 
     declaration:
       'We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct. Goods once sold will only be exchanged as per store policy. This is a computer-generated invoice.',
     watermark: null,
+    labelPreset: '50x25',
+    labelWidthMm: 50,
+    labelHeightMm: 25,
+    labelShowFront: true,
+    labelShowBack: true,
+    labelFrontCompany: true,
+    labelFrontName: true,
+    labelFrontRate: true,
+    labelBackSku: true,
+    labelBackBarcode: true,
+    labelBackName: false,
+    labelFrontSku: true,
+    labelBackCompany: true,
+    labelBackProduct: true,
+    labelFrontFontSizeMm: 0,
+    labelFrontFontAlign: 'right',
+    labelFrontTextPosition: 'bottom',
+    labelBackFontSizeMm: 0,
+    labelBackFontAlign: 'left',
+    labelBackTextPosition: 'top',
+    labelBorder: true,
+    labelBackgroundColor: '#ffffff',
+    labelRadiusMm: 1,
   }
 }
 
@@ -170,6 +219,41 @@ export function sanitizePrintConfig(input: unknown): { config: PrintDesignerConf
     thankYouNote: clampStr(raw.thankYouNote, 300, d.thankYouNote),
     declaration: clampStr(raw.declaration, 1000, d.declaration),
     watermark: typeof raw.watermark === 'string' && raw.watermark.trim() !== '' ? raw.watermark.trim().slice(0, 40) : null,
+    labelPreset: ['50x22', '35x22', '50x10', 'custom'].includes(String(raw.labelPreset))
+      ? (raw.labelPreset as PrintDesignerConfig['labelPreset'])
+      : '50x25',
+    labelWidthMm: clampNum(raw.labelWidthMm, 15, 130, 50),
+    labelHeightMm: clampNum(raw.labelHeightMm, 8, 60, 25),
+    labelShowFront: raw.labelShowFront !== false,
+    labelShowBack: raw.labelShowBack !== false,
+    labelFrontCompany: raw.labelFrontCompany !== false,
+    labelFrontName: raw.labelFrontName !== false,
+    labelFrontRate: raw.labelFrontRate !== false,
+    labelBackSku: raw.labelBackSku !== false,
+    labelBackBarcode: raw.labelBackBarcode !== false,
+    labelBackName: raw.labelBackName === true,
+    labelFrontSku: raw.labelFrontSku !== false,
+    labelBackCompany: raw.labelBackCompany !== false,
+    labelBackProduct: raw.labelBackProduct !== false,
+    labelFrontFontSizeMm: clampNum(raw.labelFrontFontSizeMm, 0, 10, 0),
+    labelFrontFontAlign: ['center', 'right'].includes(String(raw.labelFrontFontAlign))
+      ? (raw.labelFrontFontAlign as PrintDesignerConfig['labelFrontFontAlign'])
+      : 'right',
+    labelFrontTextPosition: ['center', 'top'].includes(String(raw.labelFrontTextPosition))
+      ? (raw.labelFrontTextPosition as PrintDesignerConfig['labelFrontTextPosition'])
+      : 'bottom',
+    labelBackFontSizeMm: clampNum(raw.labelBackFontSizeMm, 0, 10, 0),
+    labelBackFontAlign: ['center', 'right'].includes(String(raw.labelBackFontAlign))
+      ? (raw.labelBackFontAlign as PrintDesignerConfig['labelBackFontAlign'])
+      : 'left',
+    labelBackTextPosition: ['center', 'bottom'].includes(String(raw.labelBackTextPosition))
+      ? (raw.labelBackTextPosition as PrintDesignerConfig['labelBackTextPosition'])
+      : 'top',
+    labelBorder: raw.labelBorder !== false,
+    labelBackgroundColor: typeof raw.labelBackgroundColor === 'string' && HEX_RE.test(raw.labelBackgroundColor.trim())
+      ? raw.labelBackgroundColor.trim()
+      : '#ffffff',
+    labelRadiusMm: clampNum(raw.labelRadiusMm, 0, 5, 1),
   }
   return { config }
 }
@@ -216,6 +300,31 @@ export function sampleDocument(docType: PrintDocType): Record<string, unknown> {
   }
   if (docType === 'pick-list') {
     return { ...base, number: 'SO-2026-00789', status: 'confirmed' }
+  }
+  if (docType === 'barcode-label') {
+    return {
+      ...base,
+      number: 'SO-2026-00789',
+      status: 'confirmed',
+      items: [
+        {
+          product: '92.5 Sterling Silver Pendant',
+          sku: 'SL-PD-001',
+          barcode: '8901234567890',
+          qty: 10,
+          weight: 2.8,
+          sellingPrice: 3250.5,
+        },
+        {
+          product: '92.5 Sterling Silver Ring',
+          sku: 'SL-RG-002',
+          barcode: '8901234567906',
+          qty: 8,
+          weight: 1.95,
+          sellingPrice: 2450.0,
+        },
+      ],
+    }
   }
   return base
 }
