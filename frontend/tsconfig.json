@@ -1,12 +1,15 @@
-{
+﻿{
   "files": [],
   "references": [
     { "path": "./tsconfig.app.json" },
     { "path": "./tsconfig.node.json" },
     { "path": "./tsconfig.test.json" }
   ],
-  /* Mirrored from tsconfig.app.json: tsx (node --test) reads this file, and
-     the app config's paths are not visible through project references. */
+  /* Mirrored from tsconfig.app.json: tsx resolves the `@/*` alias from the
+     tsconfig at the process cwd (frontend/), and the app config's paths are not
+     visible through project references. tsx ignores `jsx` in this solution-style
+     config, so the test launcher carries scripts/jsx-shim.mjs for the classic
+     runtime instead. */
   "compilerOptions": {
     "baseUrl": ".",
     "jsx": "react-jsx",

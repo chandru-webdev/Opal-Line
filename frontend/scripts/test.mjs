@@ -1,21 +1,43 @@
-// Runs the frontend test suite through tsx with the app tsconfig loaded.
+// Runs the frontend test suite through tsx.
 //
+// Two tsx limitations shape this launcher:
+//   * `@/*` aliases come from the tsconfig tsx finds at the process cwd, so
+//     the child runs with cwd = frontend/ (its tsconfig.json mirrors the
+//     `paths` mapping from tsconfig.app.json).
+//   * tsx only applies `jsx: react-jsx` from an auto-detected non-solution
+//     config; the solution-style tsconfig.json (`files: []` + `references`)
+//     is ignored, so JSX under src/ compiles with the classic runtime. The
+//     React shim puts `React` on the global object for `React.createElement`
+//     lookups; automatic-runtime output is unaffected by it.
 // npm scripts cannot set an environment variable portably (Windows cmd has no
-// `VAR=value cmd` syntax) and tsx skips the frontend's solution-style
-// tsconfig.json, so the launcher points TSX_TSCONFIG_PATH at tsconfig.app.json
-// — that is where the `@/*` path alias and the automatic JSX runtime live.
-import { spawn } from 'node:child_process'
-import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+// `VAR=value cmd` syntax), which is why this is a script instead of a one-liner.
+import { spawnSync } from 'node:child_process'
+import { readdirSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const child = spawn(
+const here = dirname(fileURLToPath(import.meta.url))
+const frontend = resolve(here, '..')
+const shim = pathToFileURL(join(here, 'jsx-shim.mjs')).href
+
+function collect(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) return collect(full)
+    return /\.test\.tsx?$/.test(entry.name) ? [full] : []
+  })
+}
+
+const files = collect(join(frontend, 'src'))
+if (files.length === 0) {
+  console.error('No test files found under src/.')
+  process.exit(1)
+}
+
+const result = spawnSync(
   process.execPath,
-  ['--import', 'tsx', '--test', '--test-force-exit', 'src/**/*.test.{ts,tsx}'],
-  {
-    cwd: root,
-    env: { ...process.env, TSX_TSCONFIG_PATH: 'tsconfig.app.json' },
-    stdio: 'inherit',
-  },
+  ['--import', 'tsx', '--import', shim, '--test', '--test-force-exit', ...files],
+  { cwd: frontend, stdio: 'inherit' },
 )
-child.on('exit', (code) => process.exit(code ?? 0))
+
+process.exit(result.status ?? 1)
