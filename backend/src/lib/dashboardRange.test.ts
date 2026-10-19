@@ -107,3 +107,55 @@ test('custom rejects an inverted or oversized range', () => {
   assert.equal(err({ period: 'custom', start: '2026-09-30', end: '2026-09-01' }).status, 400)
   assert.equal(err({ period: 'custom', start: '2025-01-01', end: '2026-09-01' }).status, 400)
 })
+
+
+test('last 7 days are the trailing 7 days ending tomorrow midnight', () => {
+  const r = ok({ period: 'last7' })
+  assert.equal(r.label, 'Last 7 Days')
+  assert.equal(r.from, '2026-10-10T00:00:00')
+  assert.equal(r.to, '2026-10-17T00:00:00')
+  assert.equal(r.days, 7)
+  assert.equal(r.bucket, 'day')
+  assert.equal(r.prevLabel, 'vs previous 7 days')
+})
+
+test('last 30 days are the trailing 30 days', () => {
+  const r = ok({ period: 'last30' })
+  assert.equal(r.label, 'Last 30 Days')
+  assert.equal(r.from, '2026-09-17T00:00:00')
+  assert.equal(r.to, '2026-10-17T00:00:00')
+  assert.equal(r.days, 30)
+  assert.equal(r.bucket, 'day')
+  assert.equal(r.prevLabel, 'vs previous 30 days')
+})
+
+test('last 3 months run whole calendar months from the 1st', () => {
+  const r = ok({ period: 'last3m' })
+  assert.equal(r.label, 'Last 3 Months')
+  assert.equal(r.from, '2026-08-01T00:00:00')
+  assert.equal(r.to, '2026-10-17T00:00:00')
+  assert.equal(r.prevFrom, '2026-05-01T00:00:00')
+  assert.equal(r.prevTo, '2026-08-01T00:00:00')
+  assert.equal(r.prevLabel, 'vs previous 3 months')
+  assert.equal(r.bucket, 'month')
+})
+
+test('last 6 months cross the year boundary cleanly', () => {
+  const r = ok({ period: 'last6m' })
+  assert.equal(r.label, 'Last 6 Months')
+  assert.equal(r.from, '2026-05-01T00:00:00')
+  assert.equal(r.prevFrom, '2025-11-01T00:00:00')
+  assert.equal(r.prevTo, '2026-05-01T00:00:00')
+  assert.equal(r.bucket, 'month')
+})
+
+test('last 12 months start last November and bucket monthly', () => {
+  const r = ok({ period: 'last12m' })
+  assert.equal(r.label, 'Last 12 Months')
+  assert.equal(r.from, '2025-11-01T00:00:00')
+  assert.equal(r.to, '2026-10-17T00:00:00')
+  assert.equal(r.prevFrom, '2024-11-01T00:00:00')
+  assert.equal(r.prevTo, '2025-11-01T00:00:00')
+  assert.equal(r.prevLabel, 'vs previous 12 months')
+  assert.equal(r.bucket, 'month')
+})

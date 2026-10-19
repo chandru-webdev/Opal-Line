@@ -1254,6 +1254,16 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
     // entry so an upgraded install has real history instead of a balance that
     // appears from nowhere on the day of its first sale.
     await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
+    // Invoice items raised before the weight snapshot carried weight 0. Fill
+    // them from the catalogue (net weight × qty) so totals, prints and the
+    // dashboard agree with new invoices. Idempotent; failures are logged but
+    // never block boot.
+    await import('../invoiceWeights')
+      .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
+      .then((n) => {
+        if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
+      })
+      .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
     return { ran: true, tablesCreated: false }
   } finally {
     await sql.end({ timeout: 5 })

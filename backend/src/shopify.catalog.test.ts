@@ -16,8 +16,8 @@ import 'dotenv/config'
 import type { SyncProduct } from './types'
 import type { CatalogApplyIo, CatalogInsertValues, CatalogRow } from './shopify'
 
-process.env.SHOPIFY_STORE_URL ||= 'https://opal-line-test.myshopify.com'
-process.env.SHOPIFY_ACCESS_TOKEN ||= 'shpat_test_token'
+process.env.SHOPIFY_STORE_URL = 'https://opal-line-test.myshopify.com'
+process.env.SHOPIFY_ACCESS_TOKEN = 'shpat_test_token'
 delete process.env.DATABASE_URL
 
 let shopify: typeof import('./shopify')

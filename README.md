@@ -37,10 +37,11 @@ the installed desktop app and a Docker deployment can coexist on one machine.
 
 | Port | Used by |
 |---|---|
-| **5432** | PostgreSQL (standard port) — the dev database (`DATABASE_URL` in `backend/.env`) |
+| **5432** | PostgreSQL on the standard port — only when you point `DATABASE_URL` in `backend/.env` at your own server; `npm run dev` provisions its own cluster and leaves such a URL alone |
 | **47191** | Backend API in development (`npm run dev:server`) |
 | **47192** | Backend API of the installed desktop app (bundled runtime) |
 | **47193** | PostgreSQL of the installed desktop app (portable, `%APPDATA%\Opal Line Billing\pgdata`) |
+| **47194** | PostgreSQL of the dev stack (portable, `%APPDATA%\Opal Line Billing Dev\pgdata`, provisioned by `npm run dev`) |
 | **47195** | Vite dev server (UI in development) |
 | **47196** | Backend in Docker (`docker-compose.yml`, container listens on 4000) |
 | **47197** | Frontend in Docker (nginx) |
@@ -48,9 +49,9 @@ the installed desktop app and a Docker deployment can coexist on one machine.
 
 In Docker the backend reaches the database over the compose network
 (`DATABASE_URL=...@db:5432`), so 47198 is only for host-side tools. Dev vs
-desktop never collide: dev uses 47191/47195 + external PG on 5432, the desktop
-app uses its own 47192/47193 pair and refuses to start with a clear message if
-those are taken.
+desktop never collide: dev uses 47191/47195 + its own PostgreSQL on 47194, the
+desktop app uses its own 47192/47193 pair and refuses to start with a clear
+message if those are taken.
 
 ## Repository layout
 
@@ -207,7 +208,7 @@ in with the generated first-run admin credentials.
 The first-run bootstrap is verified on a **clean machine**: with the install
 directory, `%APPDATA%\Opal Line Billing` and the uninstall registry entries
 wiped beforehand, the bundled PostgreSQL initializes on 47193, the backend
-bootstraps the schema (45 tables), the generated admin logs in, and
+bootstraps the schema (53 tables), the generated admin logs in, and
 `/api/v1/db/stats` returns fresh data. No Node.js, PostgreSQL or other
 dependency is needed on the target machine.
 

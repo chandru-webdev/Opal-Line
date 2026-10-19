@@ -122,18 +122,20 @@ function parseDbUrl(url) {
 
 /**
  * True for the URL older versions of this script wrote into backend/.env:
- * the DESKTOP APP's cluster (127.0.0.1:47193/opal_line). Those checkouts
- * shared one database between dev and the installed app — sessions, users
- * and data collided. Such URLs were machine-generated, never hand-maintained,
- * so dev.mjs migrates them to the separate dev cluster on the next run.
- * Every other DATABASE_URL is treated as hand-maintained and left alone.
+ * the DESKTOP APP's cluster (127.0.0.1:47193) with either the desktop's
+ * bundled database (`opal_line`) or the short-lived same-cluster dev
+ * database (`opal_line_dev`). Both layouts shared the desktop app's cluster
+ * with dev — sessions, users and files collided. Such URLs were
+ * machine-generated, never hand-maintained, so dev.mjs migrates them to the
+ * separate dev cluster on the next run. Every other DATABASE_URL is treated
+ * as hand-maintained and left alone.
  */
 function isLegacySharedDbUrl(url) {
   const target = parseDbUrl(url)
   return (
     target?.host === '127.0.0.1' &&
     target.port === 47193 &&
-    /^postgres(?:ql)?:\/\/[^/]+\/opal_line\/?$/.test(url)
+    /^postgres(?:ql)?:\/\/[^/]+\/opal_line(?:_dev)?\/?$/.test(url)
   )
 }
 

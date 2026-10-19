@@ -21,9 +21,9 @@ import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
 import 'dotenv/config'
 
-process.env.SHOPIFY_STORE_URL ||= 'https://opal-line-test.myshopify.com'
-process.env.SHOPIFY_ACCESS_TOKEN ||= 'shpat_test_token'
-process.env.SHOPIFY_API_VERSION ||= '2024-10'
+process.env.SHOPIFY_STORE_URL = 'https://opal-line-test.myshopify.com'
+process.env.SHOPIFY_ACCESS_TOKEN = 'shpat_test_token'
+process.env.SHOPIFY_API_VERSION = '2024-10'
 delete process.env.DATABASE_URL
 
 type FetchCall = { url: string; method: string; body?: unknown }
