@@ -434,7 +434,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -506,7 +509,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Payment Status</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Payment Status</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
+                </div>
                 <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
               </CardHeader>
               <CardContent>
@@ -566,7 +572,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -621,7 +630,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -654,8 +666,8 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                         <TableCell className="text-right font-semibold tabular-nums text-red-600 dark:text-red-400">{formatPieces(l.stock)}</TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">{formatPieces(l.reorderLevel)}</TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={l.status === 'critical' ? 'danger' : 'warning'} dot>
-                            {l.status}
+                          <Badge variant={l.stock === 0 || l.status === 'critical' ? 'danger' : 'warning'} dot>
+                            {l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'}
                           </Badge>
                         </TableCell>
                       </TableRow>
@@ -790,6 +802,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 <CardTitle className="text-sm flex items-center gap-2">
                   <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
                 </CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Failed logins and account lockouts</p>
               </CardHeader>
               <CardContent className="space-y-3">
                 {security ? (
@@ -828,6 +841,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </CardHeader>
               <CardContent className="p-0">
                 <div className="relative px-5 pb-5">

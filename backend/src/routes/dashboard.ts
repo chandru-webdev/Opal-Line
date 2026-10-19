@@ -8,6 +8,7 @@ import { LOCKOUT_DURATION_MS, LOCKOUT_THRESHOLD } from '../lockout'
 import { computeUserPermissions } from '../rbac'
 import { routeParam } from '../lib/routeParams'
 import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
+import { DEFAULT_REORDER_LEVEL, lowStockWhere } from '../lib/lowStock'
 
 export const dashboardRouter = Router()
 
@@ -48,8 +49,12 @@ const BUSINESS_NAME_PATTERN = /house|jewels|llp|pvt|ltd|exports|trading|industri
 const BUSINESS_NAME_RE = 'house|jewels|llp|pvt|ltd|exports|trading|industries|firm|company|corp'
 
 // Voided invoices are not sales: a cancelled or refunded invoice must never
-// count towards revenue, order counts or the chart.
-const NOT_VOIDED = sql`coalesce(${schema.salesInvoices.status}, '') not in ('cancelled', 'refunded')`
+// count towards revenue, order counts or the chart. Refund is checked on BOTH
+// columns — the payment-status widget reports an invoice as Refunded when
+// either one says so, so the Sales KPI, chart, rankings and Net Revenue must
+// drop it too or the widgets totals disagree (money reported as refunded and
+// as sales at the same time).
+const NOT_VOIDED = sql`coalesce(${schema.salesInvoices.status}, '') not in ('cancelled', 'refunded') and coalesce(${schema.salesInvoices.paymentStatus}, '') <> 'refunded'`
 
 /** Resolve the page-wide range from the request, or send a 400 and return null. */
 function rangeFromQuery(req: { query: unknown }, res: Response, defaultPeriod?: string): DashboardRange | null {
@@ -101,18 +106,23 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
   if (!range) return
   try {
     // Aggregated in SQL: the invoice table can outgrow a load-everything scan.
+    // Cost basis = silver_value + making_charge; only invoices that carry both
+    // contribute to profit/cost. An invoice imported without a basis would
+    // otherwise report its whole grand_total as profit (100% margin), so the
+    // KPI discloses how many invoices the figure is based on.
     const invAgg = async (from: string, to: string) => {
       const rows = await db!
         .select({
           total: sql<number>`coalesce(sum(grand_total), 0)`,
           count: sql<number>`count(*)`,
-          profit: sql<number>`coalesce(sum(grand_total - coalesce(silver_value, 0) - coalesce(making_charge, 0)), 0)`,
-          cost: sql<number>`coalesce(sum(coalesce(silver_value, 0) + coalesce(making_charge, 0)), 0)`,
+          profit: sql<number>`coalesce(sum(grand_total - coalesce(silver_value, 0) - coalesce(making_charge, 0)) filter (where silver_value is not null and making_charge is not null), 0)`,
+          cost: sql<number>`coalesce(sum(coalesce(silver_value, 0) + coalesce(making_charge, 0)) filter (where silver_value is not null and making_charge is not null), 0)`,
+          costedCount: sql<number>`count(*) filter (where silver_value is not null and making_charge is not null)`,
         })
         .from(schema.salesInvoices)
         .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
       const r = rows[0]
-      return { total: num(r.total), count: Number(r.count), profit: num(r.profit), cost: num(r.cost) }
+      return { total: num(r.total), count: Number(r.count), profit: num(r.profit), cost: num(r.cost), costedCount: Number(r.costedCount) }
     }
     const ordersAgg = async (from: string, to: string) => {
       const rows = await db!
@@ -129,7 +139,7 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       ordersAgg(range.prevFrom, range.prevTo),
       returnsTotal(range.from, range.to),
       returnsTotal(range.prevFrom, range.prevTo),
-      db!.select({ n: sql<number>`count(*)` }).from(schema.products).where(sql`stock is not null and reorder_level is not null and stock <= reorder_level`),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.products).where(lowStockWhere()),
       db!.select({ total: sql<number>`coalesce(sum(grand_total), 0)`, count: sql<number>`count(*)` }).from(schema.salesInvoices).where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
     ])
 
@@ -140,10 +150,15 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
     const salesCompare = compare(curSales, prevSales)
     const orderCompare = compare(curOrders, prevOrders)
     const invoiceCompare = compare(cur.count, prev.count)
-    // Gross profit uses metal + making (the app's cost basis). With no cost
-    // basis in the window it reads N/A instead of a misleading 100% margin.
-    const hasCost = cur.cost > 0
-    const profitCompare = hasCost ? compare(cur.profit, prev.cost > 0 ? prev.profit : 0) : { trend: 'flat' as const, delta: '—' }
+    // Gross profit uses metal + making (the app's cost basis), counted only
+    // over invoices that carry both components. With no costed invoice in the
+    // window it reads N/A instead of a misleading 100% margin, and the caption
+    // states how many invoices the figure is based on.
+    const hasCost = cur.costedCount > 0
+    const profitCompare = hasCost ? compare(cur.profit, prev.costedCount > 0 ? prev.profit : 0) : { trend: 'flat' as const, delta: '—' }
+    const profitCaption = hasCost
+      ? `based on ${cur.costedCount} of ${cur.count} invoices`
+      : 'no cost basis in range'
     const outstanding = num(outstandingRows[0]?.total)
     const outstandingCount = Number(outstandingRows[0]?.count ?? 0)
 
@@ -151,7 +166,7 @@ dashboardRouter.get('/dashboard/kpis', async (req, res) => {
       { key: 'sales', label: 'Sales', value: inr(curSales), trend: salesCompare.trend, delta: salesCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'indian-rupee', accent: 'purple' },
       { key: 'orders', label: 'Orders', value: String(curOrders), trend: orderCompare.trend, delta: orderCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'shopping-bag', accent: 'blue' },
       { key: 'invoices', label: 'Invoices', value: String(cur.count), trend: invoiceCompare.trend, delta: invoiceCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'file-text', accent: 'green' },
-      { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: range.prevLabel, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
+      { key: 'grossProfit', label: 'Gross Profit', value: hasCost ? inr(cur.profit) : 'N/A', trend: profitCompare.trend, delta: profitCompare.delta, deltaLabel: profitCaption, rangeLabel: range.label, icon: 'trending-up', accent: 'orange' },
       { key: 'outstanding', label: 'Outstanding', value: inr(outstanding), trend: 'flat', delta: '—', deltaLabel: `${outstandingCount} invoices`, rangeLabel: range.label, icon: 'clock', accent: 'red' },
       { key: 'lowStock', label: 'Low Stock Items', value: String(Number(lowStockRows[0]?.n ?? 0)), trend: 'flat', delta: '—', deltaLabel: 'Needs Reorder', rangeLabel: range.label, icon: 'package-x', accent: 'slate' },
     ])
@@ -494,21 +509,26 @@ dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
 dashboardRouter.get('/dashboard/low-stock', async (_req, res) => {
   if (!requireDb(res)) return
   try {
+    // Out-of-stock (0) sorts first with `stock asc`; NULL reorder levels fall
+    // back to the shared default so unimported products still flag.
     const rows = await db!
       .select()
       .from(schema.products)
-      .where(sql`stock is not null and reorder_level is not null and stock <= reorder_level`)
+      .where(lowStockWhere())
       .orderBy(sql`stock asc`)
 
     res.json(
-      rows.map((p) => ({
-        id: p.id,
-        product: p.name,
-        sku: p.sku,
-        stock: num(p.stock),
-        reorderLevel: num(p.reorderLevel),
-        status: num(p.stock) === 0 || num(p.stock) * 2 <= num(p.reorderLevel) ? ('critical' as const) : ('low' as const),
-      })),
+      rows.map((p) => {
+        const reorderLevel = p.reorderLevel ?? DEFAULT_REORDER_LEVEL
+        return {
+          id: p.id,
+          product: p.name,
+          sku: p.sku,
+          stock: num(p.stock),
+          reorderLevel,
+          status: num(p.stock) === 0 || num(p.stock) * 2 <= reorderLevel ? ('critical' as const) : ('low' as const),
+        }
+      }),
     )
   } catch {
     res.status(500).json({ error: 'Internal server error' })
@@ -703,17 +723,22 @@ dashboardRouter.get('/dashboard/analytics', async (req, res) => {
   if (!range) return
   try {
     // Period aggregates computed in SQL, compared with the equivalent previous window.
+    // Cost and revenue are both restricted to invoices that carry the app's
+    // cost basis (silver_value + making_charge), so the margin never pairs the
+    // full period's sales with a subset of its costs.
     const agg = async (from: string, to: string) => {
       const rows = await db!
         .select({
           sales: sql<number>`coalesce(sum(grand_total), 0)`,
           count: sql<number>`count(*)`,
-          cost: sql<number>`coalesce(sum(coalesce(silver_value, 0) + coalesce(making_charge, 0)), 0)`,
+          cost: sql<number>`coalesce(sum(coalesce(silver_value, 0) + coalesce(making_charge, 0)) filter (where silver_value is not null and making_charge is not null), 0)`,
+          costedSales: sql<number>`coalesce(sum(grand_total) filter (where silver_value is not null and making_charge is not null), 0)`,
+          costedCount: sql<number>`count(*) filter (where silver_value is not null and making_charge is not null)`,
         })
         .from(schema.salesInvoices)
         .where(and(gte(schema.salesInvoices.date, from), sql`${schema.salesInvoices.date} < ${to}`, NOT_VOIDED))
       const r = rows[0]
-      return { sales: num(r.sales), count: Number(r.count), cost: num(r.cost) }
+      return { sales: num(r.sales), count: Number(r.count), cost: num(r.cost), costedSales: num(r.costedSales), costedCount: Number(r.costedCount) }
     }
 
     const [cur, prev, curReturns, prevReturns, invRows] = await Promise.all([
@@ -731,8 +756,10 @@ dashboardRouter.get('/dashboard/analytics', async (req, res) => {
     const aov = cur.count > 0 ? curSales / cur.count : 0
     const prevAov = prev.count > 0 ? prevSales / prev.count : 0
     // Margin needs a cost basis; without one it reads N/A, never 100%.
-    const curMargin = cur.cost > 0 && curSales > 0 ? (curSales - cur.cost) / curSales : null
-    const prevMargin = prev.cost > 0 && prevSales > 0 ? (prevSales - prev.cost) / prevSales : null
+    // Both sides come from the costed invoice subset (returns are reported by
+    // the separate Return Rate card), so the ratio stays internally consistent.
+    const curMargin = cur.costedCount > 0 && cur.costedSales > 0 ? (cur.costedSales - cur.cost) / cur.costedSales : null
+    const prevMargin = prev.costedCount > 0 && prev.costedSales > 0 ? (prev.costedSales - prev.cost) / prev.costedSales : null
 
     const salesCmp = compare(curSales, prevSales)
     const orderCmp = compare(cur.count, prev.count)
@@ -764,7 +791,7 @@ dashboardRouter.get('/dashboard/inventory-overview', async (_req, res) => {
       totalQuantity: products.reduce((a, p) => a + num(p.stock), 0),
       totalWeight: round2(products.reduce((a, p) => a + num(p.stock) * num(p.netWeight), 0)),
       inventoryValue: round2(products.reduce((a, p) => a + num(p.stock) * num(p.sellingPrice), 0)),
-      lowStock: products.filter((p) => num(p.stock) <= num(p.reorderLevel)).length,
+      lowStock: products.filter((p) => p.trackInventory && p.stock != null && num(p.stock) <= (p.reorderLevel ?? DEFAULT_REORDER_LEVEL)).length,
       outOfStock: products.filter((p) => num(p.stock) === 0).length,
     })
   } catch {
