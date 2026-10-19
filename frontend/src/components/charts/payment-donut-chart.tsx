@@ -7,6 +7,7 @@ const COLORS: Record<PaymentStatusSegment['status'], string> = {
   paid: '#16a34a',
   pending: '#f59e0b',
   failed: '#ef4444',
+  refunded: '#94a3b8',
 }
 
 export function PaymentDonutChart({

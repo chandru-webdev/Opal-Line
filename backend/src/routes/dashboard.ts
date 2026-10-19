@@ -384,29 +384,42 @@ dashboardRouter.get('/dashboard/payment-status', async (req, res) => {
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
-    // Segment predicates mirror the previous JS logic exactly (pending keeps
-    // matching overdue rows, paid excludes them) so chart values are stable.
+    // Four mutually exclusive segments covering every live invoice for the
+    // window, so the rows always add up to the total shown in the donut centre.
+    // Precedence: refunded → failed/overdue → paid → pending (the catch-all).
+    // Cancelled invoices are void and count nowhere; `total` is the sum of the
+    // four segments rather than a separate aggregate, so the two can never
+    // disagree.
+    const live = sql`coalesce(status, '') <> 'cancelled'`
+    const refundedCond = sql`(coalesce(status, '') = 'refunded' or coalesce(payment_status, '') = 'refunded')`
+    const notRefunded = sql`not (${refundedCond})`
+    const isOverdue = sql`coalesce(status, '') = 'overdue'`
+    const notOverdue = sql`not (${isOverdue})`
     const rows = await db!
       .select({
-        paid: sql<number>`coalesce(sum(grand_total) filter (where payment_status = 'paid' and (status is null or status <> 'overdue')), 0)`,
-        paidCount: sql<number>`count(*) filter (where payment_status = 'paid' and (status is null or status <> 'overdue'))`,
-        pending: sql<number>`coalesce(sum(grand_total) filter (where payment_status in ('pending','partial')), 0)`,
-        pendingCount: sql<number>`count(*) filter (where payment_status in ('pending','partial'))`,
-        failed: sql<number>`coalesce(sum(grand_total) filter (where payment_status = 'failed' or status = 'overdue'), 0)`,
-        failedCount: sql<number>`count(*) filter (where payment_status = 'failed' or status = 'overdue')`,
-        total: sql<number>`coalesce(sum(grand_total), 0)`,
+        paid: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') = 'paid'), 0)`,
+        paidCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') = 'paid')`,
+        pending: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') not in ('paid', 'failed')), 0)`,
+        pendingCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and ${notOverdue} and coalesce(payment_status, '') not in ('paid', 'failed'))`,
+        failed: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${notRefunded} and (coalesce(payment_status, '') = 'failed' or ${isOverdue})), 0)`,
+        failedCount: sql<number>`count(*) filter (where ${live} and ${notRefunded} and (coalesce(payment_status, '') = 'failed' or ${isOverdue}))`,
+        refunded: sql<number>`coalesce(sum(grand_total) filter (where ${live} and ${refundedCond}), 0)`,
+        refundedCount: sql<number>`count(*) filter (where ${live} and ${refundedCond})`,
       })
       .from(schema.salesInvoices)
-      .where(and(gte(schema.salesInvoices.date, range.from), sql`${schema.salesInvoices.date} < ${range.to}`, NOT_VOIDED))
+      .where(and(gte(schema.salesInvoices.date, range.from), sql`${schema.salesInvoices.date} < ${range.to}`))
     const r = rows[0]
 
+    const segments = [
+      { status: 'paid' as const, label: 'Paid', value: round2(num(r.paid)), count: Number(r.paidCount) },
+      { status: 'pending' as const, label: 'Pending', value: round2(num(r.pending)), count: Number(r.pendingCount) },
+      { status: 'failed' as const, label: 'Failed / Overdue', value: round2(num(r.failed)), count: Number(r.failedCount) },
+      { status: 'refunded' as const, label: 'Refunded', value: round2(num(r.refunded)), count: Number(r.refundedCount) },
+    ]
+
     res.json({
-      segments: [
-        { status: 'paid', label: 'Paid', value: round2(num(r.paid)), count: Number(r.paidCount) },
-        { status: 'pending', label: 'Pending', value: round2(num(r.pending)), count: Number(r.pendingCount) },
-        { status: 'failed', label: 'Failed / Overdue', value: round2(num(r.failed)), count: Number(r.failedCount) },
-      ],
-      total: round2(num(r.total)),
+      segments,
+      total: round2(segments.reduce((sum, s) => sum + s.value, 0)),
     })
   } catch {
     res.status(500).json({ error: 'Internal server error' })

@@ -185,7 +185,7 @@ export interface ProfitAnalytics {
 }
 
 export interface PaymentStatusSegment {
-  status: 'paid' | 'pending' | 'failed'
+  status: 'paid' | 'pending' | 'failed' | 'refunded'
   label: string
   value: number
   count: number

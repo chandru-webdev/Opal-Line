@@ -541,6 +541,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                                 s.status === 'paid' && 'bg-success',
                                 s.status === 'pending' && 'bg-warning',
                                 s.status === 'failed' && 'bg-destructive',
+                                s.status === 'refunded' && 'bg-muted-foreground',
                               )}
                             />
                             <span className="text-muted-foreground">{s.label}</span>
