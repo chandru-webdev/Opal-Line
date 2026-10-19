@@ -112,6 +112,10 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 
 export default function DashboardPage() {
   const navigate = useNavigate()
+  const { currentUser } = useAuth()
+  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
+  // everyone else, so don't even fetch it (and never render the card).
+  const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
 const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
@@ -163,7 +167,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range),
       dbApi.getAnalyticsStats(range),
-      dbApi.getDashboardSecurity(range),
+      securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null),
       dbApi.getReceivablesAging(),
       shopifyApi.getStatus(),
     ]).then((results) => {
@@ -279,7 +283,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     return () => {
       cancelled = true
     }
-  }, [period, customRange])
+  }, [period, customRange, securityAdmin])
 
   // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
   // a bucket the first time it is expanded.
@@ -742,7 +746,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                                           </p>
                                         </div>
                                         <div className="shrink-0 text-right">
-                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.grandTotal)}</p>
+                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.outstanding ?? inv.grandTotal)}</p>
+                                          {inv.outstanding != null && inv.outstanding < inv.grandTotal ? (
+                                            <p className="text-[10.5px] text-muted-foreground">of {compactCurrency(inv.grandTotal)}</p>
+                                          ) : null}
                                           {inv.daysOverdue > 0 ? (
                                             <p className="text-[10.5px] font-medium text-red-600 dark:text-red-400">{inv.daysOverdue}d overdue</p>
                                           ) : (
@@ -777,6 +784,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
+            {securityAdmin ? (
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
@@ -815,6 +823,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 )}
               </CardContent>
             </Card>
+            ) : null}
 
             <Card className="xl:col-span-1">
               <CardHeader>

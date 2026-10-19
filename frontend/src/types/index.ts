@@ -282,6 +282,8 @@ export interface AgingInvoice {
   date: string | null
   dueDate: string | null
   grandTotal: number
+  /** Unpaid remainder (grand total net of successful payments) — what the bucket counts. */
+  outstanding: number
   paymentStatus: string
   status: string
   daysOverdue: number

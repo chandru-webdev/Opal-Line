@@ -4,7 +4,8 @@ import { db, schema } from '../db/client'
 import { CONSTANTS } from '../constants'
 import { logger } from '../logger'
 import { computeInputGst, computeTcs, netPayable } from '../gst'
-import { LOCKOUT_THRESHOLD } from '../lockout'
+import { LOCKOUT_DURATION_MS, LOCKOUT_THRESHOLD } from '../lockout'
+import { computeUserPermissions } from '../rbac'
 import { routeParam } from '../lib/routeParams'
 import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
 
@@ -566,23 +567,55 @@ function activityType(module: string | null, action: string | null): string {
   return 'sync'
 }
 
+/** Merged-feed ordering: newest first; a missing timestamp sorts oldest. */
+function newestFirst(a: { timestamp: string | null }, b: { timestamp: string | null }): number {
+  const at = a.timestamp ?? ''
+  const bt = b.timestamp ?? ''
+  return at < bt ? 1 : at > bt ? -1 : 0
+}
+
 dashboardRouter.get('/dashboard/activities', async (req, res) => {
   if (!requireDb(res)) return
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
     // Every activity in the selected period, newest first (no fixed cap).
-    const logs = await db!
-      .select()
-      .from(schema.auditLogs)
-      .where(and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`))
-      .orderBy(desc(schema.auditLogs.timestamp))
+    // Two sources feed the feed: activity_logs (recordActivity — auth, sales,
+    // system, backup and RBAC operations) and audit_logs (recordAudit — the
+    // Shopify sync events plus legacy seeded rows), merged newest-first.
+    const [activityRows, auditRows] = await Promise.all([
+      db!
+        .select({
+          id: schema.activityLogs.id,
+          timestamp: schema.activityLogs.timestamp,
+          user: schema.activityLogs.user,
+          action: schema.activityLogs.action,
+          module: schema.activityLogs.module,
+          entity: schema.activityLogs.entity,
+          detail: schema.activityLogs.details,
+        })
+        .from(schema.activityLogs)
+        .where(and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)),
+      db!
+        .select({
+          id: schema.auditLogs.id,
+          timestamp: schema.auditLogs.timestamp,
+          user: schema.auditLogs.user,
+          action: schema.auditLogs.action,
+          module: schema.auditLogs.module,
+          entity: schema.auditLogs.entity,
+          detail: schema.auditLogs.changes,
+        })
+        .from(schema.auditLogs)
+        .where(and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)),
+    ])
+    const logs = [...activityRows, ...auditRows].sort(newestFirst)
     res.json(
       logs.map((l) => ({
         id: l.id,
         type: activityType(l.module, l.action),
         title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
-        detail: l.changes ?? undefined,
+        detail: l.detail ?? undefined,
         actor: l.user ?? 'System',
         time: friendlyTime(l.timestamp),
       })),
@@ -593,29 +626,68 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
 })
 
 // Security snapshot for the dashboard widget: failed logins in the selected
-// period plus active account lockouts (a point-in-time snapshot).
+// period plus active account lockouts (a point-in-time snapshot). Admin-only —
+// the payload names accounts that failed to log in, so only Admin / Super
+// Admin may read it; the widget hides itself for everyone else.
+const SECURITY_ADMIN_ROLES = ['Admin', 'Super Admin']
+
 dashboardRouter.get('/dashboard/security', async (req, res) => {
   if (!requireDb(res)) return
+  const userId = req.userId
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' })
+    return
+  }
+  const perms = await computeUserPermissions(userId)
+  if (!perms || !SECURITY_ADMIN_ROLES.includes(perms.role)) {
+    res.status(403).json({ error: 'Admin access required' })
+    return
+  }
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
-    const inRange = and(
+    // Failed logins are written by the auth stack into activity_logs
+    // (recordActivity); audit_logs holds recordAudit rows (Shopify sync) and
+    // legacy seeds — count and list both so nothing can be missed.
+    const failedActivityWhere = and(
+      sql`${schema.activityLogs.action} = 'Failed Login Attempt'`,
+      gte(schema.activityLogs.timestamp, range.from),
+      sql`${schema.activityLogs.timestamp} < ${range.to}`,
+    )
+    const failedAuditWhere = and(
       sql`${schema.auditLogs.action} = 'Failed Login Attempt'`,
       gte(schema.auditLogs.timestamp, range.from),
       sql`${schema.auditLogs.timestamp} < ${range.to}`,
     )
-    const [failedLogins, locked, recent] = await Promise.all([
-      db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(inRange),
-      db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(sql`${schema.loginAttempts.count} >= ${LOCKOUT_THRESHOLD}`),
+    // Locked = threshold reached AND the lockout window still open — the same
+    // rule checkLockout() applies at login (routes/auth.ts), so a stale row
+    // whose window has lapsed no longer reads as a locked account here.
+    const lockCutoff = new Date(Date.now() - LOCKOUT_DURATION_MS).toISOString()
+    const [failedActivity, failedAudit, locked, recentActivity, recentAudit] = await Promise.all([
+      db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(failedActivityWhere),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(failedAuditWhere),
+      db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(
+        and(
+          gte(schema.loginAttempts.count, LOCKOUT_THRESHOLD),
+          gte(schema.loginAttempts.lastAttempt, lockCutoff),
+        ),
+      ),
+      db!
+        .select({ entity: schema.activityLogs.entity, details: schema.activityLogs.details, timestamp: schema.activityLogs.timestamp })
+        .from(schema.activityLogs)
+        .where(failedActivityWhere)
+        .orderBy(desc(schema.activityLogs.timestamp))
+        .limit(5),
       db!
         .select({ entity: schema.auditLogs.entity, details: schema.auditLogs.changes, timestamp: schema.auditLogs.timestamp })
         .from(schema.auditLogs)
-        .where(inRange)
+        .where(failedAuditWhere)
         .orderBy(desc(schema.auditLogs.timestamp))
         .limit(5),
     ])
+    const recent = [...recentActivity, ...recentAudit].sort(newestFirst).slice(0, 5)
     res.json({
-      failedLogins: Number(failedLogins[0]?.n ?? 0),
+      failedLogins: Number(failedActivity[0]?.n ?? 0) + Number(failedAudit[0]?.n ?? 0),
       lockedAccounts: Number(locked[0]?.n ?? 0),
       recent,
     })
@@ -811,12 +883,6 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
     const invoicedTotal = num(invTotals[0]?.total)
     const invoicedCount = Number(invTotals[0]?.count ?? 0)
     const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
-    const parseNaive = (s: string | null): Date | null => {
-      if (!s) return null
-      const body = s.includes('T') ? s : s.replace(' ', 'T')
-      const d = new Date(body)
-      return Number.isNaN(d.getTime()) ? null : d
-    }
     const nowDay = localDayStart(0)
     const today = new Date(nowDay.replace('T', ' '))
     const DAY = 86400000
@@ -889,43 +955,70 @@ dashboardRouter.get('/dashboard/financial', async (req, res) => {
 // RECEIVABLES AGING: outstanding balance bucketed by invoice due date
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Parse a stored naive timestamp ('YYYY-MM-DD' or with a time part). */
+function parseNaive(s: string | null): Date | null {
+  if (!s) return null
+  const body = s.includes('T') ? s : s.replace(' ', 'T')
+  const d = new Date(body)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
 dashboardRouter.get('/dashboard/aging', async (_req, res) => {
   if (!requireDb(res)) return
   try {
     const today = localDayStart(0)
-    // One scan over outstanding invoices only; bucket membership is decided by
-    // SQL so the buckets stay consistent no matter how the date column is
-    // formatted. Invoices without a due date (or not yet due) are "current".
-    const rows = await db!
-      .select({
-        current: sql<number>`coalesce(sum(grand_total) filter (where due_date is null or due_date > ${today}), 0)`,
-        currentCount: sql<number>`count(*) filter (where due_date is null or due_date > ${today})`,
-        d1_30: sql<number>`coalesce(sum(grand_total) filter (where due_date is not null and due_date <= ${today} and due_date > (${today}::timestamp - interval '30 days')), 0)`,
-        d1_30Count: sql<number>`count(*) filter (where due_date is not null and due_date <= ${today} and due_date > (${today}::timestamp - interval '30 days'))`,
-        d31_60: sql<number>`coalesce(sum(grand_total) filter (where due_date is not null and due_date <= (${today}::timestamp - interval '30 days') and due_date > (${today}::timestamp - interval '60 days')), 0)`,
-        d31_60Count: sql<number>`count(*) filter (where due_date is not null and due_date <= (${today}::timestamp - interval '30 days') and due_date > (${today}::timestamp - interval '60 days'))`,
-        d60plus: sql<number>`coalesce(sum(grand_total) filter (where due_date is not null and due_date <= (${today}::timestamp - interval '60 days')), 0)`,
-        d60plusCount: sql<number>`count(*) filter (where due_date is not null and due_date <= (${today}::timestamp - interval '60 days'))`,
-        total: sql<number>`coalesce(sum(grand_total), 0)`,
-        count: sql<number>`count(*)`,
-        overdueTotal: sql<number>`coalesce(sum(grand_total) filter (where due_date is not null and due_date <= ${today}), 0)`,
-        overdueCount: sql<number>`count(*) filter (where due_date is not null and due_date <= ${today})`,
-      })
-      .from(schema.salesInvoices)
-      .where(OUTSTANDING_WHERE)
-    const r = rows[0]
+    // Open invoices only (never voided/cancelled — OUTSTANDING_WHERE alone can
+    // still match a cancelled invoice whose payment_status lingers at
+    // 'pending'), value net of successful payments so a part-paid invoice
+    // contributes only its unpaid remainder. Same basis as the Receivable
+    // Summary; bucket membership still comes from the due date.
+    const [openRows, paidRows] = await Promise.all([
+      db!
+        .select({ number: schema.salesInvoices.number, grandTotal: schema.salesInvoices.grandTotal, dueDate: schema.salesInvoices.dueDate })
+        .from(schema.salesInvoices)
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED)),
+      db!
+        .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
+        .from(schema.payments)
+        .where(eq(schema.payments.status, 'success'))
+        .groupBy(schema.payments.invoice),
+    ])
+    const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
+    const todayDate = new Date(today.replace('T', ' '))
+    const day30 = new Date(todayDate.getTime() - 30 * 86400000)
+    const day60 = new Date(todayDate.getTime() - 60 * 86400000)
+
+    const buckets = [
+      { key: 'current', label: 'Current / Not yet due', value: 0, count: 0 },
+      { key: 'd1_30', label: '1–30 days overdue', value: 0, count: 0 },
+      { key: 'd31_60', label: '31–60 days overdue', value: 0, count: 0 },
+      { key: 'd60plus', label: '60+ days overdue', value: 0, count: 0 },
+    ]
+    let total = 0
+    let overdueTotal = 0
+    let overdueCount = 0
+    for (const row of openRows) {
+      const unpaid = Math.max(0, num(row.grandTotal) - (paidByInvoice.get(row.number ?? '') ?? 0))
+      total += unpaid
+      const due = parseNaive(row.dueDate)
+      if (!due || due > todayDate) {
+        buckets[0].value += unpaid
+        buckets[0].count += 1
+      } else {
+        overdueTotal += unpaid
+        overdueCount += 1
+        const band = due > day30 ? 1 : due > day60 ? 2 : 3
+        buckets[band].value += unpaid
+        buckets[band].count += 1
+      }
+    }
 
     res.json({
-      buckets: [
-        { key: 'current', label: 'Current / Not yet due', value: round2(num(r.current)), count: Number(r.currentCount) },
-        { key: 'd1_30', label: '1–30 days overdue', value: round2(num(r.d1_30)), count: Number(r.d1_30Count) },
-        { key: 'd31_60', label: '31–60 days overdue', value: round2(num(r.d31_60)), count: Number(r.d31_60Count) },
-        { key: 'd60plus', label: '60+ days overdue', value: round2(num(r.d60plus)), count: Number(r.d60plusCount) },
-      ],
-      total: round2(num(r.total)),
-      invoiceCount: Number(r.count),
-      overdueTotal: round2(num(r.overdueTotal)),
-      overdueCount: Number(r.overdueCount),
+      buckets: buckets.map((b) => ({ ...b, value: round2(b.value) })),
+      total: round2(total),
+      invoiceCount: openRows.length,
+      overdueTotal: round2(overdueTotal),
+      overdueCount,
     })
   } catch (err) {
     logger.error({ err: err instanceof Error ? err.message : 'Unknown error' }, 'dashboard aging failed')
@@ -949,22 +1042,32 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
     const predicate = predicates[bucket]
     if (!predicate) return res.status(400).json({ error: 'Unknown bucket' })
 
-    const rows = await db!
-      .select({
-        id: schema.salesInvoices.id,
-        number: schema.salesInvoices.number,
-        customer: schema.salesInvoices.customer,
-        date: schema.salesInvoices.date,
-        dueDate: schema.salesInvoices.dueDate,
-        grandTotal: schema.salesInvoices.grandTotal,
-        paymentStatus: schema.salesInvoices.paymentStatus,
-        status: schema.salesInvoices.status,
-        daysOverdue: sql<number>`greatest(0, floor(extract(epoch from (${today}::timestamp - ${schema.salesInvoices.dueDate})) / 86400))::int`,
-      })
-      .from(schema.salesInvoices)
-      .where(and(OUTSTANDING_WHERE, predicate))
-      .orderBy(sql`${schema.salesInvoices.dueDate} asc nulls last`, sql`${schema.salesInvoices.number} asc`)
-      .limit(50)
+    const [rows, paidRows] = await Promise.all([
+      db!
+        .select({
+          id: schema.salesInvoices.id,
+          number: schema.salesInvoices.number,
+          customer: schema.salesInvoices.customer,
+          date: schema.salesInvoices.date,
+          dueDate: schema.salesInvoices.dueDate,
+          grandTotal: schema.salesInvoices.grandTotal,
+          paymentStatus: schema.salesInvoices.paymentStatus,
+          status: schema.salesInvoices.status,
+          daysOverdue: sql<number>`greatest(0, floor(extract(epoch from (${today}::timestamp - ${schema.salesInvoices.dueDate})) / 86400))::int`,
+        })
+        .from(schema.salesInvoices)
+        .where(and(OUTSTANDING_WHERE, NOT_VOIDED, predicate))
+        .orderBy(sql`${schema.salesInvoices.dueDate} asc nulls last`, sql`${schema.salesInvoices.number} asc`)
+        .limit(50),
+      // Same paid basis as the bucket totals, so a row's amount always adds
+      // back up to the bucket it was expanded from.
+      db!
+        .select({ invoice: schema.payments.invoice, paid: sql<number>`coalesce(sum(coalesce(amount, 0)), 0)` })
+        .from(schema.payments)
+        .where(eq(schema.payments.status, 'success'))
+        .groupBy(schema.payments.invoice),
+    ])
+    const paidByInvoice = new Map(paidRows.map((r) => [r.invoice ?? '', num(r.paid)]))
 
     res.json({
       bucket,
@@ -975,6 +1078,7 @@ dashboardRouter.get('/dashboard/aging/invoices', async (req, res) => {
         date: r.date,
         dueDate: r.dueDate,
         grandTotal: round2(num(r.grandTotal)),
+        outstanding: round2(Math.max(0, num(r.grandTotal) - (paidByInvoice.get(r.number ?? '') ?? 0))),
         paymentStatus: r.paymentStatus ?? '',
         status: r.status ?? '',
         daysOverdue: r.dueDate ? Number(r.daysOverdue ?? 0) : 0,

@@ -7,7 +7,8 @@
 1. Add to the Dashboard page: **Net Revenue**, **Receivable Summary**, **Income and Expense**, **Top Expense** (Item 4 below — now the active task, user asked for it directly). **DONE, committed** (`e9238b9`, plus `7f72a03` range test and `d305e21` Shopify fix) — see Item 4 for what was built and how it was verified.
 2. **Bug:** when the user customises the range to **Today** or **This Week**, widgets show **no data**; only month/year ranges show data. **INVESTIGATED — no code bug; the data stops at 2026-10-10.** Evidence in Pending task #2 (read-only on `opal_line_dev` + desktop `opal_line`), plus a new scratch-DB regression test.
 3. **Item 2 Payment Status** (full donut total + Refunded row): **DONE, verified** — see Item 2. Test-runner fix for the frontend JSX issue included (see the test-plumbing note under Item 4).
-4. **Item 3 Silver Rate History**: **DONE, verified** — see Item 3 (backfill endpoint + redesigned card with 7/30/90 toggles). Mid-session the repo also absorbed your `git pull` of `origin/master` (`7a6fbbe`) — see Item 3 for the merge/flag details. **Next:** items 4–6 of the user's list, subject to the HOLD in PENDING #4.
+4. **Item 3 Silver Rate History**: **DONE, verified** — see Item 3 (backfill endpoint + redesigned card with 7/30/90 toggles). Mid-session the repo also absorbed your `git pull` of `origin/master` (`7a6fbbe`) — see Item 3 for the merge/flag details.
+5. **Widget checks (user-list item 4 = progress Item 5)**: **DONE, verified** — see Item 5. Admin-only Security gate (hidden + never fetched for non-admins, 403 at the API), lockout count follows the real 15-minute window, Recent Activities + failed logins now read the log table their writers actually use (both merged), aging counts only live invoices net of successful payments; live Playwright 2/2 with temp-user cleanup. **Next:** user-list item 5 = the remaining Part-3 cards (1d Low Stock table, 1e Gross Profit basis, 1g totals reconciliation, 1h card subtitles — the HOLD in PENDING #4 is superseded by your "Widget checks + verification" choice), then user-list item 6 = full verification (progress Item 6: e2e suite, desktop build, final report), then user-list item 7 = catalogue-damage read-only report (PENDING #1, still read-only until approved).
 
 ## PENDING TASKS (user decisions 2026-10-19 — order matters; committing/pushing to the local `chandru1` branch was explicitly permitted on 2026-10-19, no other branches)
 
@@ -29,7 +30,7 @@
    - C. Sales card shows incl./excl. GST in a subtitle; every widget uses the same basis.
    - D. Orphan `stock_levels` cleanup: show rows first, back up the DB, then delete.
    - E. `backend/src/shopify.ts` commit — **approved** (idempotent, dry-run = 0 new invoices); commit as part of this sequence.
-4. **HOLD** remaining Part 3 (cards 1c–1f/1h, Payment Status, Silver Rate History, widgets, totals reconciliation) until #1 and #2 are done and the user confirms the numbers.
+4. **HOLD** remaining Part 3 (cards 1c–1f/1h, Payment Status, Silver Rate History, widgets, totals reconciliation) until #1 and #2 are done and the user confirms the numbers. — **SUPERSEDED 2026-10-19**: the user chose "Widget checks + verification" on the follow-up question; widget checks are **done** (Item 5), verification is Item 6, and the remaining cards (1d/1e/1g/1h — user-list item 5) follow without waiting for #1/#2. Payment Status and Silver Rate History were already done (Items 2–3); 1c still open.
 5. **Push only to `chandru1`** (explicit permission 2026-10-19); no other branch. For each step report what was run vs only reviewed.
 
 ---
@@ -101,9 +102,40 @@ No item is marked done without a tag saying how it was verified.
 - Note: Receivables Aging already exists on the Dashboard (predates this plan).
 
 
-## Item 5 — Widget checks: Receivables Aging, Security (admin-only, unlock), Recent Activities scope — PARTLY DONE
+## Item 5 — Widget checks: Receivables Aging, Security (admin-only, unlock), Recent Activities scope — DONE, verified
 
-- Security widget exists and is range-aware (`Dashboard.tsx`) — **review**. Admin-only visibility and unlock behaviour: **not verified**.
+*(Progress numbering: this is user-list item 4 "widget checks". User-list item 5 = the remaining Part-3 cards 1d/1e/1g/1h; user-list item 6 = Item 6 below; user-list item 7 = PENDING #1 catalogue damage.)*
+
+### Security widget — admin-only gate, window-correct lockouts
+
+- **Backend** `GET /db/dashboard/security` (`backend/src/routes/dashboard.ts`): 401 `{error:'Not authenticated'}` with no session user; 403 `{error:'Admin access required'}` unless `computeUserPermissions(userId).role` is `Admin`/`Super Admin` (`SECURITY_ADMIN_ROLES`). `lockedAccounts` now requires `count >= LOCKOUT_THRESHOLD` **and** `lastAttempt >= now − LOCKOUT_DURATION_MS` — the same rule `checkLockout()` applies at login, so a stale `login_attempts` row whose window lapsed no longer reads as a locked account — **[run]** `dashboardSecurity.test.ts`.
+- **Frontend** (`frontend/src/pages/Dashboard.tsx`): `securityAdmin` from `useAuth()` (Admin / Super Admin); the security fetch is conditional (`securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null)`, same `Promise.allSettled` slot, deps `[period, customRange, securityAdmin]`) and the whole `<Card>` is wrapped in `{securityAdmin ? … : null}` — non-admins never request the endpoint at all — **[tc]** + live-verified below.
+- **Unlock behaviour finding**: there is **no manual admin unlock action** anywhere (UI or API). Accounts self-unlock after 15 minutes (`checkLockout` lazily deletes the row) and a successful login clears the counter (`backend/src/routes/auth.ts:238`); the pure logic is covered by `lockout.test.ts`. Reported to the user; can be built as a follow-up if wanted — **[review]**.
+- **Defect found and fixed — wrong log table**: auth and every business path log through `recordActivity()` → **`activity_logs`** (auth, db, index, rbac, backup, quotations, followups), while `recordAudit()` → `audit_logs` is called only by `shopify.ts` — but `/dashboard/security` counted `audit_logs` for `'Failed Login Attempt'`, a row production never writes there (**failed logins was always 0**). Fixed: the count sums both tables and `recent` merges both (each pre-limited to 5, then newest-first, capped at 5) via a null-safe `newestFirst` helper — **[run]** test asserts activity_logs markers (production path) **and** audit_logs markers both count and appear.
+
+### Recent Activities scope
+
+- **Defect found and fixed — same wrong table**: `/dashboard/activities` read `audit_logs` alone, so it showed only Shopify sync events + legacy seeds; logins, invoices, payments, RBAC and backup events (all `recordActivity` → `activity_logs`) were invisible on the widget **and** in the header dropdown (both call this endpoint). Fixed: the endpoint now selects both tables with identical shapes (`details`/`changes` → `detail`), merges newest-first (no cap, unchanged response contract `id/type/title/detail/actor/time`). Evidence the table choice was the bug: Day Book already reads `activity_logs` (`dashboard.ts:1629`) — **[run]** `dashboardActivities.test.ts` (new file: markers from both tables present, out-of-period row excluded, merged order newest-first, `detail`/`actor` populated; separate file on purpose — a test's `finally` closes the shared pool, which broke a second test in the same file until split).
+
+### Receivables Aging
+
+- **Backend** `/dashboard/aging` rewritten to bucket in JS over `openRows` (`OUTSTANDING_WHERE` + `NOT_VOIDED`) with `paidRows` (`payments.status = 'success'` grouped per invoice); band value = `max(grandTotal − paid, 0)`, bands `current/d1_30/d31_60/d60plus` with the same boundary semantics and unchanged response shape; `parseNaive` hoisted to module scope. `/dashboard/aging/invoices` drill-down: `NOT_VOIDED` + paid map, rows now carry `outstanding` — **[run]** `dashboardAging.test.ts` (not-due → current, 40d → d31_60, 70d → d60plus, part-paid 2000−1500 → d1_30 value 500, **voided-with-pending 9999 excluded**, `total = Σ buckets`, drill-down `outstanding`, unknown bucket → 400).
+- **Frontend**: `AgingInvoice.outstanding` added to `frontend/src/types/index.ts`; drill-down rows display `outstanding` with an "of ₹total" note when lower than the invoice total — **[tc]**.
+
+### Verification
+
+- **Backend gauntlet — [run]**: `tsc --noEmit` 0, oxlint 0, full suite with `DASHBOARD_TEST_DATABASE_URL` = `.env` URL retargeted to `/opal_line_scratch`: **296 tests, 295 pass, 0 fail, 1 skip, exit 0** (both widget test files green standalone too). Scratch DB **recreated after the session's merge** re-provisioned dev PostgreSQL to `127.0.0.1:47194` (dev.mjs now uses db `opal_line`): schema-only `pg_dump` from `opal_line` → 53 = 53 tables parity; tests must be given the full URL (scheme + creds) or postgres.js fails `ERR_INVALID_URL`.
+- **Frontend gauntlet — [run]**: `tsc -b --force` 0 (must run with cwd = `frontend/`; `-p frontend` errors TS5072), oxlint 0, `npm test` 15/15, `vite build` OK.
+- **Live Playwright — [run]** (temp spec, deleted before commit; dev stack 47195 UI + 47191 backend):
+  - *Admin context*: Security card visible (`Failed logins`, `Locked accounts`), Recent Activities card visible and the feed API returns today's login (rows carry `title/actor/time`), Receivables Aging renders its settled-book empty state, every `/db/dashboard/security` response 200, **zero post-login console errors**.
+  - *Fresh non-admin context*: temp user created via `POST /db/users` (role `Manager` + personal `permissions {dashboard:{view:true}}` override; CSRF double-submit — must fetch `GET /api/v1/csrf-token` and send `X-CSRF-Token`, login exempt; `prepareUserBody` clears `requirePasswordChange` when a password is supplied). As that user: `GET /db/dashboard/security` → 403 `{error:'Admin access required'}`; the dashboard page **never calls it** (0 security requests); Security card absent (`Failed logins`/`Locked accounts` count 0); **every** `/api/v1/db/dashboard/*` call 200; no uncaught page errors; both widget cards render.
+  - *Cleanup*: `DELETE /db/users/:id` → 200 (generic CRUD route, CSRF header); psql scrub removed 12 temp `activity_logs` rows from the create/login/delete cycles; dev DB checked back to 0 temp users/sessions/login_attempts/rows. Temp spec + `test-results/` deleted before commit.
+- **Findings recorded, not fixed (candidates/follow-ups):**
+  - **UTC-vs-local day-boundary skew**: `recordActivity`/`recordAudit` write `new Date().toISOString()` (UTC-naive) while range queries build local-naive `[00:00, next-day)` windows → events between 00:00–05:30 IST (18:30–00:00 UTC) bucket to the **previous** local day. Fixing needs coordinated writer+reader+`parseDbTimestamp` changes; left alone. Tests use `localNaive(now)` markers so they are hour-independent.
+  - **Header feed is today-only**: `getRecentActivities()` (header dropdown) passes no range → `period=today` default; the widget itself is range-aware.
+  - **App-bootstrap fetches ignore role**: `silver-rate-provider` (`GET /silver/rate`) and `auth-provider`'s users preload (`GET /db/users?limit=200`) run for every session and 403 for roles without those modules → browser "Failed to load resource" console noise on every page for dashboard-only users (observed live). Widget endpoints themselves all pass; a permission-aware gate (like the security fetch now has) is the candidate fix.
+  - **CSRF for future API-driving e2e**: mutating requests need `X-CSRF-Token` matching the `XSRF-TOKEN` cookie (double-submit, `index.ts:156`); `/auth/login` is exempt.
+- **DB writes this item**: temp user + temp activity rows only, all scrubbed; no schema/data changes (the `require_password_change` flag clear for `admin` stays documented under Item 3).
 
 ## Item 6 — Verify on scratch data, tests, cleanup, report repo/branch — PARTLY DONE
 
