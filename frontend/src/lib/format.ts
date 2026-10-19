@@ -76,6 +76,16 @@ export function todayIST(): string {
   return istDateKey(new Date())
 }
 
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** Chart axis/tooltip label for an IST calendar day: "2026-10-05" → "5 Oct". */
+export function rateDayLabel(isoDay: string): string {
+  const [, m, d] = String(isoDay).split('-')
+  const month = SHORT_MONTHS[Number(m) - 1]
+  if (!month || !d) return String(isoDay)
+  return `${Number(d)} ${month}`
+}
+
 export function formatDate(date: Date | string | null | undefined) {
   const d = toDate(date)
   if (!d) return '—'

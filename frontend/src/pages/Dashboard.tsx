@@ -42,7 +42,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
-import { SilverRateChart } from '@/components/charts/silver-rate-chart'
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
 import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
@@ -57,7 +57,6 @@ import type {
   ReceivablesAging,
   SalesOverviewPoint,
   SilverRate,
-  SilverRatePoint,
   TopCategory,
   TopProduct,
   PeriodKey,
@@ -123,7 +122,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
   const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
   const [silverRate, setSilverRate] = useState<SilverRate | null>(null)
-  const [silverHistory, setSilverHistory] = useState<SilverRatePoint[]>([])
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
@@ -162,7 +160,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       dbApi.getTopCategory(range),
       dbApi.getPaymentStatus(range),
       dbApi.getSilverRate(),
-      dbApi.getSilverRateHistory(),
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range),
       dbApi.getAnalyticsStats(range),
@@ -178,13 +175,12 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       const topCategoryResult = results[4]
       const paymentStatusResult = results[5]
       const silverRateResult = results[6]
-      const silverHistoryResult = results[7]
-      const lowStockResult = results[8]
-      const activitiesResult = results[9]
-      const analyticsResult = results[10]
-      const securityResult = results[11]
-      const agingResult = results[12]
-      const shopifyStatusResult = results[13]
+      const lowStockResult = results[7]
+      const activitiesResult = results[8]
+      const analyticsResult = results[9]
+      const securityResult = results[10]
+      const agingResult = results[11]
+      const shopifyStatusResult = results[12]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -234,9 +230,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       // Silver Rate
       const silverRate = silverRateResult.status === 'fulfilled' ? silverRateResult.value : null
 
-      // Silver History
-      const silverHistory = silverHistoryResult.status === 'fulfilled' ? silverHistoryResult.value : []
-
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
 
@@ -266,7 +259,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       setPaymentStatus(paymentStatus)
       setPaymentStatusError(paymentStatusError ?? null)
       setSilverRate(silverRate)
-      setSilverHistory(silverHistory)
       setLowStock(lowStock)
       setActivities(activities)
       setAnalytics(analytics)
@@ -621,33 +613,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Silver Rate History ({silverRate?.purity ?? 92.5})</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Last 7 days · ₹ / gm</p>
-                </div>
-                <Badge variant="success" className="text-[10px]">
-                  Today: {silverRate ? `₹${silverRate.rate.toFixed(2)} / gm` : '—'}
-                </Badge>
-              </CardHeader>
-              <CardContent>
-                {silverHistory.length > 0 ? (
-                  <SilverRateChart data={silverHistory} />
-                ) : (
-                  <EmptyState
-                    icon={Tag}
-                    title="No silver rate history"
-                    description="Update today's rate to start the 7-day trend line."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/silver-rate')}>
-                        Set Silver Rate
-                      </Button>
-                    }
-                  />
-                )}
-              </CardContent>
-            </Card>
+            <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">

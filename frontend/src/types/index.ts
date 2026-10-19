@@ -287,6 +287,10 @@ export interface AgingInvoice {
   daysOverdue: number
 }
 
+/** Preset windows of the dashboard Silver Rate History chart. */
+export type SilverHistoryDays = 7 | 30 | 90
+
+/** One backfilled silver-rate point: `date` is an IST calendar day (YYYY-MM-DD). */
 export interface SilverRatePoint {
   date: string
   rate: number

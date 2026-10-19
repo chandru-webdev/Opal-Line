@@ -1,5 +1,5 @@
 import { Router, type Response } from 'express'
-import { and, desc, eq, gte, ne, sql, type AnyColumn, type SQL } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, ne, sql, type AnyColumn, type SQL } from 'drizzle-orm'
 import { db, schema } from '../db/client'
 import { CONSTANTS } from '../constants'
 import { logger } from '../logger'
@@ -421,6 +421,70 @@ dashboardRouter.get('/dashboard/payment-status', async (req, res) => {
       segments,
       total: round2(segments.reduce((sum, s) => sum + s.value, 0)),
     })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ── Silver Rate History ────────────────────────────────────────────────
+// One point per IST calendar day for the last `days` days (7 | 30 | 90).
+// silver_rates only records *changes*, so days without an update
+// forward-fill the last known rate (and rates from before the window carry
+// in); days before the first rate ever recorded are omitted — we never
+// invent history. No rates at all → `{ days, points: [] }`.
+const SILVER_HISTORY_WINDOWS = [7, 30, 90]
+
+function shiftIsoDay(dayKey: string, deltaDays: number): string {
+  const d = new Date(`${dayKey}T00:00:00Z`)
+  d.setUTCDate(d.getUTCDate() + deltaDays)
+  return d.toISOString().slice(0, 10)
+}
+
+dashboardRouter.get('/dashboard/silver-history', async (req, res) => {
+  if (!requireDb(res)) return
+  const days = Number(req.query.days ?? 7)
+  if (!SILVER_HISTORY_WINDOWS.includes(days)) {
+    return res.status(400).json({ error: 'days must be one of 7, 30, 90' })
+  }
+  try {
+    const rows = await db!
+      .select({ rate: schema.silverRates.rate, updatedAt: schema.silverRates.updatedAt })
+      .from(schema.silverRates)
+      .orderBy(asc(schema.silverRates.updatedAt))
+
+    // Last rate recorded on each IST day (rows arrive oldest first → later wins).
+    const byDay = new Map<string, number>()
+    for (const row of rows) {
+      if (row.rate == null) continue
+      // drizzle mode:'string' types this as string, but the driver may hand
+      // back a Date for timestamptz — accept either.
+      const raw = row.updatedAt as string | Date | null
+      if (raw == null) continue
+      const when = raw instanceof Date ? raw : parseTimestamp(raw)
+      if (Number.isNaN(when.getTime())) continue
+      byDay.set(istDayKey(when), Number(row.rate))
+    }
+    const entries = [...byDay.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+
+    const today = istDayKey(new Date())
+    const start = shiftIsoDay(today, -(days - 1))
+
+    const points: Array<{ date: string; rate: number }> = []
+    let carry: number | null = null
+    let i = 0
+    while (i < entries.length && entries[i][0] < start) {
+      carry = entries[i][1]
+      i += 1
+    }
+    for (let day = start; day <= today; day = shiftIsoDay(day, 1)) {
+      while (i < entries.length && entries[i][0] === day) {
+        carry = entries[i][1]
+        i += 1
+      }
+      if (carry != null) points.push({ date: day, rate: carry })
+    }
+
+    res.json({ days, points })
   } catch {
     res.status(500).json({ error: 'Internal server error' })
   }
