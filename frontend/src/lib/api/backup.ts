@@ -228,7 +228,22 @@ export const backupApi = {
       method: 'POST',
       body: JSON.stringify({ to }),
     }),
-  downloadAllLabels: (opts?: { preset?: string; showPrice?: boolean; showWeight?: boolean; showQR?: boolean; showBrand?: boolean; copies?: number; brandName?: string; ids?: string[] }) => {
+  downloadAllLabels: (opts?: {
+    preset?: string
+    showPrice?: boolean
+    showWeight?: boolean
+    showQR?: boolean
+    showBrand?: boolean
+    copies?: number
+    brandName?: string
+    ids?: string[]
+    width?: number
+    height?: number
+    columns?: number
+    rows?: number
+    margin?: number
+    gap?: number
+  }) => {
     const params = new URLSearchParams()
     if (opts?.preset) params.set('preset', opts.preset)
     if (opts?.showPrice === false) params.set('price', 'false')
@@ -237,6 +252,12 @@ export const backupApi = {
     if (opts?.showBrand === false) params.set('brand', 'false')
     if (opts?.copies && opts.copies > 1) params.set('copies', String(opts.copies))
     if (opts?.brandName) params.set('brandName', opts.brandName)
+    if (opts?.width) params.set('w', String(opts.width))
+    if (opts?.height) params.set('h', String(opts.height))
+    if (opts?.columns) params.set('cols', String(opts.columns))
+    if (opts?.rows) params.set('rows', String(opts.rows))
+    if (opts?.margin !== undefined) params.set('margin', String(opts.margin))
+    if (opts?.gap !== undefined) params.set('gap', String(opts.gap))
     if (opts?.ids && opts.ids.length > 0) params.set('ids', opts.ids.join(','))
     window.open(`${API_BASE}/db/products/labels?${params.toString()}`, '_blank', 'noopener')
   },

@@ -188,7 +188,7 @@ async function tcpOpen(host, port, ms = 3000) {
   })
 }
 
-// ── PostgreSQL discovery ────────────────────────────────────────────────────
+// ── PostgreSQL discovery ──────────────────────────────────
 // Supported majors (documented 15+), newest first so a machine with several
 // installs prefers the newest when there is no cluster yet.
 const PG_SUPPORTED_MAJORS = [18, 17, 16, 15]
@@ -231,8 +231,8 @@ function systemPgBinDirs(programFiles) {
       ? [
           process.env.ProgramFiles,
           process.env['ProgramFiles(x86)'],
-          'C:\\Program Files',
-          'C:\\Program Files (x86)',
+          'C:\Program Files',
+          'C:\Program Files (x86)',
         ].filter(Boolean)
       : []
   const found = new Map()
@@ -249,6 +249,8 @@ function systemPgBinDirs(programFiles) {
   }
   return [...found.entries()].map(([major, bin]) => ({ major, bin })).sort((a, b) => b.major - a.major)
 }
+
+
 
 /** pg_ctl found on PATH, or null. */
 function pgBinOnPath() {

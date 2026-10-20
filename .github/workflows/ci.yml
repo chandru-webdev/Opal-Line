@@ -37,6 +37,14 @@ jobs:
           node-version: 26
           cache: npm
 
+      - name: Debug npm lockfile
+        run: |
+          pwd
+          ls -la
+          git rev-parse HEAD
+          git ls-files package.json package-lock.json
+          node -p "require('./package-lock.json').lockfileVersion"
+          
       - name: Install dependencies
         run: npm ci
         env:
