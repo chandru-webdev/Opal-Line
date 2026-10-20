@@ -236,6 +236,37 @@ dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'),
   res.json(Object.entries(LABEL_PRESETS).map(([key, val]) => ({ key, ...(val as any) })))
 })
 
+// Parses optional custom label geometry from query/body. Values are clamped to
+// sane physical ranges so a bad request can never produce a broken PDF.
+function labelSizeOverride(src: Record<string, unknown>): Partial<{
+  width: number
+  height: number
+  columns: number
+  rows: number
+  margin: number
+  gap: number
+}> {
+  const num = (v: unknown, min: number, max: number): number | undefined => {
+    const n = Number(v)
+    if (!Number.isFinite(n)) return undefined
+    return Math.min(Math.max(n, min), max)
+  }
+  const out: ReturnType<typeof labelSizeOverride> = {}
+  const width = num(src.w ?? src.width, 10, 150)
+  const height = num(src.h ?? src.height, 5, 150)
+  const columns = num(src.cols ?? src.columns, 1, 12)
+  const rows = num(src.rows, 1, 60)
+  const margin = num(src.margin, 0, 40)
+  const gap = num(src.gap, 0, 20)
+  if (width !== undefined) out.width = width
+  if (height !== undefined) out.height = height
+  if (columns !== undefined) out.columns = Math.floor(columns)
+  if (rows !== undefined) out.rows = Math.floor(rows)
+  if (margin !== undefined) out.margin = margin
+  if (gap !== undefined) out.gap = gap
+  return out
+}
+
 dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
     const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
@@ -247,7 +278,7 @@ dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (
     const idsParam = String(req.query.ids ?? '').split(',').map((x) => x.trim()).filter(Boolean)
     const products = idsParam.length > 0 ? await fetchProductLabels(idsParam) : await fetchAllProductLabels()
     if (products.length === 0) return res.status(404).json({ error: 'No products found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
+    const opts = { ...LABEL_PRESETS[preset], ...labelSizeOverride(req.query as Record<string, unknown>) }
     const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')
@@ -269,7 +300,10 @@ dbRouter.post('/products/labels', requirePermission('inventory', 'view'), async 
     if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
     const products = await fetchProductLabels(ids)
     if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
+    const opts = {
+      ...LABEL_PRESETS[preset],
+      ...labelSizeOverride((req.body ?? {}) as Record<string, unknown>),
+    }
     const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')

@@ -19,6 +19,10 @@ interface LabelOptions {
   height: number      // mm
   columns: number
   rows: number
+  /** Outer page margin in mm (A4/Letter stock). */
+  margin: number
+  /** Gap between adjacent labels in mm. */
+  gap: number
   showPrice: boolean
   showWeight: boolean
   showQR: boolean
@@ -31,6 +35,8 @@ const DEFAULT_OPTIONS: LabelOptions = {
   height: 30,
   columns: 4,
   rows: 7,
+  margin: 5,
+  gap: 0,
   showPrice: true,
   showWeight: true,
   showQR: true,
@@ -363,8 +369,13 @@ export async function generateLabelsPDF(
     doc.on('data', (chunk: Buffer) => chunks.push(chunk))
     doc.on('end', () => resolve(Buffer.concat(chunks)))
 
-    const startX = 20
-    const startY = 20
+    const startX = mmToPt(clamp(opts.margin, 0, 40))
+    const startY = mmToPt(clamp(opts.margin, 0, 40))
+    const gapPt = mmToPt(clamp(opts.gap, 0, 20))
+    const stepX = labelW + gapPt
+    const stepY = labelH + gapPt
+    const columns = Math.max(1, Math.floor(opts.columns))
+    const rows = Math.max(1, Math.floor(opts.rows))
     let col = 0
     let row = 0
 
@@ -372,20 +383,20 @@ export async function generateLabelsPDF(
       const product = products[i]
 
       // Check if we need a new page
-      if (row >= opts.rows) {
+      if (row >= rows) {
         doc.addPage()
         col = 0
         row = 0
       }
 
-      const actualY = startY + row * labelH
-      const actualX = startX + col * labelW
+      const actualY = startY + row * stepY
+      const actualX = startX + col * stepX
 
       drawLabel(doc, product, actualX, actualY, labelW, labelH, geometry, opts, qrBuffers[i] ?? null)
 
       // Advance position
       col++
-      if (col >= opts.columns) {
+      if (col >= columns) {
         col = 0
         row++
       }
