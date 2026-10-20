@@ -25,7 +25,8 @@ import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from '@/components/ui/confirm'
-import { dbApi, backupApi } from '@/lib/api'
+import { dbApi, backupApi, shopifyApi } from '@/lib/api'
+import { mergeShopifyProducts } from '@/lib/mergeShopifyProducts'
 import {
   buildLabelSheet,
   computeGrid,
@@ -50,6 +51,7 @@ import {
   printHtmlToPrinter,
 } from '@/lib/printTemplate'
 import type { Product } from '@/types'
+import type { SyncProduct } from '@/types/shopify'
 
 const CONFIG_STORAGE_KEY = 'opal-line.barcodeLabelConfig'
 
@@ -164,17 +166,26 @@ export default function BarcodeLabelsPage() {
   useEffect(() => {
     let active = true
     Promise.all([
-      dbApi.getProducts().then((data) => {
+      Promise.all([
+        dbApi.getProducts().catch((error: unknown) => {
+          if (active) {
+            const message = error instanceof Error ? error.message : 'Could not load products'
+            toast.error(message)
+          }
+          return [] as Product[]
+        }),
+        // Shopify is optional: a failure or an unconfigured store must never
+        // block the local catalog, so the error is swallowed here.
+        shopifyApi.getProducts().then((r) => r.data).catch(() => [] as SyncProduct[]),
+      ]).then(([local, shopify]) => {
+        if (!active) return
+        const data = mergeShopifyProducts(local, shopify)
         setProducts(data)
         const idsParam = (searchParams.get('ids') ?? '').split(',').map((x) => x.trim()).filter(Boolean)
         if (idsParam.length > 0) {
           const available = new Set(data.map((p) => p.id))
           setSelected(new Set(idsParam.filter((id) => available.has(id))))
         }
-      }).catch((error: unknown) => {
-        if (!active) return
-        const message = error instanceof Error ? error.message : 'Could not load products'
-        toast.error(message)
       }),
       dbApi.getProductDuplicates().then((r) => {
         if (active) setDuplicates(new Set(r.data.map((d) => d.sku.toLowerCase())))
