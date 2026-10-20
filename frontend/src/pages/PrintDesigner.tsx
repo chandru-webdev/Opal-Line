@@ -9,8 +9,10 @@ import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { toast } from '@/components/ui/confirm'
-import { dbApi, printTemplatesApi } from '@/lib/api'
+import { dbApi, printTemplatesApi, shopifyApi } from '@/lib/api'
+import { mergeShopifyProducts } from '@/lib/mergeShopifyProducts'
 import type { Product } from '@/types'
+import type { SyncProduct } from '@/types/shopify'
 import {
   DEFAULT_PRINT_CONFIG,
   LABEL_PRESETS,
@@ -90,10 +92,19 @@ export default function PrintDesignerPage() {
   }, [docType])
 
   // Load the ERP catalogue once the barcode-label tab is opened so the
-  // product picker can fill real SKU/barcode/rate data.
+  // product picker can fill real SKU/barcode/rate data. Live Shopify products
+  // are merged in (and a Shopify failure is ignored) so the picker also shows
+  // store products that have not been synced into the local DB yet.
   useEffect(() => {
     if (!isLabel || products.length > 0) return
-    dbApi.getProducts().then(setProducts).catch(() => {})
+    let active = true
+    Promise.all([
+      dbApi.getProducts().catch(() => [] as Product[]),
+      shopifyApi.getProducts().then((r) => r.data).catch(() => [] as SyncProduct[]),
+    ]).then(([local, shopify]) => {
+      if (active) setProducts(mergeShopifyProducts(local, shopify))
+    })
+    return () => { active = false }
   }, [isLabel, products.length])
 
   const set = <K extends keyof PrintDesignerConfig>(key: K, value: PrintDesignerConfig[K]) =>
