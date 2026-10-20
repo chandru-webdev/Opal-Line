@@ -44,6 +44,7 @@ import type {
   SalesOverviewPoint,
   SalesReturn,
   SilverRate,
+  SilverHistoryDays,
   SilverRatePoint,
   ProfitAnalytics,
   StockCategory,
@@ -61,7 +62,6 @@ import type {
   Shipment,
   NotificationLogEntry,
 } from '@/types'
-import { istDateKey } from '@/lib/format'
 import { request, list, maybe, withItems, PAGED } from './core'
 import type { SearchResults, SalesInvoiceRow } from './core'
 
@@ -183,16 +183,12 @@ export const dbApi = {
     request(rangePath('/db/dashboard/financial', range)),
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
-  getSilverRateHistory: async (): Promise<SilverRatePoint[]> => {
-    const res = await request<{ data: Array<{ updatedAt: string; rate: number }> }>('/db/silver-rates?limit=100')
-    const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-    return res.data
-      .filter((r) => r.updatedAt && Number.isFinite(Number(r.rate)))
-      .map((r) => {
-        const [, m, d] = istDateKey(r.updatedAt).split('-')
-        return { date: `${Number(d)} ${MONTHS[Number(m) - 1]}`, rate: Number(r.rate) }
-      })
-  },
+  // One point per IST calendar day, backfilled server-side, for the given
+  // window (the chart owns this range — the page-wide filter does not drive it).
+  getSilverRateHistory: (days: SilverHistoryDays = 7): Promise<SilverRatePoint[]> =>
+    request<{ days: number; points: SilverRatePoint[] }>(`/db/dashboard/silver-history?days=${days}`).then(
+      (res) => res.points,
+    ),
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
   getRecentActivities: (range?: DashboardRangeInput): Promise<Activity[]> => request(rangePath('/db/dashboard/activities', range)),
   getDashboardSecurity: (range?: DashboardRangeInput): Promise<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> }> =>

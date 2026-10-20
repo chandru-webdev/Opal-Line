@@ -3,6 +3,7 @@ import { desc, sql } from 'drizzle-orm'
 import { db, schema } from './db/client'
 import { requirePermission } from './rbac'
 import { logger } from './logger'
+import { DEFAULT_REORDER_LEVEL, lowStockWhere } from './lib/lowStock'
 
 /**
  * Unified notification feed for the header bell:
@@ -22,17 +23,18 @@ feedRouter.get('/notifications/feed', requirePermission('dashboard', 'view'), as
     type FeedItem = { type: string; title: string; detail: string | null; at: string | null; href: string }
     const items: FeedItem[] = []
 
-    // Low stock (not time-based — current state)
+    // Low stock (not time-based — current state; shared default reorder level)
     const low = await db
       .select({ id: schema.products.id, name: schema.products.name, sku: schema.products.sku, stock: schema.products.stock, reorder: schema.products.reorderLevel })
       .from(schema.products)
-      .where(sql`${schema.products.stock} is not null and ${schema.products.reorderLevel} is not null and ${schema.products.stock} <= ${schema.products.reorderLevel}`)
+      .where(lowStockWhere())
+      .orderBy(sql`${schema.products.stock} asc`)
       .limit(8)
     for (const p of low) {
       items.push({
         type: 'low-stock',
         title: `Low stock: ${p.name}`,
-        detail: `${p.stock ?? 0} left (reorder at ${p.reorder})`,
+        detail: `${p.stock ?? 0} left (reorder at ${p.reorder ?? DEFAULT_REORDER_LEVEL})`,
         at: null,
         href: '/inventory/low-stock',
       })

@@ -42,7 +42,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Skeleton } from '@/components/ui/skeleton'
 import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
-import { SilverRateChart } from '@/components/charts/silver-rate-chart'
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
 import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
@@ -57,7 +57,6 @@ import type {
   ReceivablesAging,
   SalesOverviewPoint,
   SilverRate,
-  SilverRatePoint,
   TopCategory,
   TopProduct,
   PeriodKey,
@@ -113,6 +112,10 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 
 export default function DashboardPage() {
   const navigate = useNavigate()
+  const { currentUser } = useAuth()
+  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
+  // everyone else, so don't even fetch it (and never render the card).
+  const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
 const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
@@ -123,7 +126,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
   const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
   const [silverRate, setSilverRate] = useState<SilverRate | null>(null)
-  const [silverHistory, setSilverHistory] = useState<SilverRatePoint[]>([])
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
   const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
@@ -162,11 +164,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       dbApi.getTopCategory(range),
       dbApi.getPaymentStatus(range),
       dbApi.getSilverRate(),
-      dbApi.getSilverRateHistory(),
       dbApi.getLowStock(),
       dbApi.getRecentActivities(range),
       dbApi.getAnalyticsStats(range),
-      dbApi.getDashboardSecurity(range),
+      securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null),
       dbApi.getReceivablesAging(),
       shopifyApi.getStatus(),
     ]).then((results) => {
@@ -178,13 +179,12 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       const topCategoryResult = results[4]
       const paymentStatusResult = results[5]
       const silverRateResult = results[6]
-      const silverHistoryResult = results[7]
-      const lowStockResult = results[8]
-      const activitiesResult = results[9]
-      const analyticsResult = results[10]
-      const securityResult = results[11]
-      const agingResult = results[12]
-      const shopifyStatusResult = results[13]
+      const lowStockResult = results[7]
+      const activitiesResult = results[8]
+      const analyticsResult = results[9]
+      const securityResult = results[10]
+      const agingResult = results[11]
+      const shopifyStatusResult = results[12]
 
       // Helper: if fulfilled, return value; if rejected, log error and return default
       const safe = (result: PromiseSettledResult<any>): any => {
@@ -234,9 +234,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       // Silver Rate
       const silverRate = silverRateResult.status === 'fulfilled' ? silverRateResult.value : null
 
-      // Silver History
-      const silverHistory = silverHistoryResult.status === 'fulfilled' ? silverHistoryResult.value : []
-
       // Low Stock
       const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
 
@@ -266,7 +263,6 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
       setPaymentStatus(paymentStatus)
       setPaymentStatusError(paymentStatusError ?? null)
       setSilverRate(silverRate)
-      setSilverHistory(silverHistory)
       setLowStock(lowStock)
       setActivities(activities)
       setAnalytics(analytics)
@@ -287,7 +283,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
     return () => {
       cancelled = true
     }
-  }, [period, customRange])
+  }, [period, customRange, securityAdmin])
 
   // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
   // a bucket the first time it is expanded.
@@ -438,7 +434,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -510,7 +509,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Payment Status</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Payment Status</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
+                </div>
                 <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
               </CardHeader>
               <CardContent>
@@ -570,7 +572,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -621,37 +626,14 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
-            <Card className="xl:col-span-1">
-              <CardHeader className="flex-row items-center justify-between space-y-0">
-                <div>
-                  <CardTitle className="text-sm">Silver Rate History ({silverRate?.purity ?? 92.5})</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Last 7 days · ₹ / gm</p>
-                </div>
-                <Badge variant="success" className="text-[10px]">
-                  Today: {silverRate ? `₹${silverRate.rate.toFixed(2)} / gm` : '—'}
-                </Badge>
-              </CardHeader>
-              <CardContent>
-                {silverHistory.length > 0 ? (
-                  <SilverRateChart data={silverHistory} />
-                ) : (
-                  <EmptyState
-                    icon={Tag}
-                    title="No silver rate history"
-                    description="Update today's rate to start the 7-day trend line."
-                    action={
-                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/silver-rate')}>
-                        Set Silver Rate
-                      </Button>
-                    }
-                  />
-                )}
-              </CardContent>
-            </Card>
+            <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -684,8 +666,8 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                         <TableCell className="text-right font-semibold tabular-nums text-red-600 dark:text-red-400">{formatPieces(l.stock)}</TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">{formatPieces(l.reorderLevel)}</TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={l.status === 'critical' ? 'danger' : 'warning'} dot>
-                            {l.status}
+                          <Badge variant={l.stock === 0 || l.status === 'critical' ? 'danger' : 'warning'} dot>
+                            {l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'}
                           </Badge>
                         </TableCell>
                       </TableRow>
@@ -776,7 +758,10 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                                           </p>
                                         </div>
                                         <div className="shrink-0 text-right">
-                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.grandTotal)}</p>
+                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.outstanding ?? inv.grandTotal)}</p>
+                                          {inv.outstanding != null && inv.outstanding < inv.grandTotal ? (
+                                            <p className="text-[10.5px] text-muted-foreground">of {compactCurrency(inv.grandTotal)}</p>
+                                          ) : null}
                                           {inv.daysOverdue > 0 ? (
                                             <p className="text-[10.5px] font-medium text-red-600 dark:text-red-400">{inv.daysOverdue}d overdue</p>
                                           ) : (
@@ -811,11 +796,13 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
               </CardContent>
             </Card>
 
+            {securityAdmin ? (
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
                   <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
                 </CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Failed logins and account lockouts</p>
               </CardHeader>
               <CardContent className="space-y-3">
                 {security ? (
@@ -849,10 +836,12 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 )}
               </CardContent>
             </Card>
+            ) : null}
 
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </CardHeader>
               <CardContent className="p-0">
                 <div className="relative px-5 pb-5">

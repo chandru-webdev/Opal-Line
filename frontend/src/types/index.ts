@@ -285,11 +285,17 @@ export interface AgingInvoice {
   date: string | null
   dueDate: string | null
   grandTotal: number
+  /** Unpaid remainder (grand total net of successful payments) — what the bucket counts. */
+  outstanding: number
   paymentStatus: string
   status: string
   daysOverdue: number
 }
 
+/** Preset windows of the dashboard Silver Rate History chart. */
+export type SilverHistoryDays = 7 | 30 | 90
+
+/** One backfilled silver-rate point: `date` is an IST calendar day (YYYY-MM-DD). */
 export interface SilverRatePoint {
   date: string
   rate: number
