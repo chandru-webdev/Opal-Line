@@ -18,6 +18,7 @@ import {
   qrQuietMm,
   qrTopMm,
   textEmWidth,
+  type LabelFieldDesign,
   type LabelFieldKind,
 } from './barcodeLabels'
 import { renderZpl } from './zpl'
@@ -108,7 +109,7 @@ test('the design table matches the recorded reference ZPL coordinate fixture', (
     assert.equal(design!.height, ref.heightMm)
 
     for (const f of ref.fields) {
-      const field = design!.fields.find((d) => d.kind === f.kind)
+      const field: LabelFieldDesign | undefined = design!.fields.find((d) => d.kind === f.kind)
       assert.ok(field, `${ref.label} ${f.kind} missing`)
       assert.ok(near(field!.x * DOTS, f.x), `${ref.label} ${f.kind} x ${field!.x * DOTS} != ${f.x}`)
       assert.ok(near(field!.baseline * DOTS, f.y), `${ref.label} ${f.kind} y ${field!.baseline * DOTS} != ${f.y}`)
