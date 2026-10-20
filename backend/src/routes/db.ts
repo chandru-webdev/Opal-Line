@@ -1,8 +1,19 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, ne, or, sql, and, gte, lte } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, isNotNull } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
+import {
+  barcodeFormatError,
+  duplicateBarcodeMessage,
+  duplicateScanMessage,
+  inactiveProductMessage,
+  makeBarcode,
+  newBarcodeSeed,
+  normalizeBarcode,
+  normalizeScanCode,
+  scanCodeError,
+} from '../barcode'
 import { DEFAULT_LOCATION_ID, applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
@@ -38,6 +49,20 @@ const COLUMNS_KEY = Symbol.for('drizzle:Columns')
 function columnsOf(table: any): string[] {
   const cols = table?.[COLUMNS_KEY] ?? table
   return Object.keys(cols)
+}
+
+/**
+ * Full text of an error, including the wrapped driver cause. Drizzle wraps the
+ * underlying Postgres error in a DrizzleQueryError whose own `message` is just
+ * "Failed query: ...", so a unique-violation check that only reads `message`
+ * would miss the driver's "duplicate key value violates unique constraint".
+ */
+function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return typeof err === 'string' ? err : 'Unknown error'
+  const cause = (err as { cause?: unknown }).cause
+  const causeText =
+    cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : ''
+  return `${err.message} ${causeText}`.trim()
 }
 
 function sanitize(body: Record<string, unknown>, table: any): Record<string, unknown> {
@@ -265,63 +290,279 @@ const s = schema
 
 dbRouter.get('/products', listOf(s.products, s.products.name))
 
+// ─── Barcode identity helpers ──────────────────────────────────────
+// Generation is only ever applied to products that have NO barcode, so an
+// existing (legacy or manual) value is never silently replaced. Uniqueness is
+// enforced here with a transaction-scoped advisory lock, which serialises two
+// concurrent writers on the same code without needing the optional DB index.
+
+async function generateUniqueBarcode(tx: any): Promise<string> {
+  for (let i = 0; i < 25; i++) {
+    const candidate = makeBarcode(newBarcodeSeed())
+    const [dup] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.barcode, candidate)).limit(1)
+    if (!dup) return candidate
+  }
+  throw new Error('Could not generate a unique barcode — please try again')
+}
+
+const missingBarcode = () => or(isNull(s.products.barcode), eq(s.products.barcode, ''))
+
 // Barcode / QR Code labels (must be before /products/:id to avoid param capture)
-dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), (_req, res) => {
-  const { LABEL_PRESETS } = require('../barcodeLabels')
-  res.json(Object.entries(LABEL_PRESETS).map(([key, val]) => ({ key, ...(val as any) })))
+dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), async (_req, res) => {
+  const { LABEL_PRESET_LIST } = await import('../barcodeLabels')
+  res.json(LABEL_PRESET_LIST)
 })
+
+async function labelRequestOptions(source: Record<string, unknown>) {
+  const { resolveLabelPreset } = await import('../barcodeLabels')
+  const preset = String(source.preset || '')
+  const copiesRaw = source.copies
+  const opts = resolveLabelPreset(preset, {
+    showPrice: source.price !== 'false' && source.showPrice !== false,
+    showWeight: source.weight !== 'false' && source.showWeight !== false,
+    showQR: source.qr !== 'false' && source.showQR !== false,
+    showBrand: source.brand !== 'false' && source.showBrand !== false,
+    copies: copiesRaw == null ? 1 : Number(copiesRaw),
+  })
+  const brand = source.brandName
+  if (typeof brand === 'string' && brand.trim()) opts.brand = brand.trim()
+  return opts
+}
+
+function unknownLabelPresetMessage(error: unknown): string | null {
+  return error instanceof Error && error.message.startsWith('Unknown label preset:')
+    ? error.message
+    : null
+}
 
 dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
-    const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
-    const preset = String(req.query.preset || 'zlabel-50x30')
-    const showPrice = req.query.price !== 'false'
-    const showWeight = req.query.weight !== 'false'
-    const showQR = req.query.qr !== 'false'
+    const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF } = await import('../barcodeLabels')
     // Optional `ids` query (comma-separated product IDs) → labels for selected products only
     const idsParam = String(req.query.ids ?? '').split(',').map((x) => x.trim()).filter(Boolean)
     const products = idsParam.length > 0 ? await fetchProductLabels(idsParam) : await fetchAllProductLabels()
     if (products.length === 0) return res.status(404).json({ error: 'No products found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
-    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    const pdf = await generateLabelsPDF(products, await labelRequestOptions(req.query as Record<string, unknown>))
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
     res.send(pdf)
-  } catch {
+  } catch (err) {
+    logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
 
 dbRouter.post('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
-    const { fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
-    const ids: string[] = req.body?.productIds ?? []
-    const preset = String(req.body?.preset || 'zlabel-50x30')
-    const showPrice = req.body?.showPrice !== false
-    const showWeight = req.body?.showWeight !== false
-    const showQR = req.body?.showQR !== false
+    const { fetchProductLabels, generateLabelsPDF } = await import('../barcodeLabels')
+    const ids: string[] = Array.isArray(req.body?.productIds) ? req.body.productIds : []
     if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
     const products = await fetchProductLabels(ids)
     if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
-    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    const pdf = await generateLabelsPDF(products, await labelRequestOptions(req.body ?? {}))
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
     res.send(pdf)
-  } catch {
+  } catch (err) {
+    logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
 
-// Scan-based stock count: look up a product by barcode or exact SKU (for scanner guns)
+// Raw ZPL output for a ZPL-capable label printer / print server. Returns text
+// only — it is never written to a raw socket from the server.
+dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), async (req, res) => {
+  try {
+    const { fetchProductLabels } = await import('../barcodeLabels')
+    const { renderZpl, zplOptionsForPreset } = await import('../zpl')
+    const ids: string[] = Array.isArray(req.body?.productIds) ? req.body.productIds : []
+    if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
+    const products = await fetchProductLabels(ids)
+    if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
+    const symbology = req.body?.format === 'code128' ? 'code128' : 'qr'
+    const brandName = typeof req.body?.brandName === 'string' ? req.body.brandName.trim() : ''
+    const opts = zplOptionsForPreset(String(req.body?.preset || ''), {
+      copies: req.body?.copies == null ? 1 : Number(req.body.copies),
+      symbology,
+      showPrice: req.body?.showPrice !== false,
+      showWeight: req.body?.showWeight !== false,
+      showQR: req.body?.showQR !== false && req.body?.qr !== 'false',
+      showBrand: req.body?.showBrand !== false,
+      ...(brandName ? { brand: brandName } : {}),
+    })
+    const zpl = renderZpl(products, opts)
+    if (!zpl) return res.status(400).json({ error: 'Invalid label dimensions' })
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.zpl"`)
+    res.send(zpl)
+  } catch (err) {
+    logger.error({ err }, 'label ZPL generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
+    res.status(500).json({ error: 'Label generation failed' })
+  }
+})
+
+// Counts for the Products / Barcode screens: how many products are missing a
+// barcode and whether any barcode is duplicated.
+dbRouter.get('/products/barcodes/summary', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [row] = await db!
+      .select({
+        total: sql<number>`count(*)`,
+        missing: sql<number>`count(*) filter (where ${s.products.barcode} is null or ${s.products.barcode} = '')`,
+      })
+      .from(s.products)
+    const dupRows = await db!
+      .select({ barcode: s.products.barcode, cnt: sql<number>`count(*)` })
+      .from(s.products)
+      .where(and(isNotNull(s.products.barcode), ne(s.products.barcode, '')))
+      .groupBy(s.products.barcode)
+      .having(sql`count(*) > 1`)
+    res.json({
+      total: Number(row?.total ?? 0),
+      missing: Number(row?.missing ?? 0),
+      duplicates: dupRows.map((r) => ({ barcode: String(r.barcode), count: Number(r.cnt) })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'barcode summary failed')
+    res.status(500).json({ error: 'Could not load barcode summary' })
+  }
+})
+
+// Backfill missing barcodes. Supports a dry run so the operator can preview
+// exactly which products would change before anything is written.
+dbRouter.post('/products/barcodes/generate', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const ids: string[] = Array.isArray(req.body?.ids)
+      ? req.body.ids.map((x: unknown) => String(x).trim()).filter(Boolean)
+      : []
+    const dryRun = req.body?.dryRun === true
+    const result = await db!.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('bc:backfill'))`)
+      const condition = ids.length > 0 ? and(missingBarcode(), inArray(s.products.id, ids)) : missingBarcode()
+      const missing = await tx
+        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku })
+        .from(s.products)
+        .where(condition!)
+        .orderBy(s.products.name)
+      const assignments: Array<{ id: string; name: string; sku: string; barcode: string }> = []
+      if (!dryRun) {
+        for (const p of missing) {
+          const barcode = await generateUniqueBarcode(tx)
+          await tx
+            .update(s.products)
+            .set({ barcode })
+            .where(and(eq(s.products.id, p.id), missingBarcode()))
+          assignments.push({ id: p.id, name: p.name, sku: p.sku, barcode })
+        }
+      }
+      return { missing, assignments }
+    })
+
+    if (!dryRun && result.assignments.length > 0) {
+      const actor = actorFromRequest(req)
+      void recordActivity({
+        action: 'Generated barcodes',
+        module: 'inventory',
+        entity: `Product barcodes (${result.assignments.length} assigned)`,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+
+    res.json({
+      ok: true,
+      dryRun,
+      candidates: result.missing.length,
+      assigned: result.assignments.length,
+      samples: result.missing.slice(0, 50).map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+      assignments: result.assignments.slice(0, 50),
+    })
+  } catch (err) {
+    logger.error({ err }, 'barcode backfill failed')
+    res.status(500).json({ error: 'Could not generate barcodes' })
+  }
+})
+
+// Assign or generate a barcode for a single product.
+//  - body.barcode present  → validated manual assignment
+//  - body.barcode absent   → generate, but only when the product has none
+dbRouter.post('/products/:id/barcode', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  const id = routeParam(req.params.id)
+  const requested = normalizeBarcode(req.body?.barcode)
+  try {
+    const result = await db!.transaction(async (tx) => {
+      const [product] = await tx.select().from(s.products).where(eq(s.products.id, id)).limit(1)
+      if (!product) return null
+
+      if (requested) {
+        const fmtError = barcodeFormatError(requested)
+        if (fmtError) throw new Error(fmtError)
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`bc:${requested}`}))`)
+        const [dup] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(and(eq(s.products.barcode, requested), ne(s.products.id, id)))
+          .limit(1)
+        if (dup) throw new Error(duplicateBarcodeMessage(requested))
+        if (normalizeBarcode(product.barcode) === requested) {
+          return { barcode: requested, created: false, changed: false }
+        }
+        await tx.update(s.products).set({ barcode: requested }).where(eq(s.products.id, id))
+        return { barcode: requested, created: false, changed: true }
+      }
+
+      // Generate — an existing valid barcode is returned untouched (idempotent).
+      if (normalizeBarcode(product.barcode)) {
+        return { barcode: normalizeBarcode(product.barcode), created: false, changed: false }
+      }
+      const barcode = await generateUniqueBarcode(tx)
+      await tx.update(s.products).set({ barcode }).where(eq(s.products.id, id))
+      return { barcode, created: true, changed: true }
+    })
+
+    if (!result) return res.status(404).json({ error: 'Not found' })
+    if (result.changed) {
+      const actor = actorFromRequest(req)
+      void recordActivity({
+        action: result.created ? 'Generated barcode' : 'Assigned barcode',
+        module: 'inventory',
+        entity: `Product ${id}`,
+        details: result.barcode,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+    res.json({ ok: true, id, barcode: result.barcode, created: result.created })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const known = msg.includes('Barcode')
+    res.status(known ? 400 : 500).json({ error: known ? msg : 'Could not assign barcode' })
+  }
+})
+
+// Scan-based stock count: look up a product by exact barcode or exact SKU (for
+// scanner guns). Input is normalised first so a keyboard-wedge scan and a typed
+// value resolve identically.
 dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const code = String(req.query.code ?? '').trim()
-    if (!code) return res.status(400).json({ error: 'code is required' })
-    const [row] = await db!
+    const formatError = scanCodeError(req.query.code)
+    if (formatError) return res.status(400).json({ error: formatError })
+    const code = normalizeScanCode(req.query.code)
+    // Exact match only — no fuzzy/partial matching, so a scan can never resolve
+    // to the wrong product.
+    const rows = await db!
       .select({
         id: s.products.id,
         name: s.products.name,
@@ -329,12 +570,18 @@ dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (re
         barcode: s.products.barcode,
         stock: s.products.stock,
         category: s.products.category,
+        status: s.products.status,
       })
       .from(s.products)
       .where(or(eq(s.products.barcode, code), eq(s.products.sku, code)))
-      .limit(1)
-    if (!row) return res.status(404).json({ error: 'No product with that barcode/SKU' })
-    res.json({ data: row })
+      .limit(2)
+    if (rows.length === 0) return res.status(404).json({ error: 'No product matches that barcode or SKU' })
+    if (rows.length > 1) return res.status(409).json({ error: duplicateScanMessage() })
+    const row = rows[0]
+    if (row.status && row.status !== 'active') {
+      return res.status(409).json({ error: inactiveProductMessage(row.name, row.status) })
+    }
+    res.json({ data: { id: row.id, name: row.name, sku: row.sku, barcode: row.barcode, stock: row.stock, category: row.category } })
   } catch (err) {
     logger.error({ err }, 'product scan lookup failed')
     res.status(500).json({ error: 'Scan lookup failed' })
@@ -3517,33 +3764,12 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
       })
     }
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
-    // Same duplicate guard as create, ignoring the product being updated.
-    if (body.sku != null) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(and(sql`lower(${s.products.sku}) = lower(${String(body.sku).trim()})`, ne(s.products.id, routeParam(req.params.id))))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
-    }
-    if (body.barcode != null) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(and(eq(s.products.barcode, String(body.barcode).trim()), ne(s.products.id, routeParam(req.params.id))))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
-    }
     const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : ''
     logger.error({ err }, 'product update failed')
-    if (msg.includes('duplicate')) {
-      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
-    }
     res.status(400).json({ error: 'Failed to update product' })
   }
 })
@@ -3630,39 +3856,49 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   if (!requireDb(res)) return
   try {
     const body = sanitize(req.body ?? {}, s.products)
+    const name = String(body.name ?? '').trim()
+    const sku = String(body.sku ?? '').trim()
+    if (!name) return res.status(400).json({ error: 'Product name is required' })
+    if (!sku) return res.status(400).json({ error: 'SKU is required' })
+    body.name = name
+    body.sku = sku
+
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
-    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     if (!body.id) body.id = randomUUID()
 
-    // Identifier uniqueness: sku also has a DB unique index; barcode only has
-    // this check. Either way, respond with the conflicting product so the UI
-    // can offer "edit existing" or fresh codes instead of a blind failure.
-    const skuStr = body.sku != null ? String(body.sku).trim() : ''
-    const barcodeStr = body.barcode != null ? String(body.barcode).trim() : ''
-    if (skuStr) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(sql`lower(${s.products.sku}) = lower(${skuStr})`)
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    // A create may state the barcode explicitly; validate it up front so a bad
+    // code is a clean 400 rather than a mid-transaction failure. Otherwise the
+    // product gets a generated code below.
+    const requested = normalizeBarcode(body.barcode)
+    if (requested) {
+      const fmtError = barcodeFormatError(requested)
+      if (fmtError) return res.status(400).json({ error: fmtError })
     }
-    if (barcodeStr) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(eq(s.products.barcode, barcodeStr))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
-    }
+    delete body.barcode
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
     if (openingQty > 0 && !locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
 
     const row = await db!.transaction(async (tx) => {
-      const [created] = await tx.insert(s.products).values(body as never).returning()
+      // Serialise barcode writers on the same code so two concurrent creates
+      // cannot mint an identical code before either row is visible.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${requested ? `bc:${requested}` : 'bc:generate'}))`)
+      let barcode: string
+      if (requested) {
+        const [dup] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(eq(s.products.barcode, requested))
+          .limit(1)
+        if (dup) throw new Error(duplicateBarcodeMessage(requested))
+        barcode = requested
+      } else {
+        barcode = await generateUniqueBarcode(tx)
+      }
+
+      const [created] = await tx.insert(s.products).values({ ...body, barcode } as never).returning()
       if (openingQty > 0 && created.sku) {
         await applyStockMovement({
           sku: String(created.sku),
@@ -3679,13 +3915,9 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     recordCrud('products', 'Created', req, row)
     res.status(201).json(row)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const msg = errorText(err)
     logger.error({ err }, 'product create failed')
-    if (msg.includes('duplicate')) {
-      // Unique-index race (two saves at once) — same shape as the pre-check.
-      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
-    }
-    res.status(400).json({ error: 'Failed to create product' })
+    res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
   }
 })
 

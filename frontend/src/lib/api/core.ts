@@ -102,8 +102,30 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export async function list<T>(path: string, params?: Record<string, string | number>): Promise<T[]> {
-  const all: T[] = []
+/**
+ * Like `request`, but returns the raw response body as text. Used for
+ * non-JSON payloads such as ZPL label streams.
+ */
+export async function requestText(path: string, init?: RequestInit): Promise<string> {
+  const isStateChanging = init?.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method)
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (isStateChanging) {
+    const token = await fetchCsrfToken()
+    if (token) headers['X-CSRF-Token'] = token
+  }
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null
+    throw new ApiError(res.status, body?.error ?? `API error ${res.status}`)
+  }
+  return res.text()
+}
+
+export async function list<T>(path: string, params?: Record<string, string | number>): Promise<T[]> {  const all: T[] = []
   let page = 1
   const pageSize = 200
   while (true) {

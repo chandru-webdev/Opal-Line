@@ -1,64 +1,275 @@
-import { useState, useEffect } from 'react'
-import { Printer, Settings, Tag, QrCode, Check } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import QRCode from 'qrcode'
+import { Printer, Settings, Tag, QrCode, Check, Barcode, AlertTriangle, FileCode2, Wand2 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { Select } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { toast, confirmDialog } from '@/components/ui/confirm'
 import { dbApi, backupApi } from '@/lib/api'
+import {
+  FALLBACK_LABEL_PRESETS,
+  validateReferenceLabelPresets,
+  type LabelPreset,
+  type LabelPresetDesign,
+} from '@/lib/labelPresets'
 import type { Product } from '@/types'
 
-const LABEL_PRESETS = [
-  { key: 'label-50x25', label: '50 × 25 mm', desc: '4 columns × 11 rows' },
-  { key: 'label-50x22', label: '50 × 22 mm', desc: '4 columns × 13 rows' },
-  { key: 'label-35x22', label: '35 × 22 mm', desc: '5 columns × 13 rows' },
-  { key: 'label-50x10', label: '50 × 10 mm', desc: '4 columns × 28 rows' },
-  { key: 'zlabel-50x30', label: '50 × 30 mm (Standard)', desc: '4 columns × 7 rows' },
-  { key: 'zlabel-40x25', label: '40 × 25 mm (Compact)', desc: '4 columns × 8 rows' },
-  { key: 'avery-5160', label: 'Avery 5160', desc: '3 columns × 10 rows' },
-  { key: 'avery-8160', label: 'Avery 8160', desc: '4 columns × 12 rows' },
-  { key: 'dymo-30256', label: 'DYMO 30256', desc: '3 columns × 8 rows' },
-]
+type LabelDesign = LabelPresetDesign
+
+const DEFAULT_PRESET = 'label-50x40'
+
+// Mirrors the renderers in `backend/src/barcodeLabels.ts`.
+const ZPL_EM_RATIO = 0.925
+const ZPL_CAP_RATIO = 718 / 925
+const PREVIEW_WIDTH_PX = 264
+const QR_QUIET_MODULES = 3
+
+function useLabelQr(value: string, enabled: boolean, sizePx: number): string {
+  const [result, setResult] = useState<{ value: string; sizePx: number; src: string }>({
+    value: '',
+    sizePx: 0,
+    src: '',
+  })
+  useEffect(() => {
+    let active = true
+    if (!enabled || !value || sizePx <= 0) return () => { active = false }
+
+    try {
+      const qr = QRCode.create(value, { errorCorrectionLevel: 'L' })
+      const moduleSizePx = Math.max(1, Math.round(sizePx / qr.modules.size))
+      QRCode.toDataURL(value, {
+        errorCorrectionLevel: 'L',
+        margin: 0,
+        width: moduleSizePx * qr.modules.size,
+        color: { dark: '#000000', light: '#ffffff' },
+      }).then((dataUrl) => {
+        if (active) setResult({ value, sizePx, src: dataUrl })
+      }).catch((error: unknown) => {
+        if (!active) return
+        toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
+      })
+    } catch (error) {
+      if (!active) return
+      toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
+    }
+    return () => { active = false }
+  }, [enabled, sizePx, value])
+  return enabled && result.value === value && result.sizePx === sizePx ? result.src : ''
+}
+
+function fieldMaxWidthMm(design: LabelDesign, field: LabelDesign['fields'][number], showQR: boolean): number {
+  const moduleMm = design.qr.size / design.qr.modules
+  const quietMm = moduleMm * QR_QUIET_MODULES
+  let maxWidth = showQR ? field.maxWidth : design.width - field.x
+
+  const sibling = design.fields.find((candidate) => candidate.kind === 'attr2')
+  if (field.kind === 'attr1' && sibling && sibling.x > field.x) {
+    maxWidth = Math.min(maxWidth, sibling.x - field.x - quietMm)
+  }
+  if (!showQR || field.x >= design.qr.x) return Math.max(0, maxWidth)
+
+  const qrTop = design.qr.bottom - (design.qr.modules + QR_QUIET_MODULES) * moduleMm
+  const boxTop = qrTop - quietMm
+  const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
+  const overlap = Math.min(field.baseline, design.qr.bottom) - Math.max(capTop, boxTop)
+  if (overlap > field.capHeight * ZPL_CAP_RATIO * 0.25) {
+    maxWidth = Math.min(maxWidth, design.qr.x - quietMm - field.x)
+  }
+  return Math.max(0, maxWidth)
+}
+
+/**
+ * Draws a reference label the way the printer lays it out: every line is placed
+ * by the same millimetre geometry the PDF and ZPL renderers use, so the preview
+ * matches the printed label rather than approximating it.
+ */
+function LabelDesignPreview({
+  design,
+  text,
+  showQR,
+  qrSrc,
+}: {
+  design: LabelDesign
+  text: Record<string, string | undefined>
+  showQR: boolean
+  qrSrc: string
+}) {
+  const scale = PREVIEW_WIDTH_PX / design.width
+  return (
+    <div
+      className="relative overflow-hidden rounded-md bg-white text-gray-900 ring-1 ring-border"
+      style={{ width: PREVIEW_WIDTH_PX, height: design.height * scale }}
+    >
+      {design.fields.map((field) => {
+        const value = text[field.kind]
+        if (!value) return null
+        // Capitals print at ZPL_CAP_RATIO of `h`, so the em box is h / 0.925 —
+        // exactly what the PDF's font size is.
+        const fontSizeMm = field.capHeight / ZPL_EM_RATIO
+        const condense = field.refWidth / fontSizeMm
+        return (
+          <span
+            key={field.kind}
+            className="absolute whitespace-nowrap font-bold"
+            style={{
+              left: field.x * scale,
+              top: (field.baseline - field.capHeight * ZPL_CAP_RATIO) * scale,
+              fontSize: fontSizeMm * scale,
+              lineHeight: 1,
+              // The transform shrinks the drawn glyphs, so allow for it when
+              // clipping to the column the reference gives the line.
+              width: (fieldMaxWidthMm(design, field, showQR) * scale) / condense,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              display: 'block',
+              transform: `scaleX(${condense})`,
+              transformOrigin: 'left top',
+              fontFamily: 'Arial, Helvetica, sans-serif',
+              textTransform: field.kind === 'name' || field.kind === 'brand' ? 'uppercase' : undefined,
+            }}
+          >
+            {value}
+          </span>
+        )
+      })}
+      {showQR && qrSrc ? (
+        <img
+          src={qrSrc}
+          alt="Product QR code"
+          className="absolute [image-rendering:pixelated]"
+          style={{
+            left: design.qr.x * scale,
+            top:
+              (design.qr.bottom -
+                ((design.qr.modules + QR_QUIET_MODULES) * design.qr.size) / design.qr.modules) *
+              scale,
+            width: design.qr.size * scale,
+            height: design.qr.size * scale,
+          }}
+        />
+      ) : null}
+    </div>
+  )
+}
 
 export default function BarcodeLabelsPage() {
+  const [searchParams] = useSearchParams()
   const [products, setProducts] = useState<Product[]>([])
   const [loading, setLoading] = useState(true)
+  const [presetError, setPresetError] = useState('')
+  const [productError, setProductError] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [preset, setPreset] = useState('zlabel-50x30')
+  const [presets, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
+  const [preset, setPreset] = useState(DEFAULT_PRESET)
   const [showPrice, setShowPrice] = useState(true)
   const [showWeight, setShowWeight] = useState(true)
   const [showQR, setShowQR] = useState(true)
+  const [showBrand, setShowBrand] = useState(true)
+  const [copies, setCopies] = useState(1)
+  const [format, setFormat] = useState<'qr' | 'code128'>('qr')
   const [generating, setGenerating] = useState(false)
   const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
+  const [brand, setBrand] = useState('')
+  const [missingCount, setMissingCount] = useState(0)
+
+  const loadProducts = useCallback(() => {
+    return dbApi.getProducts().then((data) => {
+      setProducts(data)
+      setProductError('')
+      setMissingCount(data.filter((p) => !p.barcode || !String(p.barcode).trim()).length)
+      // Preselect products passed via ?ids=… (used by the Products page's
+      // "Print Label" / bulk actions so the operator lands here ready to print).
+      const idsParam = (searchParams.get('ids') ?? '').split(',').map((x) => x.trim()).filter(Boolean)
+      if (idsParam.length > 0) {
+        const available = new Set(data.map((p) => p.id))
+        setSelected(new Set(idsParam.filter((id) => available.has(id))))
+      }
+    })
+  }, [searchParams])
 
   useEffect(() => {
-    dbApi.getProducts().then((data) => {
-      setProducts(data)
-      setLoading(false)
-    }).catch(() => setLoading(false))
-    dbApi.getProductDuplicates().then((r) => {
-      setDuplicates(new Set(r.data.map((d) => d.sku.toLowerCase())))
-    }).catch(() => undefined)
-  }, [])
+    let active = true
+    Promise.all([
+      loadProducts().catch((error: unknown) => {
+        if (!active) return
+        const message = error instanceof Error ? error.message : 'Could not load products'
+        setProductError(message)
+        toast.error(message)
+      }),
+      dbApi.getProductDuplicates().then((r) => {
+        if (active) setDuplicates(new Set(r.data.map((d) => d.sku.toLowerCase())))
+      }).catch((error: unknown) => {
+        if (active) toast.error(error instanceof Error ? error.message : 'Could not load duplicate SKU status')
+      }),
+      backupApi
+        .getLabelPresets()
+        .then((list) => {
+          if (!Array.isArray(list) || !validateReferenceLabelPresets(list, FALLBACK_LABEL_PRESETS)) {
+            throw new Error('The server did not return complete geometry for all six reference templates')
+          }
+          if (active) {
+            setPresets(list)
+            setPresetError('')
+          }
+        })
+        .catch((error: unknown) => {
+          if (!active) return
+          const message = error instanceof Error ? error.message : 'Could not load label templates'
+          setPresets(FALLBACK_LABEL_PRESETS)
+          setPresetError(message)
+          toast.error(`${message}; using the bundled reference templates`)
+        }),
+      dbApi
+        .getSettings()
+        .then((s) => {
+          if (active && s?.businessName) setBrand(s.businessName)
+        })
+        .catch(() => undefined),
+    ]).finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [loadProducts])
 
-  const toggleSelect = (id: string) => {
+  const toggleSelect = useCallback((id: string) => {
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
   const selectAll = () => {
-    if (selected.size === products.length) {
-      setSelected(new Set())
-    } else {
-      setSelected(new Set(products.map((p) => p.id)))
-    }
+    if (selected.size === products.length) setSelected(new Set())
+    else setSelected(new Set(products.map((p) => p.id)))
   }
+
+  const currentPreset = presets.find((p) => p.key === preset)
+  const sample = useMemo(() => {
+    for (const p of products) if (selected.size === 0 || selected.has(p.id)) return p
+    return products[0]
+  }, [products, selected])
+  const qrPayload = sample ? (sample.barcode?.trim() || sample.sku?.trim() || '') : ''
+  const previewQrSize = currentPreset?.design
+    ? currentPreset.design.qr.size * PREVIEW_WIDTH_PX / currentPreset.design.width
+    : currentPreset
+      ? Math.min(currentPreset.width * 0.38, currentPreset.height) * PREVIEW_WIDTH_PX / currentPreset.width
+      : 0
+  const qrSrc = useLabelQr(qrPayload, showQR, previewQrSize)
+  const previewBrand = currentPreset?.brand ?? brand
+  const printBrand = currentPreset?.brand ? undefined : brand || undefined
+
+  const printCount = (selected.size > 0 ? selected.size : products.length) * Math.max(1, copies)
+  const ids = useCallback(() => (selected.size > 0 ? [...selected] : []), [selected])
 
   const printLabels = () => {
     setGenerating(true)
@@ -68,12 +279,62 @@ export default function BarcodeLabelsPage() {
         showPrice,
         showWeight,
         showQR,
+        showBrand,
+        copies,
+        brandName: printBrand,
         // Pass the selected products so the chosen size applies to exactly the
-        // labels the button promises ("Print N Labels"); no selection = all.
-        ...(selected.size > 0 ? { ids: [...selected] } : {}),
+        // labels the button promises; no selection = all.
+        ...(selected.size > 0 ? { ids: ids() } : {}),
       })
     } finally {
       setTimeout(() => setGenerating(false), 1000)
+    }
+  }
+
+  const downloadZpl = async () => {
+    const targetIds = selected.size > 0 ? ids() : products.map((p) => p.id)
+    if (targetIds.length === 0) {
+      toast.error('No products to print')
+      return
+    }
+    setGenerating(true)
+    try {
+      await backupApi.downloadLabelsZpl(targetIds, {
+        preset,
+        copies,
+        format,
+        showPrice,
+        showWeight,
+        showQR,
+        showBrand,
+        brandName: printBrand,
+      })
+      toast.success(`Prepared ZPL for ${targetIds.length} label${targetIds.length === 1 ? '' : 's'}`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not build ZPL')
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const generateMissing = async () => {
+    if (missingCount === 0) {
+      toast.info('Every product already has a barcode')
+      return
+    }
+    try {
+      const preview = await dbApi.generateMissingBarcodes({ dryRun: true })
+      const ok = await confirmDialog({
+        title: `Generate ${preview.candidates} barcode${preview.candidates === 1 ? '' : 's'}?`,
+        description: 'Only products that do not already have a barcode will be updated. Existing barcodes are never changed.',
+        confirmLabel: 'Generate',
+      })
+      if (!ok) return
+      const result = await dbApi.generateMissingBarcodes({})
+      await loadProducts()
+      toast.success(`Assigned ${result.assigned} barcode${result.assigned === 1 ? '' : 's'}`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not generate barcodes')
     }
   }
 
@@ -91,29 +352,62 @@ export default function BarcodeLabelsPage() {
       <PageHeader
         title={
           <span className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300 ring-1 ring-primary-100">
+            <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 ring-1 ring-primary-100 dark:bg-primary-50/60 dark:text-primary-300">
               <Tag className="h-5 w-5" />
             </div>
             <span>Barcode Labels</span>
           </span>
         }
-        subtitle="Generate QR code and barcode labels for products"
+        subtitle="Design, preview and print scannable product labels"
         actions={
-          <>
-            <Button onClick={printLabels} disabled={generating}>
-              <Printer className="h-4 w-4" />
-              {generating ? 'Generating...' : `Print ${selected.size > 0 ? `${selected.size} Labels` : 'All Labels'}`}
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={downloadZpl} disabled={generating || !currentPreset || !!presetError}>
+              <FileCode2 className="h-4 w-4" /> ZPL
             </Button>
-          </>
+            <Button
+              onClick={printLabels}
+              disabled={generating || products.length === 0 || !currentPreset || !!presetError}
+            >
+              <Printer className="h-4 w-4" />
+              {generating ? 'Generating…' : `Print ${printCount} Label${printCount === 1 ? '' : 's'}`}
+            </Button>
+          </div>
         }
       />
+
+      {presetError ? (
+        <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-500/40 dark:bg-amber-950/30 dark:text-amber-200" role="alert">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{presetError}. Bundled layouts are shown for preview; printing is disabled until the server templates match.</span>
+        </div>
+      ) : null}
+      {productError ? (
+        <div className="flex items-start gap-2 rounded-md border border-red-300 bg-red-50 p-3 text-sm text-red-900 dark:border-red-500/40 dark:bg-red-950/30 dark:text-red-200" role="alert">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>Products could not be loaded: {productError}</span>
+        </div>
+      ) : null}
+
+      {missingCount > 0 && (
+        <Card>
+          <CardContent className="flex flex-col gap-3 border border-amber-300 bg-amber-50 p-4 sm:flex-row sm:items-center dark:border-amber-500/40 dark:bg-amber-950/30">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <p className="flex-1 text-sm text-amber-800 dark:text-amber-200">
+              {missingCount} product{missingCount === 1 ? '' : 's'} have no barcode yet. Labels for them fall back to the SKU.
+            </p>
+            <Button size="sm" variant="outline" onClick={generateMissing}>
+              <Wand2 className="h-3.5 w-3.5" /> Generate Missing
+            </Button>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         {/* Options */}
         <div className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle className="text-sm flex items-center gap-2">
+              <CardTitle className="flex items-center gap-2 text-sm">
                 <Settings className="h-4 w-4" /> Label Settings
               </CardTitle>
             </CardHeader>
@@ -121,21 +415,39 @@ export default function BarcodeLabelsPage() {
               <div>
                 <label className="text-sm font-medium text-foreground">Label Size</label>
                 <Select
-                  options={LABEL_PRESETS.map((p) => ({ value: p.key, label: p.label }))}
+                  options={presets.map((p) => ({
+                    value: p.key,
+                    label: p.reference ? `${p.label} •` : p.label,
+                  }))}
                   value={preset}
                   onValueChange={setPreset}
                   className="mt-1"
                 />
-                <p className="text-xs text-muted-foreground mt-1">
-                  {LABEL_PRESETS.find((p) => p.key === preset)?.desc}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {currentPreset
+                    ? `${currentPreset.width} × ${currentPreset.height} mm · ${currentPreset.columns} cols × ${currentPreset.rows} rows`
+                    : ''}
                 </p>
+              </div>
+
+              <div>
+                <label htmlFor="copies" className="text-sm font-medium text-foreground">
+                  Copies per product
+                </label>
+                <Input
+                  id="copies"
+                  type="number"
+                  min={1}
+                  max={999}
+                  value={copies}
+                  onChange={(e) => setCopies(Math.min(999, Math.max(1, Number(e.target.value) || 1)))}
+                  className="mt-1"
+                />
               </div>
 
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm">Show Price</span>
-                  </div>
+                  <span className="text-sm">Show Price</span>
                   <Switch checked={showPrice} onCheckedChange={setShowPrice} />
                 </div>
                 <div className="flex items-center justify-between">
@@ -143,10 +455,104 @@ export default function BarcodeLabelsPage() {
                   <Switch checked={showWeight} onCheckedChange={setShowWeight} />
                 </div>
                 <div className="flex items-center justify-between">
-                  <span className="text-sm flex items-center gap-1"><QrCode className="h-3.5 w-3.5" /> Show QR Code</span>
+                  <span className="text-sm">Show Brand</span>
+                  <Switch checked={showBrand} onCheckedChange={setShowBrand} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1 text-sm">
+                    <QrCode className="h-3.5 w-3.5" /> Show QR symbol
+                  </span>
                   <Switch checked={showQR} onCheckedChange={setShowQR} />
                 </div>
               </div>
+
+              <div>
+                <label className="text-sm font-medium text-foreground">ZPL code format</label>
+                <Select
+                  options={[
+                    { value: 'qr', label: 'QR code' },
+                    { value: 'code128', label: 'Linear (Code 128)' },
+                  ]}
+                  value={format}
+                  onValueChange={(v) => setFormat(v as 'qr' | 'code128')}
+                  className="mt-1"
+                />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  PDF labels always use the QR symbol. This option only changes the ZPL export.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Live preview — drawn at the label's real aspect ratio. */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Preview</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {currentPreset?.design ? (
+                <div className="flex justify-center">
+                  <LabelDesignPreview
+                    design={currentPreset.design}
+                    showQR={showQR}
+                    qrSrc={qrSrc}
+                    text={{
+                      brand: showBrand && previewBrand ? previewBrand : undefined,
+                      name: sample?.name ?? 'Product name',
+                      rate: showPrice
+                        ? `Rate: ${(sample?.sellingPrice ?? 0).toFixed(2)}/-`
+                        : undefined,
+                      code: qrPayload
+                        ? `${currentPreset.height <= 12 ? '' : 'Code: '}${currentPreset.codeLength ? qrPayload.slice(0, currentPreset.codeLength) : qrPayload}`
+                        : undefined,
+                      attr1: sample?.category || undefined,
+                      attr2: sample?.collection || (showWeight && sample?.netWeight ? `${sample.netWeight}g` : undefined),
+                    }}
+                  />
+                </div>
+              ) : currentPreset ? (
+                <div
+                  className="flex w-full flex-col justify-between overflow-hidden rounded-md border border-border bg-white p-1.5 text-[8px] leading-tight text-gray-900"
+                  style={{ aspectRatio: `${currentPreset.width} / ${currentPreset.height}` }}
+                >
+                  <div className="min-w-0">
+                    {showBrand && previewBrand ? <p className="truncate font-semibold">{previewBrand}</p> : null}
+                    <p className="truncate font-medium">{sample?.name ?? 'Product name'}</p>
+                    {currentPreset.height > 12 && sample?.category ? (
+                      <p className="truncate text-gray-400">{sample.category}</p>
+                    ) : null}
+                  </div>
+                  <div className="flex items-end justify-between gap-2">
+                    <div className="min-w-0">
+                      {showPrice ? (
+                        <p className="truncate font-semibold">
+                          Rate: {(sample?.sellingPrice ?? 0).toFixed(2)}/-
+                        </p>
+                      ) : null}
+                      {qrPayload ? (
+                        <p className="truncate text-gray-400">
+                          {currentPreset.height <= 12 ? '' : 'Code: '}
+                          {currentPreset.codeLength ? qrPayload.slice(0, currentPreset.codeLength) : qrPayload}
+                        </p>
+                      ) : null}
+                    </div>
+                    {showQR && qrSrc ? (
+                      <img
+                        src={qrSrc}
+                        alt="Product QR code"
+                        className="h-auto w-[38%] shrink-0 object-contain"
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-center text-sm text-red-700" role="alert">
+                  The selected template is unavailable. Select a listed template before printing.
+                </p>
+              )}
+              <p className="mt-2 text-center text-xs text-muted-foreground">
+                {printCount} label{printCount === 1 ? '' : 's'} will be printed
+              </p>
             </CardContent>
           </Card>
 
@@ -156,8 +562,8 @@ export default function BarcodeLabelsPage() {
                 <p className="font-medium text-foreground">{products.length} products</p>
                 <p>{selected.size > 0 ? `${selected.size} selected` : 'All products'}</p>
               </div>
-              <Button variant="outline" size="sm" className="w-full mt-3" onClick={selectAll}>
-                {selected.size === products.length ? 'Deselect All' : 'Select All'}
+              <Button variant="outline" size="sm" className="mt-3 w-full" onClick={selectAll}>
+                {selected.size === products.length && products.length > 0 ? 'Deselect All' : 'Select All'}
               </Button>
             </CardContent>
           </Card>
@@ -169,39 +575,57 @@ export default function BarcodeLabelsPage() {
             <CardHeader>
               <CardTitle className="text-sm">Products</CardTitle>
             </CardHeader>
-            <CardContent className="p-0 max-h-[500px] overflow-y-auto">
+            <CardContent className="max-h-[560px] overflow-y-auto p-0">
               <div className="divide-y divide-border">
-                {products.map((product) => (
-                  <div
-                    key={product.id}
-                    className={`flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-muted/50 transition-colors ${
-                      selected.has(product.id) ? 'bg-primary-50 dark:bg-primary-500/20' : ''
-                    }`}
-                    onClick={() => toggleSelect(product.id)}
-                  >
-                    <div className={`flex h-5 w-5 items-center justify-center rounded border ${
-                      selected.has(product.id)
-                        ? 'bg-primary-600 border-primary-600 text-white'
-                        : 'border-gray-300'
-                    }`}>
-                      {selected.has(product.id) && <Check className="h-3 w-3" />}
+                {products.map((product) => {
+                  const missing = !product.barcode || !String(product.barcode).trim()
+                  return (
+                    <div
+                      key={product.id}
+                      className={`flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50 ${
+                        selected.has(product.id) ? 'bg-primary-50 dark:bg-primary-500/20' : ''
+                      }`}
+                      onClick={() => toggleSelect(product.id)}
+                    >
+                      <div
+                        className={`flex h-5 w-5 items-center justify-center rounded border ${
+                          selected.has(product.id) ? 'border-primary-600 bg-primary-600 text-white' : 'border-gray-300'
+                        }`}
+                      >
+                        {selected.has(product.id) && <Check className="h-3 w-3" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
+                        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <span className="font-mono">{product.sku}</span>
+                          {missing ? (
+                            <Badge variant="warning" className="text-[10px]">
+                              No barcode
+                            </Badge>
+                          ) : (
+                            <span className="flex items-center gap-1">
+                              <Barcode className="h-3 w-3" /> <span className="font-mono">{product.barcode}</span>
+                            </span>
+                          )}
+                          {duplicates.has(product.sku.toLowerCase()) && (
+                            <Badge variant="warning" className="text-[10px]">
+                              Duplicate SKU
+                            </Badge>
+                          )}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-sm font-semibold text-primary-700">
+                          ₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                        </p>
+                        {product.netWeight ? <p className="text-xs text-muted-foreground">{product.netWeight}g</p> : null}
+                      </div>
+                      <Badge variant="muted" className="text-[10px]">
+                        {product.category}
+                      </Badge>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-foreground truncate">{product.name}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {product.sku}
-                        {product.sku && duplicates.has(product.sku.toLowerCase()) && (
-                          <Badge variant="warning" className="ml-1.5 text-[10px]">Duplicate SKU</Badge>
-                        )}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-sm font-semibold text-primary-700">₹{(product.sellingPrice ?? 0).toLocaleString('en-IN')}</p>
-                      {product.netWeight && <p className="text-xs text-muted-foreground">{product.netWeight}g</p>}
-                    </div>
-                    <Badge variant="muted" className="text-[10px]">{product.category}</Badge>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </CardContent>
           </Card>

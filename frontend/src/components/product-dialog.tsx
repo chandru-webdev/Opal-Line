@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
+import { ImagePlus, Loader2, Plus, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { CreatableSelect } from '@/components/ui/creatable-select'
 import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
+import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
 import { findDuplicateProduct, generateBarcode, generateSku, type DuplicateMatch } from '@/lib/productCodes'
 import type { Product, Supplier } from '@/types'
@@ -232,6 +233,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // Collection names already used by products (loaded once per mount) so the
   // collection picker can offer them alongside the built-in categories.
   const [collectionChoices, setCollectionChoices] = useState<string[]>([])
+  const [barcodeBusy, setBarcodeBusy] = useState(false)
   const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Latest catalogue for code generation + duplicate checks without turning
@@ -288,6 +290,25 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       setDuplicate(null)
     })
   }, [open, mode, product])
+
+  // Edit mode: the product already exists, so the server can assign a real,
+  // globally-unique barcode immediately. Add mode pre-fills a locally generated
+  // EAN-13 (see the effect above) and the backend still assigns one on save if
+  // the field is left blank (see the create route).
+  const generateServerBarcode = async () => {
+    if (!product?.id) return
+    setBarcodeBusy(true)
+    try {
+      const res = await dbApi.generateProductBarcode(product.id)
+      set('barcode', res.barcode)
+      setError('')
+      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not generate a barcode')
+    } finally {
+      setBarcodeBusy(false)
+    }
+  }
 
   // Stock levels behind the edit dialog: clear first (deferred — sync setState
   // in an effect is linted), then load this product's per-location balances.
@@ -507,14 +528,24 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       if (form.pushToShopify) {
         // New/placeholder listings are created; already-listed products get
         // their content + local images pushed as an update by the backend.
-        const result = await shopifyApi.pushProducts([saved.id])
-        pushed = result.created > 0 || (result.updated ?? 0) > 0
-        if (result.created > 0 && form.trackInventory && (saved.stock ?? 0) > 0) {
-          try {
-            await shopifyApi.pushInventory([saved.id])
-          } catch {
-            // Inventory push is best-effort here; it can be retried from the Shopify tools.
+        // Best-effort: an unconfigured store or a Shopify outage must never make
+        // a locally-saved product read as "failed to create", so a push error is
+        // reported as a warning and the product still saves.
+        try {
+          const result = await shopifyApi.pushProducts([saved.id])
+          pushed = result.created > 0 || (result.updated ?? 0) > 0
+          if (result.created > 0 && form.trackInventory && (saved.stock ?? 0) > 0) {
+            try {
+              await shopifyApi.pushInventory([saved.id])
+            } catch {
+              // Inventory push is best-effort here; it can be retried from the Shopify tools.
+            }
           }
+        } catch (e) {
+          pushed = false
+          toast.info(
+            `Saved locally. Shopify push failed: ${e instanceof Error ? e.message : 'unknown error'}`,
+          )
         }
       }
       // Price changes always travel through the dedicated price endpoint — the
@@ -652,7 +683,31 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 <Input value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. SLV-RNG-00001" />
               </Field>
               <Field label="Barcode">
-                <Input value={form.barcode} onChange={(e) => set('barcode', e.target.value)} placeholder="12-digit EAN" />
+                <div className="flex gap-1.5">
+                  <Input
+                    value={form.barcode}
+                    onChange={(e) => set('barcode', e.target.value)}
+                    placeholder={mode === 'edit' ? 'Code encoded in the label' : 'Auto-generated if left blank'}
+                    className="font-mono"
+                  />
+                  {mode === 'edit' && product?.id ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      disabled={barcodeBusy}
+                      onClick={generateServerBarcode}
+                      title="Generate a unique barcode"
+                    >
+                      <Wand2 className={cn('h-4 w-4', barcodeBusy && 'animate-pulse')} />
+                    </Button>
+                  ) : null}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {mode === 'edit'
+                    ? 'This exact value is encoded in the printed QR/barcode.'
+                    : 'Leave blank to generate a unique barcode automatically on save.'}
+                </p>
               </Field>
               <Field label="HUID (Hallmark)">
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />
