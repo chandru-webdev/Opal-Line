@@ -1,9 +1,7 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import QRCode from 'qrcode'
 import {
   Printer,
-  Settings,
   Tag,
   QrCode,
   Barcode,
@@ -17,8 +15,6 @@ import {
   Maximize2,
   AlertTriangle,
   Check,
-  FileCode2,
-  Wand2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -28,7 +24,7 @@ import { Switch } from '@/components/ui/switch'
 import { Select } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
-import { toast, confirmDialog } from '@/components/ui/confirm'
+import { toast } from '@/components/ui/confirm'
 import { dbApi, backupApi } from '@/lib/api'
 import {
   buildLabelSheet,
@@ -46,7 +42,6 @@ import {
   FALLBACK_LABEL_PRESETS,
   validateReferenceLabelPresets,
   type LabelPreset,
-  type LabelPresetDesign,
 } from '@/lib/labelPresets'
 import {
   choosePrintMode,
@@ -57,135 +52,6 @@ import {
 import type { Product } from '@/types'
 
 const CONFIG_STORAGE_KEY = 'opal-line.barcodeLabelConfig'
-
-type LabelDesign = LabelPresetDesign
-
-const DEFAULT_PRESET = 'label-50x40'
-
-// Mirrors the renderers in `backend/src/barcodeLabels.ts`.
-const ZPL_EM_RATIO = 0.925
-const ZPL_CAP_RATIO = 718 / 925
-const PREVIEW_WIDTH_PX = 264
-const QR_QUIET_MODULES = 3
-
-function useLabelQr(value: string, enabled: boolean, sizePx: number): string {
-  const [result, setResult] = useState<{ value: string; sizePx: number; src: string }>({
-    value: '',
-    sizePx: 0,
-    src: '',
-  })
-  useEffect(() => {
-    let active = true
-    if (!enabled || !value || sizePx <= 0) return () => { active = false }
-
-    try {
-      const qr = QRCode.create(value, { errorCorrectionLevel: 'L' })
-      const moduleSizePx = Math.max(1, Math.round(sizePx / qr.modules.size))
-      QRCode.toDataURL(value, {
-        errorCorrectionLevel: 'L',
-        margin: 0,
-        width: moduleSizePx * qr.modules.size,
-        color: { dark: '#000000', light: '#ffffff' },
-      }).then((dataUrl) => {
-        if (active) setResult({ value, sizePx, src: dataUrl })
-      }).catch((error: unknown) => {
-        if (!active) return
-        toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
-      })
-    } catch (error) {
-      if (!active) return
-      toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
-    }
-    return () => { active = false }
-  }, [enabled, sizePx, value])
-  return enabled && result.value === value && result.sizePx === sizePx ? result.src : ''
-}
-
-function fieldMaxWidthMm(design: LabelDesign, field: LabelDesign['fields'][number], showQR: boolean): number {
-  const moduleMm = design.qr.size / design.qr.modules
-  const quietMm = moduleMm * QR_QUIET_MODULES
-  let maxWidth = showQR ? field.maxWidth : design.width - field.x
-
-  const sibling = design.fields.find((candidate) => candidate.kind === 'attr2')
-  if (field.kind === 'attr1' && sibling && sibling.x > field.x) {
-    maxWidth = Math.min(maxWidth, sibling.x - field.x - quietMm)
-  }
-  if (!showQR || field.x >= design.qr.x) return Math.max(0, maxWidth)
-
-  const qrTop = design.qr.bottom - (design.qr.modules + QR_QUIET_MODULES) * moduleMm
-  const boxTop = qrTop - quietMm
-  const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
-  const overlap = Math.min(field.baseline, design.qr.bottom) - Math.max(capTop, boxTop)
-  if (overlap > field.capHeight * ZPL_CAP_RATIO * 0.25) {
-    maxWidth = Math.min(maxWidth, design.qr.x - quietMm - field.x)
-  }
-  return Math.max(0, maxWidth)
-}
-
-function LabelDesignPreview({
-  design,
-  text,
-  showQR,
-  qrSrc,
-}: {
-  design: LabelDesign
-  text: Record<string, string | undefined>
-  showQR: boolean
-  qrSrc: string
-}) {
-  const scale = PREVIEW_WIDTH_PX / design.width
-  return (
-    <div
-      className="relative overflow-hidden rounded-md bg-white text-gray-900 ring-1 ring-border"
-      style={{ width: PREVIEW_WIDTH_PX, height: design.height * scale }}
-    >
-      {design.fields.map((field) => {
-        const value = text[field.kind]
-        if (!value) return null
-        const fontSizeMm = field.capHeight / ZPL_EM_RATIO
-        const condense = field.refWidth / fontSizeMm
-        return (
-          <span
-            key={field.kind}
-            className="absolute whitespace-nowrap font-bold"
-            style={{
-              left: field.x * scale,
-              top: (field.baseline - field.capHeight * ZPL_CAP_RATIO) * scale,
-              fontSize: fontSizeMm * scale,
-              lineHeight: 1,
-              width: (fieldMaxWidthMm(design, field, showQR) * scale) / condense,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              display: 'block',
-              transform: `scaleX(${condense})`,
-              transformOrigin: 'left top',
-              fontFamily: 'Arial, Helvetica, sans-serif',
-              textTransform: field.kind === 'name' || field.kind === 'brand' ? 'uppercase' : undefined,
-            }}
-          >
-            {value}
-          </span>
-        )
-      })}
-      {showQR && qrSrc ? (
-        <img
-          src={qrSrc}
-          alt="Product QR code"
-          className="absolute [image-rendering:pixelated]"
-          style={{
-            left: design.qr.x * scale,
-            top:
-              (design.qr.bottom -
-                ((design.qr.modules + QR_QUIET_MODULES) * design.qr.size) / design.qr.modules) *
-              scale,
-            width: design.qr.size * scale,
-            height: design.qr.size * scale,
-          }}
-        />
-      ) : null}
-    </div>
-  )
-}
 
 function loadConfig(): LabelConfig {
   try {
@@ -279,23 +145,12 @@ function ToggleRow({
 export default function BarcodeLabelsPage() {
   const [products, setProducts] = useState<Product[]>([])
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
   const [cfg, setCfg] = useState<LabelConfig>(loadConfig)
-  const [presets, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
-  const [preset, setPreset] = useState(DEFAULT_PRESET)
-  const [showPrice, setShowPrice] = useState(true)
-  const [showWeight, setShowWeight] = useState(true)
-  const [showQR, setShowQR] = useState(true)
-  const [showBrand, setShowBrand] = useState(true)
-  const [copies, setCopies] = useState(1)
-  const [format, setFormat] = useState<'qr' | 'code128'>('qr')
+  const [, setPresets] = useState<LabelPreset[]>(FALLBACK_LABEL_PRESETS)
   const [generating, setGenerating] = useState(false)
   const [brand, setBrand] = useState('')
-  const [missingCount, setMissingCount] = useState(0)
-  const [presetError, setPresetError] = useState('')
-  const [productError, setProductError] = useState('')
 
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('all')
@@ -304,16 +159,13 @@ export default function BarcodeLabelsPage() {
   const [zoom, setZoom] = useState(1)
   const [fitScale, setFitScale] = useState(1)
   const previewRef = useRef<HTMLDivElement>(null)
-  const searchParams = useSearchParams()
-  const [generating, setGenerating] = useState(false)
+  const [searchParams] = useSearchParams()
 
   useEffect(() => {
     let active = true
     Promise.all([
       dbApi.getProducts().then((data) => {
         setProducts(data)
-        setProductError('')
-        setMissingCount(data.filter((p) => !p.barcode || !String(p.barcode).trim()).length)
         const idsParam = (searchParams.get('ids') ?? '').split(',').map((x) => x.trim()).filter(Boolean)
         if (idsParam.length > 0) {
           const available = new Set(data.map((p) => p.id))
@@ -322,7 +174,6 @@ export default function BarcodeLabelsPage() {
       }).catch((error: unknown) => {
         if (!active) return
         const message = error instanceof Error ? error.message : 'Could not load products'
-        setProductError(message)
         toast.error(message)
       }),
       dbApi.getProductDuplicates().then((r) => {
@@ -336,13 +187,11 @@ export default function BarcodeLabelsPage() {
         }
         if (active) {
           setPresets(list)
-          setPresetError('')
         }
       }).catch((error: unknown) => {
         if (active) return
         const message = error instanceof Error ? error.message : 'Could not load label templates'
         setPresets(FALLBACK_LABEL_PRESETS)
-        setPresetError(message)
         toast.error(`${message}; using the bundled reference templates`)
       }),
       dbApi.getSettings().then((s) => {
@@ -458,11 +307,6 @@ export default function BarcodeLabelsPage() {
     })
   }
 
-  const selectAll = () => {
-    if (selected.size === products.length) setSelected(new Set())
-    else setSelected(new Set(products.map((p) => p.id)))
-  }
-
   const openFullPreview = () => {
     if (expandedCount === 0) {
       toast.info('No labels to preview')
@@ -482,7 +326,6 @@ export default function BarcodeLabelsPage() {
       showPrice: cfg.showPrice,
       showWeight: cfg.showWeight,
       showQR: cfg.showQr,
-      showBrand: cfg.showBrand,
       copies: cfg.copies,
       brandName: brand,
       width: cfg.widthMm,
@@ -568,12 +411,6 @@ export default function BarcodeLabelsPage() {
           </>
         }
       />
-
-      {loadError && (
-        <div className="rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300">
-          {loadError}
-        </div>
-      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* ΓöÇΓöÇ Settings ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
