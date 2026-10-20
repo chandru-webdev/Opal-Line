@@ -166,7 +166,7 @@ jobs:
       # above. Caching them takes ~2-4 min off every warm run. Restored
       # before npm ci because that is when the Electron download happens.
       - name: Cache Electron + electron-builder downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/AppData/Local/electron/Cache
@@ -316,7 +316,7 @@ jobs:
       # Chromium on every run is pure network time when the cache is warm.
       - name: Cache Playwright browsers
         if: env.SIGNING_AVAILABLE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}

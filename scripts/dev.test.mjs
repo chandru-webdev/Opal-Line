@@ -58,13 +58,17 @@ test('upsertEnvValue adds and replaces without disturbing the rest of the file',
 })
 
 test('isLegacySharedDbUrl recognizes only the desktop-app cluster URL', () => {
-  // The exact shape dev.mjs itself used to write (old shared setup):
+  // The exact shapes dev.mjs itself used to write (old shared setups — first
+  // the desktop's opal_line, then the same-cluster opal_line_dev):
   assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line'), true)
   assert.equal(isLegacySharedDbUrl('postgres://postgres:pw@127.0.0.1:47193/opal_line'), true)
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line_dev'), true, 'same-cluster dev URL from an intermediate script version')
   // Hand-maintained URLs must never be migrated:
   assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47194/opal_line'), false, 'dev cluster URL is current, not legacy')
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47194/opal_line_dev'), false, 'same name on the new cluster is current')
   assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@db.example.com:47193/opal_line'), false, 'remote host')
   assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/other_db'), false, 'different database')
+  assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:47193/opal_line_dev2'), false, 'look-alike name')
   assert.equal(isLegacySharedDbUrl('postgresql://postgres:pw@127.0.0.1:5432/opal_line'), false, 'different port')
 })
 

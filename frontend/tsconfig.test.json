@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./.tsbuildinfo/tsconfig.test.tsbuildinfo",
+    /* Test files run under plain Node (node:test) via tsx, so they need the
+       Node globals on top of the app's vite/client types. */
+    "types": ["node", "vite/client"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/*.test.tsx"],
+  "exclude": []
+}

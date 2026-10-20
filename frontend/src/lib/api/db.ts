@@ -5,6 +5,7 @@ import type {
   AgingInvoice,
   AnalyticsStat,
   SilverRateAutoStatus,
+  PendingRateChange,
   SilverRateRequestRow,
   SilverRateRequestsResponse,
   SilverRateRow,
@@ -18,6 +19,7 @@ import type {
   BankAccount,
   Customer,
   Expense,
+  FinancialSummary,
   GstReportResult,
   Invoice,
   InventoryLocation,
@@ -122,6 +124,16 @@ export const dbApi = {
     request('/silver/auto-rate/fetch-now', { method: 'POST' }),
   toggleSilverRateAuto: (enabled: boolean): Promise<{ ok: boolean; enabled: boolean }> =>
     request('/silver/auto-rate/toggle', { method: 'POST', body: JSON.stringify({ enabled }) }),
+  setSilverRateSchedule: (payload: { days: number[]; time: string }): Promise<{ ok: boolean; schedule: { days: number[]; time: string } }> =>
+    request('/silver/auto-rate/schedule', { method: 'PUT', body: JSON.stringify(payload) }),
+  getScheduledRateChanges: (): Promise<{ changes: PendingRateChange[] }> =>
+    request('/silver/scheduled-changes'),
+  scheduleSilverRateChange: (payload: { rate: number; applyAt: string; note?: string }): Promise<{ ok: boolean; change: PendingRateChange; changes: PendingRateChange[] }> =>
+    request('/silver/scheduled-changes', { method: 'POST', body: JSON.stringify(payload) }),
+  updateScheduledRateChange: (id: string, payload: { rate: number; applyAt: string; note?: string }): Promise<{ ok: boolean; change: PendingRateChange; changes: PendingRateChange[] }> =>
+    request(`/silver/scheduled-changes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  cancelScheduledRateChange: (id: string): Promise<{ ok: boolean; changes: PendingRateChange[] }> =>
+    request(`/silver/scheduled-changes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   getDashboardKpis: async (range?: DashboardRangeInput): Promise<KpiCardData[]> => {
     const rows = await request<
       Array<{ key: string; label: string; value: string; delta: string | null; deltaLabel: string | null; rangeLabel: string | null; icon: string; trend: 'up' | 'down' | 'flat'; accent: string }>
@@ -151,6 +163,8 @@ export const dbApi = {
       todayExpenses: number
       rangeExpenses: number
       pendingPayments: number
+      totalOrders: number
+      totalInvoices: number
     }>(rangePath('/db/dashboard/summary', range)),
   getSalesOverview: (range: DashboardRangeInput | string = 'week'): Promise<SalesOverviewPoint[]> => request(rangePath('/db/dashboard/sales-overview', range)),
   getTopProducts: (range?: DashboardRangeInput): Promise<TopProduct[]> => request(rangePath('/db/dashboard/top-products', range)),
@@ -162,6 +176,11 @@ export const dbApi = {
   getPaymentStatus: (range?: DashboardRangeInput): Promise<{ segments: PaymentStatusSegment[]; total: number }> =>
     request(rangePath('/db/dashboard/payment-status', range)),
   getReceivablesAging: (): Promise<ReceivablesAging> => request('/db/dashboard/aging'),
+  // The Financial Analytics section owns its range (defaults to Last 12
+  // Months server-side when no period is passed) and is independent of the
+  // page-wide filter.
+  getDashboardFinancial: (range?: DashboardRangeInput | string): Promise<FinancialSummary> =>
+    request(rangePath('/db/dashboard/financial', range)),
   getAgingInvoices: (bucket: AgingBucket['key']): Promise<{ bucket: string; invoices: AgingInvoice[] }> =>
     request(`/db/dashboard/aging/invoices?bucket=${encodeURIComponent(bucket)}`),
   getSilverRateHistory: async (): Promise<SilverRatePoint[]> => {
@@ -288,7 +307,7 @@ export const dbApi = {
       body: JSON.stringify({ images }),
     }),
   updateOrderStatus: (orderId: string, status: string) =>
-    request<SalesOrder>(`/db/sales-orders/${orderId}/status`, {
+    request<SalesOrder & { autoInvoice?: string | null }>(`/db/sales-orders/${orderId}/status`, {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
@@ -299,6 +318,8 @@ export const dbApi = {
     }),
   createBooking: (payload: { customer: string; items: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
     request<SalesOrder>('/db/bookings', { method: 'POST', body: JSON.stringify(payload) }),
+  updateBooking: (orderId: string, payload: { customer?: string; items?: Array<{ product: string; sku?: string; qty: number; price: number }>; advanceAmount?: number; discount?: number }) =>
+    request<SalesOrder>(`/db/bookings/${orderId}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   convertBooking: (orderId: string) =>
     request<{ invoiceNumber: string; advanceApplied: number; balance: number }>(`/db/bookings/${orderId}/convert`, {
       method: 'POST',
@@ -324,7 +345,7 @@ export const dbApi = {
   customer360: (name: string) =>
     request<Customer360>(`/db/customers/${encodeURIComponent(name)}/summary`),
   bulkOrderStatus: (ids: string[], status: string) =>
-    request<{ updated: number; status: string }>('/db/sales-orders/bulk-status', {
+    request<{ updated: number; status: string; invoicesCreated?: number; newInvoices?: string[] }>('/db/sales-orders/bulk-status', {
       method: 'POST',
       body: JSON.stringify({ ids, status }),
     }),
@@ -405,6 +426,15 @@ export const dbApi = {
         method: 'POST',
         body: JSON.stringify({ counts, mode, pushToShopify: pushToShopify === true, locationId }),
       },
+    ),
+  /**
+   * Set a product's count at ONE location (from the product edit dialog).
+   * The backend records a count_adjust movement and keeps the rollup in sync.
+   */
+  setProductStock: (productId: string, stock: number, locationId?: string) =>
+    request<{ ok: boolean; changed: boolean; stock: number; previous: number; locationId: string }>(
+      `/db/products/${encodeURIComponent(productId)}/stock`,
+      { method: 'PATCH', body: JSON.stringify(locationId ? { stock, locationId } : { stock }) },
     ),
   createInvoiceForOrder: (orderId: string) =>
     request<{ created: boolean; invoiceNumber: string | null }>(`/db/sales-orders/${encodeURIComponent(orderId)}/create-invoice`, {
@@ -517,6 +547,25 @@ export const dbApi = {
     items: Array<{ product: string; sku: string; qty: number; weight: number; rate: number }>,
   ): Promise<PurchaseOrder> =>
     request(`/db/purchase-orders/${encodeURIComponent(id)}/lines`, { method: 'PATCH', body: JSON.stringify({ items }) }),
+  /**
+   * Full PO edit — header fields plus replacement lines in one call. Totals
+   * (subtotal, GST, grand total) are recomputed server-side.
+   */
+  updatePurchaseOrder: (
+    id: string,
+    body: {
+      supplier?: string
+      supplierId?: string | null
+      status?: string
+      date?: string
+      expectedDate?: string | null
+      notes?: string | null
+      gst?: number
+      discount?: number
+      lines?: Array<{ product: string; sku: string; qty: number; weight: number; rate: number }>
+    },
+  ): Promise<PurchaseOrder> =>
+    request(`/db/purchase-orders/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
   getSalesReturns: () => list<SalesReturn>('/db/sales-returns', PAGED),
   getPurchaseReturns: () => list<PurchaseReturn>('/db/purchase-returns', PAGED),
   getStockTransfers: () => list<StockTransfer>('/db/inventory/transfers', PAGED),

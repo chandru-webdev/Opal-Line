@@ -746,12 +746,24 @@ async function deductStock(tx: any, sku: string, qty: number, locationId?: strin
   } catch { /* stock tracking optional for email orders */ }
 }
 
+export interface CreateInvoiceOptions {
+  /**
+   * Move stock out for each invoiced item (default true). The Shopify order
+   * import passes false: it already moved stock when the order row was
+   * inserted, so invoicing must not deduct it a second time.
+   */
+  deductStock?: boolean
+}
+
 /**
  * Raise a tax invoice for any order row (email-synced or manual).
  * Idempotent: returns the existing invoice number if one is already linked.
  * Returns null when the order has no line items to invoice.
  */
-export async function createInvoiceForOrderRow(order: typeof schema.salesOrders.$inferSelect): Promise<string | null> {
+export async function createInvoiceForOrderRow(
+  order: typeof schema.salesOrders.$inferSelect,
+  opts: CreateInvoiceOptions = {},
+): Promise<string | null> {
   if (!db) return null
   if (order.invoice) return order.invoice
   const lineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
@@ -763,15 +775,27 @@ export async function createInvoiceForOrderRow(order: typeof schema.salesOrders.
   const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
   const payment = order.payment === 'paid' ? 'Online' : order.payment === 'cod' ? 'COD' : 'Pending'
 
+  // Load product netWeights keyed by SKU for invoice-item weight snapshot
+  const productNetWeights = await db
+    .select({ sku: schema.products.sku, netWeight: schema.products.netWeight })
+    .from(schema.products)
+  const netWeightMap = Object.fromEntries(
+    productNetWeights.map((p) => [p.sku, Number(p.netWeight ?? 0)])
+  )
+
   const items = lineItems.map((li) => {
     const qty = Number(li.quantity ?? 0)
     const price = Number(li.price ?? 0)
     const amount = Math.round(price * qty * 100) / 100
+    // Weight snapshot: net weight × qty from the catalogue, keyed by SKU.
+    // Unknown SKUs keep 0 — the UI renders 0 as unknown ("—"), never 0.00 gm.
+    const netWeight = netWeightMap[String(li.sku ?? '')] ?? 0
+    const weight = netWeight > 0 ? Math.round(netWeight * qty * 1000) / 1000 : 0
     return {
       product: String(li.title ?? '').trim(),
       sku: String(li.sku ?? ''),
       qty,
-      weight: 0,
+      weight,
       silverRate: 0,
       makingCharge: 0,
       tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
@@ -824,16 +848,29 @@ export async function createInvoiceForOrderRow(order: typeof schema.salesOrders.
       await tx.insert(schema.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId })
       // Deduct stock for the sold SKU, same rule as manual invoices. The
       // order's own location is honoured so the deduction and any later
-      // reversal agree on which balance they touch.
-      await deductStock(tx, it.sku, it.qty, orderLocationId)
+      // reversal agree on which balance they touch. Skipped when the caller
+      // already moved stock (Shopify order import).
+      if (opts.deductStock !== false) {
+        await deductStock(tx, it.sku, it.qty, orderLocationId)
+      }
     }
     await tx.update(schema.salesOrders).set({ invoice: number }).where(eq(schema.salesOrders.id, order.id))
-  })
-  // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
-  void import('./loyalty').then(({ earnForInvoice }) =>
-    earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
-  )
-  return number
+  })    // Loyalty: award points for this invoice (fire-and-forget, never blocks sync)
+    void import('./loyalty').then(({ earnForInvoice }) =>
+      earnForInvoice({ id: invoiceId, number, customer: order.customer ?? '', grandTotal, status: order.payment === 'paid' ? 'paid' : 'issued' }),
+    )
+    // E-invoicing: in `automatic` mode the IRN must be generated for invoices
+    // raised by THIS pipeline (fulfilment, email sync) too — not only for
+    // invoices created through POST /invoices. Fire-and-forget, same rule as
+    // the manual route: a gateway failure must never fail the invoice.
+    void import('./einvoice')
+      .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
+        if ((await resolveEInvoiceMode()) !== 'automatic') return
+        const result = await generateEInvoiceForInvoice(invoiceId)
+        if (!result.ok) logger.error({ err: result.error, invoice: number }, 'automatic IRN generation failed for auto-raised invoice')
+      })
+      .catch(() => undefined)
+    return number
 }
 
 /**

@@ -143,18 +143,20 @@ function parseDbUrl(url) {
 
 /**
  * True for the URL older versions of this script wrote into backend/.env:
- * the DESKTOP APP's cluster (127.0.0.1:47193/opal_line). Those checkouts
- * shared one database between dev and the installed app — sessions, users
- * and data collided. Such URLs were machine-generated, never hand-maintained,
- * so dev.mjs migrates them to the separate dev cluster on the next run.
- * Every other DATABASE_URL is treated as hand-maintained and left alone.
+ * the DESKTOP APP's cluster (127.0.0.1:47193) with either the desktop's
+ * bundled database (`opal_line`) or the short-lived same-cluster dev
+ * database (`opal_line_dev`). Both layouts shared the desktop app's cluster
+ * with dev — sessions, users and files collided. Such URLs were
+ * machine-generated, never hand-maintained, so dev.mjs migrates them to the
+ * separate dev cluster on the next run. Every other DATABASE_URL is treated
+ * as hand-maintained and left alone.
  */
 function isLegacySharedDbUrl(url) {
   const target = parseDbUrl(url)
   return (
     target?.host === '127.0.0.1' &&
     target.port === 47193 &&
-    /^postgres(?:ql)?:\/\/[^/]+\/opal_line\/?$/.test(url)
+    /^postgres(?:ql)?:\/\/[^/]+\/opal_line(?:_dev)?\/?$/.test(url)
   )
 }
 
@@ -552,6 +554,28 @@ function reportEncryptedMigration({ migrated, failed }) {
   }
 }
 
+/**
+ * backend/pgsql is ~1 GB and NOT in git, so a fresh checkout on another
+ * machine has no server at all. Fetch the portable PostgreSQL once (the same
+ * binaries the desktop installer bundles) instead of dying — this is what
+ * makes `npm run dev` work out of the box on new systems. Returns true when
+ * a usable server was fetched into backend/pgsql.
+ */
+async function ensurePortablePostgresOnce() {
+  if (process.platform !== 'win32') return false
+  try {
+    console.log('[dev] No PostgreSQL found — downloading the portable server into backend/pgsql (~330 MB, one time)…')
+    const { ensurePortablePostgres } = await import('./portable-pg.cjs')
+    await ensurePortablePostgres(join(ROOT, 'backend', 'pgsql'), {
+      log: (m) => console.log(`[dev]${m.trimEnd()}`),
+    })
+    return true
+  } catch (err) {
+    console.log(`[dev] Portable PostgreSQL download failed: ${err?.message ?? err}`)
+    return false
+  }
+}
+
 async function provisionDatabase() {
   // Guard first: never point dev at the installed desktop app's cluster.
   assertDevDataDirSeparate()
@@ -561,7 +585,10 @@ async function provisionDatabase() {
   // major, and an older binary rejects newer-only config (PG 18 writes
   // autovacuum_worker_slots, which PG 16/17 refuse with a FATAL config error).
   const requiredMajor = readDataDirMajor(PGDATA)
-  const chosen = selectPgBinDir(requiredMajor)
+  let chosen = selectPgBinDir(requiredMajor)
+  if (!chosen && (await ensurePortablePostgresOnce())) {
+    chosen = selectPgBinDir(requiredMajor)
+  }
 
   if (!chosen) {
     const available = [...new Set(findPgBinCandidates().map((c) => c.major).filter(Boolean))].sort((a, b) => b - a)
@@ -579,7 +606,10 @@ async function provisionDatabase() {
       '    Install PostgreSQL 15+ (https://www.postgresql.org/download/windows/), or put the\n' +
       '    portable server in backend/pgsql/bin, or set DATABASE_URL in backend/.env,\n' +
       '    then re-run npm run dev. Looked in:\n' +
-      pgSearchSummary(),
+      pgSearchSummary() +
+      (process.platform === 'win32'
+        ? '\n    (If the automatic portable-server download just failed, check the internet\n     connection and re-run npm run dev.)'
+        : ''),
     )
   }
 

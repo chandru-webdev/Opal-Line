@@ -3,6 +3,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import argon2 from 'argon2'
 import { and, eq, ne, or, sql } from 'drizzle-orm'
 import { db, schema } from '../db/client'
+import { normalizeLockoutPolicy, type LockoutPolicy } from '../lockout'
 import { computeUserPermissions } from '../rbac'
 import { recordActivity } from '../activity'
 import { createSession, destroySession, destroyUserSessions, requireAuth, tokenFromRequest, setSessionCookie, clearSessionCookie } from '../sessions'
@@ -12,33 +13,34 @@ import { parseDbTimestamp } from '../lib/dbtime'
 
 export const authRouter = Router()
 
-const LOCKOUT_THRESHOLD = 5
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000
-
 /**
- * Whether account lockout is switched on for this install
- * (settings.login_lockout_enabled, managed from Settings → Security → Login
- * lockout; default/NULL = off — the product ships with lockout disabled for
- * testing and it is turned on per install). Fails open: if the setting cannot
- * be read, no lockout is enforced, matching the rest of this module where a
- * storage error must never lock the owner out of their own system.
+ * The per-install lockout policy (Settings → Security → Login lockout): the
+ * on/off switch plus the editable "attempts before lockout" and "lockout
+ * minutes" values (defaults/NULL → 5 attempts / 15 minutes). Fails open: if
+ * the settings row cannot be read, no lockout is enforced — a storage error
+ * must never lock the owner out of their own system.
  */
-async function isLockoutEnabled(): Promise<boolean> {
+export async function getLockoutPolicy(): Promise<LockoutPolicy> {
+  const fallback = normalizeLockoutPolicy({})
   try {
     const { db: getDb, schema } = await import('../db/client')
-    if (!getDb) return false
+    if (!getDb) return fallback
     const rows = await getDb
-      .select({ enabled: schema.settings.loginLockoutEnabled })
+      .select({
+        enabled: schema.settings.loginLockoutEnabled,
+        threshold: schema.settings.lockoutThreshold,
+        durationMinutes: schema.settings.lockoutDurationMinutes,
+      })
       .from(schema.settings)
       .where(eq(schema.settings.id, 'app'))
       .limit(1)
-    return rows[0]?.enabled === true
+    return normalizeLockoutPolicy(rows[0] ?? {})
   } catch {
-    return false
+    return fallback
   }
 }
 
-async function checkLockout(identifier: string): Promise<{ locked: boolean; remainingMs: number }> {
+async function checkLockout(identifier: string, policy: LockoutPolicy): Promise<{ locked: boolean; remainingMs: number }> {
   try {
     const { db: getDb, schema } = await import('../db/client')
     if (!getDb) return { locked: false, remainingMs: 0 }
@@ -52,12 +54,12 @@ async function checkLockout(identifier: string): Promise<{ locked: boolean; rema
     // counter resets on each attempt (lockout never fires).
     const lastAttempt = parseDbTimestamp(entry.lastAttempt)?.getTime()
     if (lastAttempt === undefined || Number.isNaN(lastAttempt)) return { locked: false, remainingMs: 0 }
-    if (Date.now() - lastAttempt > LOCKOUT_DURATION_MS) {
+    if (Date.now() - lastAttempt > policy.durationMs) {
       await getDb.delete(schema.loginAttempts).where(eq(schema.loginAttempts.identifier, identifier))
       return { locked: false, remainingMs: 0 }
     }
-    if (entry.count >= LOCKOUT_THRESHOLD) {
-      return { locked: true, remainingMs: LOCKOUT_DURATION_MS - (Date.now() - lastAttempt) }
+    if (entry.count >= policy.threshold) {
+      return { locked: true, remainingMs: policy.durationMs - (Date.now() - lastAttempt) }
     }
     return { locked: false, remainingMs: 0 }
   } catch {
@@ -65,7 +67,7 @@ async function checkLockout(identifier: string): Promise<{ locked: boolean; rema
   }
 }
 
-async function recordFailedAttempt(identifier: string): Promise<void> {
+async function recordFailedAttempt(identifier: string, durationMs: number): Promise<void> {
   try {
     const { db: getDb, schema } = await import('../db/client')
     if (!getDb) return
@@ -80,7 +82,7 @@ async function recordFailedAttempt(identifier: string): Promise<void> {
         set: {
           count: sql`
             CASE
-              WHEN ${schema.loginAttempts.lastAttempt} > ${new Date(Date.now() - LOCKOUT_DURATION_MS).toISOString()}
+              WHEN ${schema.loginAttempts.lastAttempt} > ${new Date(Date.now() - durationMs).toISOString()}
                 THEN ${schema.loginAttempts.count} + 1
               ELSE 1
             END
@@ -187,13 +189,14 @@ authRouter.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Username or email and password are required' })
     }
 
-    // Lockout is a per-install switch (Settings → Security → Login lockout,
-    // off by default). One settings read gates both the check and the
-    // recording below, so a disabled install neither blocks nor counts
-    // attempts — re-enabling later starts from a clean counter.
-    const lockoutEnabled = await isLockoutEnabled()
-    if (lockoutEnabled) {
-      const lockout = await checkLockout(identifier)
+    // Lockout is a per-install setting (Settings → Security → Login lockout:
+    // the switch plus editable attempts/minutes, off by default). One settings
+    // read gates both the check and the recording below, so a disabled
+    // install neither blocks nor counts attempts — re-enabling later starts
+    // from a clean counter.
+    const lockoutPolicy = await getLockoutPolicy()
+    if (lockoutPolicy.enabled) {
+      const lockout = await checkLockout(identifier, lockoutPolicy)
       if (lockout.locked) {
         return res.status(429).json({ error: `Account temporarily locked. Try again in ${Math.ceil(lockout.remainingMs / 60000)} minutes.` })
       }
@@ -205,7 +208,7 @@ authRouter.post('/login', async (req, res) => {
       .where(or(eq(schema.users.username, identifier), eq(schema.users.email, identifier)))
       .limit(1)
     if (!user) {
-      if (lockoutEnabled) await recordFailedAttempt(identifier)
+      if (lockoutPolicy.enabled) await recordFailedAttempt(identifier, lockoutPolicy.durationMs)
       void recordActivity({ action: 'Failed Login Attempt', module: 'system', entity: identifier, details: 'Unknown username or email', ip: req.ip ?? null })
       return res.status(401).json({ error: 'Invalid username or password' })
     }
@@ -228,7 +231,7 @@ authRouter.post('/login', async (req, res) => {
       valid = usedRecovery
     }
     if (!valid) {
-      if (lockoutEnabled) await recordFailedAttempt(identifier)
+      if (lockoutPolicy.enabled) await recordFailedAttempt(identifier, lockoutPolicy.durationMs)
       void recordActivity({ action: 'Failed Login Attempt', module: 'system', entity: user.name, details: user.passwordHash ? 'Invalid password' : 'Account has no password set', ip: req.ip ?? null })
       return res.status(401).json({ error: 'Invalid username or password' })
     }

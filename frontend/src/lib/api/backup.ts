@@ -122,7 +122,7 @@ export const systemApi = {
 export const backupApi = {
   getScopes: (): Promise<BackupScopeInfo[]> => request<BackupScopeInfo[]>('/backup/scopes'),
   getHistory: (): Promise<ActivityLogEntry[]> => request<ActivityLogEntry[]>('/backup/history'),
-  getAutoBackupStatus: (): Promise<{ enabled: boolean; scheduleLabel: string; nextRunAt: string; lastBackup: { fileName: string; exportedAt: string | null; sizeBytes: number } | null; backupCount: number }> =>
+  getAutoBackupStatus: (): Promise<{ enabled: boolean; scheduleLabel: string; nextRunAt: string; lastBackup: { fileName: string; exportedAt: string | null; sizeBytes: number } | null; backupCount: number; localDir?: string | null; lastLocalCopy?: string | null }> =>
     request('/backup/auto-status'),
   getBackupFiles: (): Promise<BackupFileInfo[]> => request<BackupFileInfo[]>('/backup/files'),
   backupEverything: (): Promise<BackupResult> =>

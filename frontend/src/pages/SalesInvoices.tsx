@@ -1,8 +1,8 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Plus, Printer, Search, Undo2, X } from 'lucide-react'
+import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, Search, Undo2, X } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -55,6 +55,77 @@ export default function SalesInvoicesPage() {
   const [viewInvoice, setViewInvoice] = useState<Invoice | null>(null)
   const [invoiceItems, setInvoiceItems] = useState<InvoiceItem[]>([])
   const [customers, setCustomers] = useState<Array<{ name: string; phone?: string | null }>>([])
+
+  // Header-field edit state (customer, payment, dates, discount, GST).
+  // Line items are intentionally not editable here — the backend PATCH keeps
+  // totals in sync when discount/GST change without touching stock.
+  const [editTarget, setEditTarget] = useState<Invoice | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
+  const [editError, setEditError] = useState('')
+  const [editForm, setEditForm] = useState({
+    customer: '', customerEmail: '', customerPhone: '', customerAddress: '',
+    customerCity: '', customerState: '', customerPincode: '', buyerGstin: '',
+    date: '', dueDate: '', paymentMethod: '', paymentStatus: 'pending', status: 'issued',
+    discount: '0', gst: '3',
+  })
+
+  const openEdit = (inv: Invoice) => {
+    const toDateInput = (v?: string | null) => (v ? new Date(v).toISOString().slice(0, 10) : '')
+    setEditTarget(inv)
+    setEditError('')
+    setEditForm({
+      customer: inv.customer ?? '',
+      customerEmail: inv.customerEmail ?? '',
+      customerPhone: inv.customerPhone ?? '',
+      customerAddress: inv.customerAddress ?? '',
+      customerCity: inv.customerCity ?? '',
+      customerState: inv.customerState ?? '',
+      customerPincode: inv.customerPincode ?? '',
+      buyerGstin: inv.buyerGstin ?? '',
+      date: toDateInput(inv.date),
+      dueDate: toDateInput(inv.dueDate),
+      paymentMethod: inv.paymentMethod ?? '',
+      paymentStatus: inv.paymentStatus,
+      status: inv.status,
+      discount: String(inv.discount ?? 0),
+      gst: String(inv.gst ?? 3),
+    })
+    setViewInvoice(null)
+  }
+
+  const submitEdit = async () => {
+    if (!editTarget) return
+    if (!editForm.customer.trim()) { setEditError('Customer name is required'); return }
+    setEditSaving(true)
+    setEditError('')
+    try {
+      const patch: Record<string, unknown> = {
+        customer: editForm.customer.trim(),
+        customerEmail: editForm.customerEmail.trim() || null,
+        customerPhone: editForm.customerPhone.trim() || null,
+        customerAddress: editForm.customerAddress.trim() || null,
+        customerCity: editForm.customerCity.trim() || null,
+        customerState: editForm.customerState.trim() || null,
+        customerPincode: editForm.customerPincode.trim() || null,
+        buyerGstin: editForm.buyerGstin.trim() || null,
+        paymentMethod: editForm.paymentMethod.trim() || null,
+        paymentStatus: editForm.paymentStatus,
+        status: editForm.status,
+        discount: parseFloat(editForm.discount) || 0,
+        gst: parseFloat(editForm.gst) || 0,
+      }
+      if (editForm.date) patch.date = new Date(`${editForm.date}T00:00:00`).toISOString()
+      if (editForm.dueDate) patch.dueDate = new Date(`${editForm.dueDate}T00:00:00`).toISOString()
+      const updated = await dbApi.update<Invoice>('invoices', editTarget.id, patch)
+      setInvoices((prev) => prev.map((x) => (x.id === editTarget.id ? { ...x, ...updated } : x)))
+      toast.success(`Invoice ${editTarget.number} updated`)
+      setEditTarget(null)
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Failed to update invoice')
+    } finally {
+      setEditSaving(false)
+    }
+  }
 
   const setInvoiceStatus = async (inv: Invoice, status: Invoice['status']) => {
     if (!(await confirmDialog({ title: `Mark invoice ${inv.number} as ${status}?` }))) return
@@ -227,9 +298,9 @@ export default function SalesInvoicesPage() {
               <Button variant="ghost" size="icon-sm">
                 <MoreHorizontal className="h-4 w-4" />
               </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
+            </DropdownMenuTrigger>              <DropdownMenuContent align="end">
               <DropdownMenuLabel className="text-xs text-muted-foreground">More actions</DropdownMenuLabel>
+              <DropdownMenuItem onClick={() => openEdit(row.original)}><Pencil className="h-3.5 w-3.5" /> Edit invoice</DropdownMenuItem>
               <DropdownMenuItem onClick={() => navigate(`/sales/invoices/${row.original.id}`)}><Download className="h-3.5 w-3.5" /> Download PDF</DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={() => setInvoiceStatus(row.original, 'refunded')}><Undo2 className="h-3.5 w-3.5" /> Refund</DropdownMenuItem>
@@ -399,7 +470,86 @@ export default function SalesInvoicesPage() {
             </div>
           ) : null}
       </AppDialog>
+
+      <AppDialog
+        open={editTarget !== null}
+        onOpenChange={(open) => { if (!open) setEditTarget(null) }}
+        size="lg"
+        title={`Edit ${editTarget?.number ?? ''}`}
+        description="Update invoice header details. Totals recalculate when discount or GST changes."
+        footer={
+          <DialogFooter className="flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving}>
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
+            </Button>
+          </DialogFooter>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          {editError ? (
+            <div className="rounded-md border border-danger-200 bg-danger-50 px-3 py-2 text-xs text-danger-700">{editError}</div>
+          ) : null}
+          <Field label="Customer *">
+            <Input value={editForm.customer} onChange={(e) => setEditForm((f) => ({ ...f, customer: e.target.value }))} />
+          </Field>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="Email"><Input type="email" value={editForm.customerEmail} onChange={(e) => setEditForm((f) => ({ ...f, customerEmail: e.target.value }))} /></Field>
+            <Field label="Phone"><Input value={editForm.customerPhone} onChange={(e) => setEditForm((f) => ({ ...f, customerPhone: e.target.value }))} /></Field>
+            <Field label="City"><Input value={editForm.customerCity} onChange={(e) => setEditForm((f) => ({ ...f, customerCity: e.target.value }))} /></Field>
+            <Field label="State"><Input value={editForm.customerState} onChange={(e) => setEditForm((f) => ({ ...f, customerState: e.target.value }))} /></Field>
+            <Field label="PIN code"><Input value={editForm.customerPincode} onChange={(e) => setEditForm((f) => ({ ...f, customerPincode: e.target.value }))} /></Field>
+            <Field label="Buyer GSTIN"><Input value={editForm.buyerGstin} onChange={(e) => setEditForm((f) => ({ ...f, buyerGstin: e.target.value }))} placeholder="e.g. 27AAAAA0000A1Z5" /></Field>
+          </div>
+          <Field label="Address"><Input value={editForm.customerAddress} onChange={(e) => setEditForm((f) => ({ ...f, customerAddress: e.target.value }))} /></Field>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="Invoice date"><Input type="date" value={editForm.date} onChange={(e) => setEditForm((f) => ({ ...f, date: e.target.value }))} /></Field>
+            <Field label="Due date"><Input type="date" value={editForm.dueDate} onChange={(e) => setEditForm((f) => ({ ...f, dueDate: e.target.value }))} /></Field>
+            <Field label="Invoice status">
+              <Select
+                options={[
+                  { value: 'issued', label: 'Issued' },
+                  { value: 'paid', label: 'Paid' },
+                  { value: 'overdue', label: 'Overdue' },
+                  { value: 'draft', label: 'Draft' },
+                  { value: 'cancelled', label: 'Cancelled' },
+                  { value: 'refunded', label: 'Refunded' },
+                ]}
+                value={editForm.status}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, status: v }))}
+              />
+            </Field>
+            <Field label="Payment status">
+              <Select
+                options={[
+                  { value: 'pending', label: 'Pending' },
+                  { value: 'partial', label: 'Partial' },
+                  { value: 'paid', label: 'Paid' },
+                  { value: 'failed', label: 'Failed' },
+                  { value: 'refunded', label: 'Refunded' },
+                ]}
+                value={editForm.paymentStatus}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, paymentStatus: v }))}
+              />
+            </Field>
+            <Field label="Payment method"><Input value={editForm.paymentMethod} onChange={(e) => setEditForm((f) => ({ ...f, paymentMethod: e.target.value }))} placeholder="Cash / UPI / Card" /></Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Discount (₹)"><Input type="number" min={0} value={editForm.discount} onChange={(e) => setEditForm((f) => ({ ...f, discount: e.target.value }))} /></Field>
+              <Field label="GST (%)"><Input type="number" min={0} step="0.01" value={editForm.gst} onChange={(e) => setEditForm((f) => ({ ...f, gst: e.target.value }))} /></Field>
+            </div>
+          </div>
+        </div>
+      </AppDialog>
     </div>
+  )
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="block space-y-1.5">
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      {children}
+    </label>
   )
 }
 

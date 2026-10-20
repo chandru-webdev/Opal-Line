@@ -169,6 +169,13 @@ async function ensurePostgres(): Promise<string> {
     // No local cluster yet: keep the documented fallback to DATABASE_URL from
     // .env (an external/remote server) instead of hard-failing.
     if (dataMajor == null) {
+      if (!isDev) {
+        const bundledRoot = join(process.resourcesPath, 'pgsql')
+        if (existsSync(bundledRoot) && !existsSync(join(bundledRoot, 'bin', 'initdb.exe'))) {
+          console.error(`[postgres] ${bundledRoot} exists but bin/initdb.exe is missing — incomplete installation.`)
+          logLine('postgres', `bundled pgsql incomplete at ${bundledRoot} (no bin/initdb.exe)`)
+        }
+      }
       console.log('[postgres] No local PostgreSQL found — using DATABASE_URL from .env')
       logLine('postgres', 'no local postgres; using external DATABASE_URL')
       return ''
@@ -505,8 +512,13 @@ function startBackend(envPath: string, managedDbUrl: string | null): Promise<voi
       }
       if (managedDbUrl) backendEnv.DATABASE_URL = managedDbUrl
       if (!backendEnv.DATABASE_URL) {
+        const bundledPgMissing =
+          !isDev && !existsSync(join(process.resourcesPath, 'pgsql', 'bin', 'pg_ctl.exe'))
         dialog.showErrorBox(
           'Database not configured',
+          (bundledPgMissing
+            ? 'The bundled database is missing from this installation — uninstall and reinstall the app.\n\n'
+            : '') +
           'No PostgreSQL database is available.\n\n' +
           'Start the bundled database or set DATABASE_URL in:\n' + envPath,
         )
