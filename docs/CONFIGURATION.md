@@ -34,9 +34,29 @@ PORT=47191
 3. `npm install` (repo root), then:
    ```bash
    npm run db:push      # create/update all tables
-   npm run db:seed      # admin user, roles, settings row
+   npm run db:seed      # demo users, roles, settings row
    ```
 4. `npm run dev` → UI at `http://127.0.0.1:47195`, API at `http://localhost:47191`.
+
+**No PostgreSQL setup needed:** if `backend/.env` has no `DATABASE_URL`,
+`npm run dev` provisions one automatically — a **dev-only** cluster on port
+**47194** under `%APPDATA%/Opal Line Billing Dev` (Windows), fully separate
+from the installed desktop app's cluster (port **47193** under
+`%APPDATA%/Opal Line Billing`). Dev and the desktop app never share users,
+sessions or data, and both stacks can run at once.
+
+**Logins** (each environment bootstraps its own database, so credentials do
+not transfer between machines):
+
+| Setup | Username | Password |
+|---|---|---|
+| Fresh database (first backend start / bootstrap) | `admin` | `Opal@2026` — first login forces a change |
+| After `npm run db:seed` (demo data) | `arjun` | `Opal@2026` |
+
+A teammate's working password will not work on a new clone; use the table
+above. An older `backend/.env` that still points `DATABASE_URL` at
+`127.0.0.1:47193` (the pre-separation shared setup) is migrated to the dev
+cluster automatically on the next `npm run dev`.
 
 Cloud database (Neon example) — just swap the URL and keep `sslmode=require`:
 
@@ -204,6 +224,28 @@ reuse the notifications email (§4).
 Rate lifecycle: *Silver Rate page* or the scheduler updates the rate → all
 product selling prices recompute → matched Shopify variants get the new price
 pushed → a sync-log entry records the change.
+
+The scheduler's run days/time are editable per install from the *Silver Rate
+page → Edit schedule* (any subset of days including weekends, plus a time in
+Asia/Kolkata; default every day at 09:00). Weekend runs are allowed — MCX is
+closed Saturdays and Sundays, so on those days the fetch returns the last
+traded rate or fails (visible in the card's last-fetch status), and manual
+entry remains available.
+
+**One-off scheduled changes** live on the same page (*Scheduled Rate
+Changes* card) behind a guided dialog: set the rate (with ±adjustments and a
+product price-impact preview), pick the date & time (quick picks like
+*Tomorrow 9:00 AM*, *Saturday 10:00 AM*, or any custom instant), add an
+optional short note, and confirm — it is applied automatically at that
+instant, like pressing "Approve & Update Shopify" at that moment. The
+weekend workflow is scheduling Saturday's rate on Friday afternoon. Admin /
+Super Admin only (scheduling is pre-approval), at most 20 queued; queued
+rows show the rate, a countdown and the note, and each can be **edited in
+place** (rate, time, note) or cancelled until it runs. Every outcome is
+written to the activity log ("Scheduled Silver Rate Change Applied", with
+the note). The queue is persisted (settings.scheduled_rate_changes) so
+changes survive a restart, and an overdue change found at startup is applied
+right away.
 
 ## 10. Paths, logging, uploads (desktop/embedded use)
 
@@ -429,6 +471,19 @@ approval and rejection is written to the activity log with the actor's name.
   npm run auth:reset -- someusername    # a different account
   ```
   Do **not** use `npm run db:seed` for this — it truncates every table.
+- **Account lockout (Settings → Security → Login lockout).** After a set
+  number of failed sign-in attempts an account is locked for a set time.
+  Both numbers are **editable from Settings** next to the switch — *Attempts
+  before lockout* (1–50, default 5) and *Lockout duration (minutes)*
+  (1–1440, default 15) — and the values are stored per install in the
+  settings row (`lockout_threshold`, `lockout_duration_minutes`); the server
+  clamps anything out of range, so a bad value can never disable protection
+  or lock accounts out for a week. The product ships with lockout
+  **disabled** (testing default) — failed attempts never lock an account
+  until an Admin / Super Admin switches it on from Settings. Each install
+  owns the setting (dev stack and desktop app are separate), every
+  successful use is audited in the activity log, and switching it off starts
+  counters fresh on the next attempt.
 - E2E tests abort with a clear 429 message when the login budget is exhausted.
 
 ## 14. Quick-reference: full example `backend/.env`

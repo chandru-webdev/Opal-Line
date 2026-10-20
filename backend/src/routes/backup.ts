@@ -13,6 +13,7 @@ import { notifyBackupComplete, notifyLowStock,  notifyBackupFiles } from '../not
 import { sendInvoiceWhatsApp, sendOrderConfirmationWhatsApp, sendShippingUpdateWhatsApp, sendLowStockWhatsApp,  isWhatsAppConfigured } from '../whatsapp'
 import { filterAttachableFiles, MAX_TOTAL_ATTACHMENT_MB } from '../mailAttachments'
 import { routeParam } from '../lib/routeParams'
+import { DEFAULT_REORDER_LEVEL } from '../lib/lowStock'
 
 export const backupRouter = Router()
 
@@ -1250,10 +1251,10 @@ backupRouter.post('/notifications/low-stock', requirePermission('system', 'view'
   if (!client) return res.status(503).json({ error: 'DB unavailable' })
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, stock, reorder_level FROM products WHERE track_inventory != false AND stock IS NOT NULL AND reorder_level IS NOT NULL AND stock <= reorder_level`
+      `SELECT name, sku, stock, reorder_level FROM products WHERE track_inventory != false AND stock IS NOT NULL AND stock <= COALESCE(reorder_level, ${DEFAULT_REORDER_LEVEL})`
     )
     if (products.length === 0) return res.json({ ok: true, message: 'No low stock items', count: 0 })
-    const sent = await notifyLowStock(email, products.map((p: any) => ({ name: p.name, sku: p.sku, stock: Number(p.stock), reorderLevel: Number(p.reorder_level) })))
+    const sent = await notifyLowStock(email, products.map((p: any) => ({ name: p.name, sku: p.sku, stock: Number(p.stock), reorderLevel: Number(p.reorder_level ?? DEFAULT_REORDER_LEVEL) })))
     res.json({ ok: sent, email, count: products.length })
   } catch {
     res.status(500).json({ error: 'Low stock check failed' })

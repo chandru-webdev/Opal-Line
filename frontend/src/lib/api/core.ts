@@ -11,7 +11,9 @@ import type {
   Supplier,
 } from '@/types'
 
-export const API_BASE = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '')
+// `?.` keeps this module importable outside Vite (node --test, SSR) where
+// import.meta.env does not exist; Vite still statically injects the env object.
+export const API_BASE = (import.meta.env?.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '')
 
 let csrfToken: string | null = null
 let csrfTokenTime: number = 0

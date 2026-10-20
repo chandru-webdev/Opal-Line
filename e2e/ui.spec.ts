@@ -98,3 +98,23 @@ test('customers page shows the PII-recovery tools', async ({ page }) => {
   // The Sync Customers control must exist regardless of gap state.
   await expect(page.getByRole('button', { name: /Sync Customers/i }).first()).toBeVisible({ timeout: 15000 })
 })
+
+test('dashboard shows error state when API fails', async ({ page }) => {
+  // Mock the dashboard KPIs API to return an error
+  await page.route('**/api/v1/db/dashboard/kpis*', async (route) => {
+    await route.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'Couldn\'t load sales data' }),
+    })
+  })
+
+  await page.goto('/')
+
+  // Wait for dashboard to load and error state to appear
+  await expect(page.getByText('Couldn\'t load sales data')).toBeVisible({ timeout: 15000 })
+  // Verify the empty state is NOT shown
+  await expect(page.getByText('Nothing to report yet')).not.toBeVisible({ timeout: 5000 })
+  // Verify the Retry button is present
+  await expect(page.getByRole('button', { name: /Retry/i })).toBeVisible({ timeout: 5000 })
+})

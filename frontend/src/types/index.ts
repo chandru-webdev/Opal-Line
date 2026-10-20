@@ -27,6 +27,14 @@ export interface AppSettings {
   lowStockAlerts: boolean
   dailySummary: boolean
   orderImports: boolean
+  /**
+   * Account lockout after repeated failed sign-ins. Off by default
+   * (testing); the attempts/minutes below are editable from
+   * Settings → Security → Login lockout (defaults 5 / 15).
+   */
+  loginLockoutEnabled?: boolean
+  lockoutThreshold?: number
+  lockoutDurationMinutes?: number
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }
@@ -102,6 +110,21 @@ export interface GstReportResult {
   gstin: string
 }
 
+export type PeriodKey = 'today' | 'week' | 'last7' | 'last30' | 'month' | 'year' | 'custom'
+
+/** The custom window chosen for the `custom` period (inclusive `YYYY-MM-DD`). */
+export interface DateRange {
+  start: string
+  end: string
+}
+
+/** Query the dashboard endpoints with one page-wide range. */
+export interface RangeQuery {
+  period: PeriodKey
+  start?: string
+  end?: string
+}
+
 export interface KpiCardData {
   key: string
   label: string
@@ -109,6 +132,8 @@ export interface KpiCardData {
   trend?: Trend
   delta?: string
   deltaLabel?: string
+  /** Label of the range the figures cover, e.g. "This Week". */
+  rangeLabel?: string
   icon: string
   accent: 'purple' | 'green' | 'orange' | 'red' | 'blue' | 'slate'
 }
@@ -168,7 +193,7 @@ export interface ProfitAnalytics {
 }
 
 export interface PaymentStatusSegment {
-  status: 'paid' | 'pending' | 'failed'
+  status: 'paid' | 'pending' | 'failed' | 'refunded'
   label: string
   value: number
   count: number
@@ -189,6 +214,70 @@ export interface ReceivablesAging {
   overdueCount: number
 }
 
+/** One expense category's total within the selected range. */
+export interface ExpenseCategorySlice {
+  category: string
+  amount: number
+  /** Share of the range's total expenses, in percent. */
+  share: number
+}
+
+/** One bucket of the Financial Analytics chart series (aligned with the Sales
+ * Overview buckets). Income is invoiced less returns for the bucket; expense
+ * is recorded expenses for the same bucket. */
+export interface FinancialPoint {
+  key: string
+  label: string
+  date: string
+  income: number
+  expense: number
+}
+
+/** Receivable aging band — days past the effective due date (invoice due date,
+ * or invoice date + 30 days when no due date is set). */
+export interface FinancialAgingBand {
+  key: 'current' | 'over30' | 'over60' | 'over90' | 'over120' | 'older'
+  label: string
+  value: number
+  count: number
+}
+
+/** Point-in-time receivable picture (independent of the selected range):
+ * every non-voided invoice's invoiced total, how much of it has been received
+ * (successful payments), and how the still-open remainder is aging. */
+export interface FinancialReceivable {
+  paid: number
+  outstanding: number
+  invoicedTotal: number
+  invoiceCount: number
+  aging: FinancialAgingBand[]
+}
+
+/** Range keys the Financial Analytics section can request on its own. */
+export type FinancialRangeKey = 'last30' | 'last3m' | 'last6m' | 'last12m' | 'year'
+
+/** Range-aware figures behind the dashboard Financial Analytics section. */
+export interface FinancialSummary {
+  label: string
+  prevLabel: string
+  sales: number
+  returns: number
+  invoiceCount: number
+  netRevenue: number
+  netRevenueDelta: string
+  netRevenueTrend: Trend
+  income: number
+  expense: number
+  expenseCount: number
+  expenseDelta: string
+  expenseTrend: Trend
+  net: number
+  expenses: ExpenseCategorySlice[]
+  topExpense: ExpenseCategorySlice | null
+  points: FinancialPoint[]
+  receivable: FinancialReceivable
+}
+
 export interface AgingInvoice {
   id: string
   number: string
@@ -196,11 +285,17 @@ export interface AgingInvoice {
   date: string | null
   dueDate: string | null
   grandTotal: number
+  /** Unpaid remainder (grand total net of successful payments) — what the bucket counts. */
+  outstanding: number
   paymentStatus: string
   status: string
   daysOverdue: number
 }
 
+/** Preset windows of the dashboard Silver Rate History chart. */
+export type SilverHistoryDays = 7 | 30 | 90
+
+/** One backfilled silver-rate point: `date` is an IST calendar day (YYYY-MM-DD). */
 export interface SilverRatePoint {
   date: string
   rate: number
@@ -269,12 +364,25 @@ export interface SilverRateAutoStatus {
   lastRate: number | null
   lastError: string | null
   fetching: boolean
-  schedule: string
+  /** Configured run days/time for the auto-update (Asia/Kolkata). */
+  schedule: { days: number[]; time: string }
   apiUrlConfigured: boolean
   /** Always true — staff rate changes cannot bypass approval. */
   approvalRequired: boolean
   /** Admin / Super Admin: may apply rate changes and fetch the spot rate. */
   isApprover: boolean
+}
+
+/** A one-off rate change queued from the Silver Rate page (pending only). */
+export interface PendingRateChange {
+  id: string
+  /** New 92.5% silver rate in ₹/gm. */
+  rate: number
+  /** When it applies — ISO-8601 instant (displayed in IST). */
+  applyAt: string
+  requestedBy: string | null
+  /** Optional short reason shown on the queued row ("weekend rate"). */
+  note?: string | null
 }
 
 export interface LowStockItem {
@@ -353,6 +461,16 @@ export interface AnalyticsStat {
   value: string
   delta?: string
   trend?: Trend
+  rangeLabel?: string
+  prevLabel?: string
+}
+
+/** Revenue rolled up by product category. */
+export interface TopCategory {
+  category: string
+  qty: number
+  weight: number
+  revenue: number
 }
 
 export interface Product {
@@ -406,6 +524,8 @@ export interface Invoice {
   customerState?: string
   customerPincode?: string
   customerGstin?: string
+  /** DB column name on sales_invoices; the API returns this key. */
+  buyerGstin?: string | null
   customerStateCode?: string
   items: InvoiceItem[]
   silverValue: number
@@ -420,6 +540,7 @@ export interface Invoice {
   paymentId?: string
   status: 'paid' | 'draft' | 'issued' | 'overdue' | 'cancelled' | 'refunded'
   date: string
+  dueDate?: string | null
   /** GST e-invoice fields, present once an IRN has been generated. */
   irn?: string | null
   irnDate?: string | null
@@ -750,7 +871,16 @@ export interface PurchaseOrder {
   items: number
   qty: number
   weight: number
+  /** Line-item subtotal, before GST and discount. */
   value: number
+  /** GST rate in percent (defaults to 3). */
+  gst?: number | null
+  gstAmount?: number | null
+  discount?: number | null
+  /** value + gstAmount − discount. */
+  grandTotal?: number | null
+  notes?: string | null
+  expectedDate?: string | null
   status: 'open' | 'received' | 'cancelled' | 'draft' | 'closed'
   date: string
   lines?: PurchaseOrderItem[]
@@ -1122,3 +1252,4 @@ export interface UpdatePrefsInfo {
   autoInstall: boolean
   showBanner: boolean
 }
+

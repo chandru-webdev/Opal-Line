@@ -512,7 +512,7 @@ export default function InvoiceDetailPage() {
       </div>
 
       <Dialog open={returnOpen} onOpenChange={setReturnOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>Return items — {invoice.number}</DialogTitle>
             <DialogDescription>Choose quantities to return. A credit note is generated automatically.</DialogDescription>

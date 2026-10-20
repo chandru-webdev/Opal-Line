@@ -36,8 +36,12 @@ const statusBadge: Record<User['status'], { label: string; variant: 'success' | 
 }
 
 export default function UsersPage() {
-  const { hasPermission, refresh } = useAuth()
+  const { hasPermission, refresh, currentUser } = useAuth()
   const canEdit = hasPermission('system', 'edit')
+  // Module grants are the super admin's call — the backend enforces this
+  // (requireSuperAdmin); the controls are hidden from other editors so they
+  // are not clickable-then-403.
+  const isSuperAdmin = currentUser?.role === 'Super Admin'
   // Deleting a user or a custom role is a distinct server-side permission
   // (requirePermission('system', 'delete')), so it needs its own gate —
   // otherwise the button is clickable and always fails with 403.
@@ -375,11 +379,11 @@ export default function UsersPage() {
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" disabled={!canEdit} onClick={() => openPerms(row.original)}>
+                  <Button variant="ghost" size="icon-sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openPerms(row.original)}>
                     <Shield className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent>Manage permissions</TooltipContent>
+                <TooltipContent>{isSuperAdmin ? 'Manage permissions' : 'Super admin only'}</TooltipContent>
               </Tooltip>
               {row.original.status === 'active' ? (
                 <Tooltip>
@@ -405,7 +409,7 @@ export default function UsersPage() {
         ),
       },
     ],
-    [canEdit, setStatus],
+    [canEdit, isSuperAdmin, setStatus],
   )
 
   return (
@@ -486,7 +490,7 @@ export default function UsersPage() {
 
         <TabsContent value="roles">
           <div className="flex items-center justify-end pb-1">
-            <Button size="sm" variant="outline" onClick={() => openRoleDialog()} disabled={!canEdit}>
+            <Button size="sm" variant="outline" onClick={() => openRoleDialog()} disabled={!canEdit || !isSuperAdmin}>
               <Plus className="h-4 w-4" /> New Role
             </Button>
           </div>
@@ -523,10 +527,10 @@ export default function UsersPage() {
                     ) : null}
                   </div>
                   <div className="mt-auto flex items-center justify-end gap-2 pt-4">
-                    <Button variant="outline" size="sm" disabled={!canEdit} onClick={() => openRoleDialog(role)}>
+                    <Button variant="outline" size="sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openRoleDialog(role)}>
                       <Pencil className="h-3.5 w-3.5" /> Edit
                     </Button>
-                    <Button variant="ghost" size="sm" disabled={!canEdit} onClick={() => openRoleDialog(role)}>
+                    <Button variant="ghost" size="sm" disabled={!canEdit || !isSuperAdmin} onClick={() => openRoleDialog(role)}>
                       <KeyRound className="h-3.5 w-3.5" /> Permissions
                     </Button>
                     {!role.isSystem ? (
@@ -730,7 +734,7 @@ export default function UsersPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={permsOpen} onOpenChange={setPermsOpen}>        <DialogContent className="max-w-3xl">
+      <Dialog open={permsOpen} onOpenChange={setPermsOpen}>        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Manage Permissions</DialogTitle>
             <DialogDescription>
@@ -757,7 +761,6 @@ export default function UsersPage() {
               </div>
               <PermissionGrid
                 permissions={permsData.overrides ?? emptyPermissions()}
-                base={permsData.rolePermissions}
                 onChange={(next) => setPermsData((p) => (p ? { ...p, overrides: next } : p))}
               />
               <div className="rounded-md border bg-success-50 px-3 py-2">
@@ -789,7 +792,7 @@ export default function UsersPage() {
       </Dialog>
 
       <Dialog open={roleDialogOpen} onOpenChange={setRoleDialogOpen}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>{editingRole ? `Edit Role — ${editingRole.name}` : 'New Role'}</DialogTitle>
             <DialogDescription>
@@ -835,11 +838,9 @@ export default function UsersPage() {
 
 function PermissionGrid({
   permissions,
-  base,
   onChange,
 }: {
   permissions: Permissions
-  base?: Permissions
   onChange: (next: Permissions) => void
 }) {
   const toggle = (moduleKey: string, action: keyof Permissions[string]) => {
@@ -849,9 +850,6 @@ function PermissionGrid({
     next[moduleKey] = cell
     onChange(next)
   }
-
-  const isOverride = (moduleKey: string, action: keyof Permissions[string]) =>
-    base ? Boolean(base[moduleKey]?.[action]) !== Boolean(permissions[moduleKey]?.[action]) : false
 
   return (
     <div className="overflow-hidden rounded-lg border">
@@ -879,12 +877,6 @@ function PermissionGrid({
                         checked={Boolean(permissions[m.key]?.[a.key])}
                         onCheckedChange={() => toggle(m.key, a.key)}
                       />
-                      {isOverride(m.key, a.key) ? (
-                        <span
-                          className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-amber-500 ring-2 ring-background"
-                          title="Overrides role default"
-                        />
-                      ) : null}
                     </span>
                   </div>
                 </td>

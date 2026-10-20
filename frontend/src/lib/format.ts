@@ -30,7 +30,9 @@ export function formatNumber(value: number | null | undefined) {
 }
 
 export function formatWeight(value: number | null | undefined, opts?: { decimals?: number }) {
-  if (value == null || !Number.isFinite(value)) return '—'
+  // A 0 weight is not a real measurement — on imported or quoted items it
+  // means "weight never captured". Show it as unknown rather than "0.00 gm".
+  if (value == null || !Number.isFinite(value) || value === 0) return '—'
   const dec = opts?.decimals ?? 2
   return `${value.toLocaleString('en-IN', {
     minimumFractionDigits: dec,
@@ -72,6 +74,16 @@ export function istDateKey(date: Date | string | null | undefined): string {
 
 export function todayIST(): string {
   return istDateKey(new Date())
+}
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** Chart axis/tooltip label for an IST calendar day: "2026-10-05" → "5 Oct". */
+export function rateDayLabel(isoDay: string): string {
+  const [, m, d] = String(isoDay).split('-')
+  const month = SHORT_MONTHS[Number(m) - 1]
+  if (!month || !d) return String(isoDay)
+  return `${Number(d)} ${month}`
 }
 
 export function formatDate(date: Date | string | null | undefined) {

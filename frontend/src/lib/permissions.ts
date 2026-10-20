@@ -36,6 +36,11 @@ export function moduleForPath(path: string): string {
   return entry?.module ?? 'dashboard'
 }
 
+/** The canonical entry path for a module ('/' for dashboard, '/sales', …). */
+export function pathForModule(moduleKey: string): string {
+  return PATH_MODULE.find((p) => p.module === moduleKey)?.prefix ?? '/'
+}
+
 export function emptyPermissions(): Permissions {
   const out: Permissions = {}
   for (const m of MODULES) out[m.key] = { view: false, create: false, edit: false, delete: false }
@@ -43,6 +48,10 @@ export function emptyPermissions(): Permissions {
 }
 
 export function can(perms: Permissions | null | undefined, moduleKey: string, action: keyof ModulePermission): boolean {
+  // '*' is the full-access marker the auth provider sets for Super Admin when
+  // the permissions API is unreachable; without it the fallback locked the
+  // super admin out of every module instead of granting them.
+  if (perms?.['*']?.[action]) return true
   return Boolean(perms?.[moduleKey]?.[action])
 }
 

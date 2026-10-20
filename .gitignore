@@ -59,6 +59,8 @@ backend/uploads/
 
 # Desktop build output
 dist-electron-app/
+pg-binaries.tmp.zip
+pg-tmp/
 
 # Local dev convenience
 start-server.cmd

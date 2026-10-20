@@ -1,5 +1,6 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { resolveClientRange, rangeToQuery } from '@/lib/dashboardRange'
 import {
   ArrowDownRight,
   ArrowUpRight,
@@ -15,10 +16,10 @@ import {
   Gem,
   IndianRupee,
   Landmark,
+  Minus,
   Package,
   PackageX,
   Plus,
-  Printer,
   Repeat,
   ShieldAlert,
   ShoppingBag,
@@ -32,7 +33,6 @@ import {
 } from 'lucide-react'
 import { useAuth } from '@/auth/auth-context'
 import { PageHeader } from '@/components/ui/page-header'
-import { printCurrentPage } from '@/lib/printTemplate'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -40,8 +40,9 @@ import { Badge } from '@/components/ui/badge'
 import { StatCard } from '@/components/ui/stat-card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { FinancialAnalytics } from '@/components/dashboard/financial-analytics'
 import { SalesOverviewChart } from '@/components/charts/sales-overview-chart'
-import { SilverRateChart } from '@/components/charts/silver-rate-chart'
+import { SilverRateHistoryCard } from '@/components/dashboard/silver-rate-history'
 import { PaymentDonutChart } from '@/components/charts/payment-donut-chart'
 import { dbApi } from '@/lib/api'
 import { shopifyApi } from '@/lib/api'
@@ -56,8 +57,11 @@ import type {
   ReceivablesAging,
   SalesOverviewPoint,
   SilverRate,
-  SilverRatePoint,
+  TopCategory,
   TopProduct,
+  PeriodKey,
+  DateRange,
+  RangeQuery,
 } from '@/types'
 import type { ShopifyStatus } from '@/types/shopify'
 import { compactCurrency, formatCurrency, formatDate, formatDateTime, formatPieces, formatWeight } from '@/lib/format'
@@ -108,92 +112,178 @@ const quickActions: { label: string; icon: LucideIcon; path: string; module: str
 
 export default function DashboardPage() {
   const navigate = useNavigate()
-  const [kpis, setKpis] = useState<KpiCardData[]>([])
+  const { currentUser } = useAuth()
+  // Security snapshot is Admin / Super Admin only — the endpoint 403s for
+  // everyone else, so don't even fetch it (and never render the card).
+  const securityAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'Super Admin'
+const [kpis, setKpis] = useState<KpiCardData[]>([])
   const [summary, setSummary] = useState<Record<string, string | number> | null>(null)
   const [salesData, setSalesData] = useState<SalesOverviewPoint[]>([])
   const [topProducts, setTopProducts] = useState<TopProduct[]>([])
+  const [topProductsError, setTopProductsError] = useState<string | null>(null)
+  const [topCategory, setTopCategory] = useState<TopCategory[]>([])
+  const [topCategoryError, setTopCategoryError] = useState<string | null>(null)
   const [paymentStatus, setPaymentStatus] = useState<{ segments: PaymentStatusSegment[]; total: number } | null>(null)
+  const [paymentStatusError, setPaymentStatusError] = useState<string | null>(null)
   const [silverRate, setSilverRate] = useState<SilverRate | null>(null)
-  const [silverHistory, setSilverHistory] = useState<SilverRatePoint[]>([])
   const [lowStock, setLowStock] = useState<LowStockItem[]>([])
   const [activities, setActivities] = useState<Activity[]>([])
-  const [security, setSecurity] = useState<{ failedLogins24h: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
+  const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
+  const [security, setSecurity] = useState<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> } | null>(null)
   const [aging, setAging] = useState<ReceivablesAging | null>(null)
   const [expandedBucket, setExpandedBucket] = useState<AgingBucket['key'] | null>(null)
   const [bucketInvoices, setBucketInvoices] = useState<Partial<Record<AgingBucket['key'], AgingInvoice[] | 'loading'>>>({})
-  const [analytics, setAnalytics] = useState<AnalyticsStat[]>([])
   const [shopifyStatus, setShopifyStatus] = useState<ShopifyStatus | null>(null)
   const [loading, setLoading] = useState(true)
-  const [period, setPeriod] = useState<PeriodKey>('week')
-  const [customRange, setCustomRange] = useState<DateRange>(() => defaultRange())
+  const [period, setPeriod] = useState<PeriodKey>(() => loadStoredRange()?.period ?? 'today')
+  const [customRange, setCustomRange] = useState<DateRange>(() => loadStoredRange()?.range ?? defaultRange())
+  const [kpisError, setKpisError] = useState<string | null>(null)
+  const [dbError, setDbError] = useState<string | null>(null)
 
+  // Persist the page-wide range in sessionStorage: it survives in-app
+  // navigation and a reload, and clears when the app closes.
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(RANGE_STORAGE_KEY, JSON.stringify({ period, range: customRange }))
+    } catch {
+      /* storage unavailable — the range just won't persist */
+    }
+  }, [period, customRange])
+
+  // One range drives every widget here. The non-range widgets (silver rate, low
+  // stock, aging, system status) are fetched alongside and don't change with it.
   useEffect(() => {
     let cancelled = false
-    Promise.all([
-      dbApi.getDashboardKpis().catch(() => []),
-      dbApi.getDashboardSummary().catch(() => ({ totalProducts: 0, activeProducts: 0, totalCustomers: 0, activeCustomers: 0, totalSuppliers: 0, activeSuppliers: 0, totalStockQty: 0, totalStockWeight: 0, todayExpenses: 0, pendingPayments: 0 })),
-      dbApi.getTopProducts().catch(() => []),
-      dbApi.getPaymentStatus().catch(() => ({ segments: [], total: 0 })),
-      dbApi.getSilverRate().catch(() => null),
-      dbApi.getSilverRateHistory().catch(() => []),
-      dbApi.getLowStock().catch(() => []),
-      dbApi.getRecentActivities().catch(() => []),
-      dbApi.getAnalyticsStats().catch(() => []),
-      dbApi.getDashboardSecurity().catch(() => null),
-      dbApi.getReceivablesAging().catch(() => null),
-      shopifyApi.getStatus().catch(() => null),
-    ]).then(([k, s, tp, ps, sr, sh, ls, ac, an, sec, ag, ss]) => {
+    const q = rangeToQuery(period, customRange)
+    const range: RangeQuery = q as RangeQuery
+    Promise.allSettled([
+      dbApi.getDashboardKpis(range),
+      dbApi.getDashboardSummary(range),
+      dbApi.getSalesOverview(range),
+      dbApi.getTopProducts(range),
+      dbApi.getTopCategory(range),
+      dbApi.getPaymentStatus(range),
+      dbApi.getSilverRate(),
+      dbApi.getLowStock(),
+      dbApi.getRecentActivities(range),
+      dbApi.getAnalyticsStats(range),
+      securityAdmin ? dbApi.getDashboardSecurity(range) : Promise.resolve(null),
+      dbApi.getReceivablesAging(),
+      shopifyApi.getStatus(),
+    ]).then((results) => {
       if (cancelled) return
-      setKpis(k)
-      setSummary(s)
-      setTopProducts(tp)
-      setPaymentStatus(ps)
-      setSilverRate(sr)
-      setSilverHistory(sh)
-      setLowStock(ls)
-      setActivities(ac)
-      setAnalytics(an)
-      setSecurity(sec)
-      setAging(ag)
-      setShopifyStatus(ss)
+      const kpisResult = results[0]
+      const summaryResult = results[1]
+      const salesOverviewResult = results[2]
+      const topProductsResult = results[3]
+      const topCategoryResult = results[4]
+      const paymentStatusResult = results[5]
+      const silverRateResult = results[6]
+      const lowStockResult = results[7]
+      const activitiesResult = results[8]
+      const analyticsResult = results[9]
+      const securityResult = results[10]
+      const agingResult = results[11]
+      const shopifyStatusResult = results[12]
+
+      // Helper: if fulfilled, return value; if rejected, log error and return default
+      const safe = (result: PromiseSettledResult<any>): any => {
+        if (result.status === 'fulfilled') return result.value
+        console.error('Dashboard API error:', result.reason)
+        return {}
+      }
+
+      // KPIs: fulfilled → real data, rejected → error state
+      const kpis = kpisResult.status === 'fulfilled' ? kpisResult.value : []
+      const kpisError = kpisResult.status === 'rejected' ? 'Couldn\'t load sales data' : null
+
+      // Summary
+      const summary = safe(summaryResult)
+      // Ensure default values when error
+      const safeSummary = {
+        totalProducts: summary.totalProducts ?? 0,
+        activeProducts: summary.activeProducts ?? 0,
+        totalCustomers: summary.totalCustomers ?? 0,
+        activeCustomers: summary.activeCustomers ?? 0,
+        totalSuppliers: summary.totalSuppliers ?? 0,
+        activeSuppliers: summary.activeSuppliers ?? 0,
+        totalStockQty: summary.totalStockQty ?? 0,
+        totalStockWeight: summary.totalStockWeight ?? 0,
+        todayExpenses: summary.todayExpenses ?? 0,
+        rangeExpenses: summary.rangeExpenses ?? 0,
+        pendingPayments: summary.pendingPayments ?? 0,
+        totalOrders: summary.totalOrders ?? 0,
+        totalInvoices: summary.totalInvoices ?? 0,
+      }
+
+      // Sales Overview
+      const salesData = salesOverviewResult.status === 'fulfilled' ? salesOverviewResult.value : []
+
+      // Top Products
+      const topProducts = topProductsResult.status === 'fulfilled' ? topProductsResult.value : []
+      const topProductsError = topProductsResult.status === 'rejected' ? 'Couldn\'t load top products' : null
+
+      // Top Category
+      const topCategory = topCategoryResult.status === 'fulfilled' ? topCategoryResult.value : []
+      const topCategoryError = topCategoryResult.status === 'rejected' ? 'Couldn\'t load category sales' : null
+
+      // Payment Status
+      const paymentStatus = paymentStatusResult.status === 'fulfilled' ? paymentStatusResult.value : { segments: [], total: 0 }
+      const paymentStatusError = paymentStatusResult.status === 'rejected' ? 'Couldn\'t load payment status' : null
+
+      // Silver Rate
+      const silverRate = silverRateResult.status === 'fulfilled' ? silverRateResult.value : null
+
+      // Low Stock
+      const lowStock = lowStockResult.status === 'fulfilled' ? lowStockResult.value : []
+
+      // Activities
+      const activities = activitiesResult.status === 'fulfilled' ? activitiesResult.value : []
+
+      // Analytics
+      const analytics = analyticsResult.status === 'fulfilled' ? analyticsResult.value : []
+
+      // Security
+      const security = securityResult.status === 'fulfilled' ? securityResult.value : null
+
+      // Aging
+      const aging = agingResult.status === 'fulfilled' ? agingResult.value : null
+
+      // Shopify Status
+      const shopifyStatus = shopifyStatusResult.status === 'fulfilled' ? shopifyStatusResult.value : null
+
+      setKpis(kpis)
+      setKpisError(kpisError ?? null)
+      setSummary(safeSummary)
+      setSalesData(salesData)
+      setTopProducts(topProducts)
+      setTopProductsError(topProductsError ?? null)
+      setTopCategory(topCategory)
+      setTopCategoryError(topCategoryError ?? null)
+      setPaymentStatus(paymentStatus)
+      setPaymentStatusError(paymentStatusError ?? null)
+      setSilverRate(silverRate)
+      setLowStock(lowStock)
+      setActivities(activities)
+      setAnalytics(analytics)
+      setSecurity(security)
+      setAging(aging)
+      setShopifyStatus(shopifyStatus)
+      // If critical widgets (KPIs or summary) had errors, mark DB as unreachable
+      if (kpisResult.status === 'rejected' || summaryResult.status === 'rejected') {
+        setDbError('Database not reachable')
+      } else {
+        setDbError(null)
+      }
       setLoading(false)
-    }).catch(() => {
+    }).catch((err) => {
       if (!cancelled) setLoading(false)
+      console.error('Dashboard critical error:', err)
     })
     return () => {
       cancelled = true
     }
-  }, [])
-
-  useEffect(() => {
-    let cancelled = false
-    const request =
-      period === 'custom' ? dbApi.getSalesOverview('custom', customRange) : dbApi.getSalesOverview(period)
-    request
-      .then((data) => {
-        if (!cancelled) setSalesData(data)
-      })
-      .catch(() => {
-        if (!cancelled) setSalesData([])
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [period, customRange])
-
-  // Print the dashboard as a standalone snapshot: a print-scoped stylesheet
-  // (index.css) unwraps the app shell while the "print-dashboard" body class
-  // is present. printCurrentPage resolves when the dialog/silent job is done
-  // (the desktop app prints to the default printer with no dialog), then the
-  // class comes off again.
-  const printDashboard = async () => {
-    document.body.classList.add('print-dashboard')
-    try {
-      await printCurrentPage()
-    } finally {
-      document.body.classList.remove('print-dashboard')
-    }
-  }
+  }, [period, customRange, securityAdmin])
 
   // Receivables aging drill-down: lazily fetch (and cache) the invoices behind
   // a bucket the first time it is expanded.
@@ -218,10 +308,6 @@ export default function DashboardPage() {
         subtitle="Here's what's happening with your ecommerce business today."
         actions={
           <div className="no-print flex items-center gap-2">
-            <Button variant="outline" size="sm" className="gap-1.5" onClick={printDashboard}>
-              <Printer className="h-3.5 w-3.5" />
-              Print / PDF
-            </Button>
             <PeriodSelect
               value={period}
               onChange={setPeriod}
@@ -237,78 +323,142 @@ export default function DashboardPage() {
       <div className="hidden print:block">
         <h1 className="text-lg font-bold text-foreground">Opal Line Billing — Dashboard</h1>
         <p className="text-xs text-muted-foreground">
-          Generated {new Date().toLocaleString('en-IN')} · {periodRangeLabel(period, customRange)}
+          Generated {new Date().toLocaleString('en-IN')} · {resolveClientRange(period, customRange).rangeText}
         </p>
       </div>
 
                 <ConnectionBanner rate={silverRate?.rate ?? null} shopifyStatus={shopifyStatus} />
 
-      <QuickActions />
+      {dbError ? (
+        <Card className="mb-6">
+          <CardContent>
+            <EmptyState
+              icon={ShieldAlert}
+              title="Database not reachable"
+              description="The dashboard cannot connect to the database. Some data may be stale or unavailable."
+            />
+          </CardContent>
+        </Card>
+      ) : (
+        <QuickActions />
+      )}
 
       {loading ? (
         <DashboardSkeleton />
       ) : (
         <>
-          {kpis.length > 0 ? (
-            <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
-              {kpis.map((kpi) => (
-                <StatCard
-                  key={kpi.key}
-                  icon={kpiIcons[kpi.icon] ?? Banknote}
-                  title={kpi.label}
-                  value={kpi.value}
-                  trend={kpi.trend}
-                  delta={kpi.delta}
-                  support={kpi.deltaLabel}
-                  accent={kpi.accent as 'purple'}
-                />
-              ))}
-            </div>
-          ) : (
-            <Card>
-              <CardContent>
-                <EmptyState
-                  icon={TrendingUp}
-                  title="Nothing to report yet"
-                  description="Add products, set today's silver rate or create your first invoice — the dashboard fills up as you work."
-                  action={
-                    <Button size="sm" variant="soft-primary" onClick={() => navigate('/inventory/products')}>
-                      Add Products
-                    </Button>
-                  }
-                />
-              </CardContent>
-            </Card>
-          )}
+{kpisError ? (
+              <Card>
+                <CardContent>
+                  <EmptyState
+                    icon={ShieldAlert}
+                    title="Couldn't load sales data"
+                    description="There was an error fetching the dashboard data. Please try again."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                        Retry
+                      </Button>
+                    }
+                  />
+                </CardContent>
+              </Card>
+            ) : (kpis.length > 0 ? (
+              <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+                {kpis.map((kpi) => (
+                  <StatCard
+                    key={kpi.key}
+                    icon={kpiIcons[kpi.icon] ?? Banknote}
+                    title={kpi.label}
+                    value={kpi.value}
+                    trend={kpi.trend}
+                    delta={kpi.delta}
+                    deltaLabel={kpi.deltaLabel}
+                    support={kpi.rangeLabel}
+                    accent={kpi.accent as 'purple'}
+                  />
+                ))}
+              </div>
+            ) : (
+              <Card>
+                <CardContent>
+                  <EmptyState
+                    icon={TrendingUp}
+                    title="Nothing to report yet"
+                    description="Add products, set today's silver rate or create your first invoice — the dashboard fills up as you work."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/inventory/products')}>
+                        Add Products
+                      </Button>
+                    }
+                  />
+                </CardContent>
+              </Card>
+            ))}
 
           {summary ? <OperationalStrip summary={summary} /> : null}
+
+          {/* Self-fetching: independent of the page-wide range above. */}
+          <FinancialAnalytics />
 
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Sales Overview</CardTitle>
-                <PeriodSelect
-                  value={period}
-                  onChange={setPeriod}
-                  range={customRange}
-                  onRangeChange={setCustomRange}
-                  variant="pill"
-                />
+                <div>
+                  <CardTitle className="text-sm">Sales Overview</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">{resolveClientRange(period, customRange).rangeText}</p>
+                </div>
               </CardHeader>
               <CardContent>
-                <SalesOverviewChart data={salesData} />
+                {salesData.length > 0 ? (
+                  <SalesOverviewChart data={salesData} />
+                ) : summary && Number(summary.totalOrders ?? 0) === 0 ? (
+                  <EmptyState
+                    icon={ShoppingBag}
+                    title="No orders imported yet"
+                    description="Run Orders Sync to import your paid Shopify orders — invoices and sales will appear here automatically."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/shopify/orders')}>
+                        Run Orders Sync
+                      </Button>
+                    }
+                  />
+                ) : (
+                  <EmptyState
+                    icon={TrendingUp}
+                    title="No sales in this period"
+                    description="There were no sales in the selected period. Try a wider date range."
+                  />
+                )}
               </CardContent>
             </Card>
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Top Selling Products</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Best sellers by revenue</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
               </CardHeader>
               <CardContent className="p-0">
-                {topProducts.length > 0 ? (
+                {topProductsError ? (
+              <Card>
+                <CardContent>
+                  <EmptyState
+                    icon={ShieldAlert}
+                    title="Couldn't load top products"
+                    description="There was an error fetching top selling products. Please try again."
+                    action={
+                      <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                        Retry
+                      </Button>
+                    }
+                  />
+                </CardContent>
+              </Card>
+            ) : (topProducts.length > 0 ? (
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -353,50 +503,69 @@ export default function DashboardPage() {
                       </Button>
                     }
                   />
-                )}
+                ))}
               </CardContent>
             </Card>
 
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Payment Status</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Payment Status</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Invoices grouped by payment state</p>
+                </div>
                 <Badge variant="muted" className="text-[10px]">{formatCurrency(paymentStatus?.total ?? 0, { compact: true })}</Badge>
               </CardHeader>
               <CardContent>
-                {paymentStatus && paymentStatus.total > 0 ? (
-                  <>
-                    <PaymentDonutChart data={paymentStatus.segments} centerTotal={paymentStatus.total} />
-                    <div className="mt-2 space-y-1.5">
-                      {paymentStatus.segments.map((s) => (
-                        <div key={s.status} className="flex items-center gap-2 text-[12px]">
-                          <span
-                            className={cn(
-                              'h-2 w-2 rounded-full',
-                              s.status === 'paid' && 'bg-success',
-                              s.status === 'pending' && 'bg-warning',
-                              s.status === 'failed' && 'bg-destructive',
-                            )}
-                          />
-                          <span className="text-muted-foreground">{s.label}</span>
-                          <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(s.value)}</span>
-                          <span className="w-9 text-right tabular-nums text-muted-foreground">
-                            {paymentStatus.total > 0 ? `${Math.round((s.value / paymentStatus.total) * 100)}%` : '0%'}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                    <Button variant="soft-primary" className="mt-4 w-full" size="sm" onClick={() => navigate('/accounts/payments')}>
-                      View Details
-                    </Button>
-                  </>
-                ) : paymentStatus ? (
-                  <EmptyState
-                    icon={IndianRupee}
-                    title="No payments yet"
-                    description="Once you record invoices, their paid and pending amounts break down here."
-                  />
-                ) : null}
-              </CardContent>
+                  {paymentStatusError ? (
+                    <Card>
+                      <CardContent>
+                        <EmptyState
+                          icon={ShieldAlert}
+                          title="Couldn't load payment status"
+                          description="There was an error fetching payment status data. Please try again."
+                          action={
+                            <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                              Retry
+                            </Button>
+                          }
+                        />
+                      </CardContent>
+                    </Card>
+                  ) : (paymentStatus && paymentStatus.total > 0 ? (
+                    <>
+                      <PaymentDonutChart data={paymentStatus.segments} centerTotal={paymentStatus.total} />
+                      <div className="mt-2 space-y-1.5">
+                        {paymentStatus.segments.map((s) => (
+                          <div key={s.status} className="flex items-center gap-2 text-[12px]">
+                            <span
+                              className={cn(
+                                'h-2 w-2 rounded-full',
+                                s.status === 'paid' && 'bg-success',
+                                s.status === 'pending' && 'bg-warning',
+                                s.status === 'failed' && 'bg-destructive',
+                                s.status === 'refunded' && 'bg-muted-foreground',
+                              )}
+                            />
+                            <span className="text-muted-foreground">{s.label}</span>
+                            <span className="ml-auto font-semibold tabular-nums text-foreground">{compactCurrency(s.value)}</span>
+                            <span className="w-9 text-right tabular-nums text-muted-foreground">
+                              {paymentStatus.total > 0 ? `${Math.round((s.value / paymentStatus.total) * 100)}%` : '0%'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                      <Button variant="soft-primary" className="mt-4 w-full" size="sm" onClick={() => navigate('/accounts/payments')}>
+                        View Details
+                      </Button>
+                    </>
+                  ) : (paymentStatus ? (
+                    <EmptyState
+                      icon={IndianRupee}
+                      title="No payments yet"
+                      description="Once you record invoices, their paid and pending amounts break down here."
+                    />
+                  ) : null))}
+                </CardContent>
             </Card>
           </div>
 
@@ -404,34 +573,67 @@ export default function DashboardPage() {
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
                 <div>
-                  <CardTitle className="text-sm">Silver Rate History ({silverRate?.purity ?? 92.5})</CardTitle>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">Last 7 days · ₹ / gm</p>
+                  <CardTitle className="text-sm">Top Selling Category</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">Revenue grouped by product category</p>
                 </div>
-                <Badge variant="success" className="text-[10px]">
-                  Today: {silverRate ? `₹${silverRate.rate.toFixed(2)} / gm` : '—'}
-                </Badge>
+                <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/reports/sales')}>
+                  View All <ArrowRight className="h-3.5 w-3.5" />
+                </Button>
               </CardHeader>
               <CardContent>
-                {silverHistory.length > 0 ? (
-                  <SilverRateChart data={silverHistory} />
-                ) : (
+                {topCategoryError ? (
+              <Card>
+                <CardContent>
                   <EmptyState
-                    icon={Tag}
-                    title="No silver rate history"
-                    description="Update today's rate to start the 7-day trend line."
+                    icon={ShieldAlert}
+                    title="Couldn't load category sales"
+                    description="There was an error fetching category sales data. Please try again."
                     action={
-                      <Button size="sm" variant="soft-primary" onClick={() => navigate('/silver-rate')}>
-                        Set Silver Rate
+                      <Button size="sm" variant="soft-primary" onClick={() => window.location.reload()}>
+                        Retry
                       </Button>
                     }
                   />
-                )}
+                </CardContent>
+              </Card>
+            ) : (topCategory.length > 0 ? (
+                  <div className="space-y-3">
+                    {topCategory.map((c) => {
+                      const max = topCategory[0]?.revenue || 1
+                      return (
+                        <div key={c.category} className="space-y-1">
+                          <div className="flex items-center justify-between gap-2 text-[12px]">
+                            <span className="truncate font-medium text-foreground">{c.category}</span>
+                            <span className="shrink-0 font-semibold tabular-nums text-foreground">{compactCurrency(c.revenue)}</span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                            <div className="h-full rounded-full bg-primary-500" style={{ width: `${Math.max(4, Math.round((c.revenue / max) * 100))}%` }} />
+                          </div>
+                          <p className="text-[10.5px] text-muted-foreground">
+                            {formatNumber(c.qty)} pcs · {formatWeight(c.weight)}
+                          </p>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : (
+                  <EmptyState
+                    icon={Tag}
+                    title="No category sales yet"
+                    description="Sales grouped by product category appear here once invoices are raised."
+                  />
+                ))}
               </CardContent>
             </Card>
 
+            <SilverRateHistoryCard onSetRate={() => navigate('/silver-rate')} />
+
             <Card className="xl:col-span-1">
               <CardHeader className="flex-row items-center justify-between space-y-0">
-                <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                <div>
+                  <CardTitle className="text-sm">Low Stock Alert</CardTitle>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">At or below their reorder level</p>
+                </div>
                 <Button variant="ghost" size="sm" className="gap-1 px-2 text-primary" onClick={() => navigate('/inventory/low-stock')}>
                   View All <ArrowRight className="h-3.5 w-3.5" />
                 </Button>
@@ -464,8 +666,8 @@ export default function DashboardPage() {
                         <TableCell className="text-right font-semibold tabular-nums text-red-600 dark:text-red-400">{formatPieces(l.stock)}</TableCell>
                         <TableCell className="text-right tabular-nums text-muted-foreground">{formatPieces(l.reorderLevel)}</TableCell>
                         <TableCell className="text-center">
-                          <Badge variant={l.status === 'critical' ? 'danger' : 'warning'} dot>
-                            {l.status}
+                          <Badge variant={l.stock === 0 || l.status === 'critical' ? 'danger' : 'warning'} dot>
+                            {l.stock === 0 ? 'Out of Stock' : l.status === 'critical' ? 'Critical' : 'Low'}
                           </Badge>
                         </TableCell>
                       </TableRow>
@@ -556,7 +758,10 @@ export default function DashboardPage() {
                                           </p>
                                         </div>
                                         <div className="shrink-0 text-right">
-                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.grandTotal)}</p>
+                                          <p className="font-semibold tabular-nums text-foreground">{compactCurrency(inv.outstanding ?? inv.grandTotal)}</p>
+                                          {inv.outstanding != null && inv.outstanding < inv.grandTotal ? (
+                                            <p className="text-[10.5px] text-muted-foreground">of {compactCurrency(inv.grandTotal)}</p>
+                                          ) : null}
                                           {inv.daysOverdue > 0 ? (
                                             <p className="text-[10.5px] font-medium text-red-600 dark:text-red-400">{inv.daysOverdue}d overdue</p>
                                           ) : (
@@ -591,19 +796,21 @@ export default function DashboardPage() {
               </CardContent>
             </Card>
 
+            {securityAdmin ? (
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security (24h)
+                  <ShieldAlert className="h-4 w-4 text-muted-foreground" /> Security
                 </CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Failed logins and account lockouts</p>
               </CardHeader>
               <CardContent className="space-y-3">
                 {security ? (
                   <>
                     <div className="grid grid-cols-2 gap-3">
                       <div className="rounded-lg border p-3">
-                        <p className="text-2xl font-bold text-foreground">{security.failedLogins24h}</p>
-                        <p className="text-[11px] text-muted-foreground">Failed logins (24h)</p>
+                        <p className="text-2xl font-bold text-foreground">{security.failedLogins}</p>
+                        <p className="text-[11px] text-muted-foreground">Failed logins · {resolveClientRange(period, customRange).rangeText}</p>
                       </div>
                       <div className="rounded-lg border p-3">
                         <p className={`text-2xl font-bold ${security.lockedAccounts > 0 ? 'text-destructive' : 'text-foreground'}`}>{security.lockedAccounts}</p>
@@ -629,10 +836,12 @@ export default function DashboardPage() {
                 )}
               </CardContent>
             </Card>
+            ) : null}
 
             <Card className="xl:col-span-1">
               <CardHeader>
                 <CardTitle className="text-sm">Recent Activities</CardTitle>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </CardHeader>
               <CardContent className="p-0">
                 <div className="relative px-5 pb-5">
@@ -684,11 +893,25 @@ export default function DashboardPage() {
 
 const formatNumber = (v: number) => v.toLocaleString('en-IN')
 
-type PeriodKey = 'today' | 'week' | 'month' | 'year' | 'custom'
+const RANGE_STORAGE_KEY = 'opal-line.dashboard.range'
 
-interface DateRange {
-  start: string
-  end: string
+function loadStoredRange(): { period: PeriodKey; range: DateRange } | null {
+  try {
+    const raw = sessionStorage.getItem(RANGE_STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as { period?: PeriodKey; range?: DateRange }
+    if (!parsed.period || !parsed.range?.start || !parsed.range?.end) return null
+    if (parsed.period === 'custom') {
+      const s = parseISODate(parsed.range.start)
+      const e = parseISODate(parsed.range.end)
+      if (!s || !e || e < s) return null
+      return { period: parsed.period, range: { start: parsed.range.start, end: parsed.range.end } }
+    }
+    const ok = ['today', 'week', 'month', 'year'].includes(parsed.period)
+    return ok ? { period: parsed.period as PeriodKey, range: parsed.range } : null
+  } catch {
+    return null
+  }
 }
 
 const PERIODS: { key: PeriodKey; label: string }[] = [
@@ -888,19 +1111,28 @@ function AnalyticsCard({ stat }: { stat: AnalyticsStat }) {
     <Card className="p-4 shadow-kpi">
       <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{stat.label}</p>
       <p className="mt-1.5 text-base font-bold tabular-nums text-foreground">{stat.value}</p>
-      {stat.trend ? (
+      {stat.delta ? (
         <span
           className={cn(
-            'mt-1 inline-flex items-center gap-0.5 text-[11px] font-semibold',
-            stat.trend === 'up' ? 'text-success-700' : 'text-red-600 dark:text-red-400',
+            'mt-1 flex items-center gap-0.5 text-[11px] font-semibold',
+            stat.trend === 'up' && 'text-success-700',
+            stat.trend === 'down' && 'text-red-600 dark:text-red-400',
+            stat.trend === 'flat' && 'text-muted-foreground',
           )}
         >
-          {stat.trend === 'up' ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
+          {stat.trend === 'up' ? (
+            <ArrowUpRight className="h-3 w-3" />
+          ) : stat.trend === 'down' ? (
+            <ArrowDownRight className="h-3 w-3" />
+          ) : (
+            <Minus className="h-3 w-3" />
+          )}
           {stat.delta}
+          {stat.prevLabel ? <span className="font-normal text-muted-foreground">· {stat.prevLabel}</span> : null}
         </span>
-      ) : (
-        <span className="mt-1 block text-[11px] text-muted-foreground">At current silver rate</span>
-      )}
+      ) : stat.rangeLabel ? (
+        <span className="mt-1 block text-[11px] text-muted-foreground">{stat.rangeLabel}</span>
+      ) : null}
     </Card>
   )
 }
@@ -1025,3 +1257,14 @@ function DashboardSkeleton() {
     </div>
   )
 }
+
+
+
+
+
+
+
+
+
+
+

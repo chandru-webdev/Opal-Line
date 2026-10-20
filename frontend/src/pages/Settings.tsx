@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { CreatableSelect } from '@/components/ui/creatable-select'
 import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -37,6 +38,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   lowStockAlerts: true,
   dailySummary: true,
   orderImports: true,
+  loginLockoutEnabled: false,
+  lockoutThreshold: 5,
+  lockoutDurationMinutes: 15,
   updatedAt: null,
 }
 
@@ -84,6 +88,8 @@ function ComplianceCard() {
         </div>
 
         <Field label="IRN generation mode">
+          {/* Fixed three-option enum on purpose: the mode drives the GST
+              gateway integration — free text here would do nothing. */}
           <Select
             options={[
               { value: 'off', label: 'Off — never generate IRNs' },
@@ -237,14 +243,25 @@ function SettingsContent() {
                   <h3 className="font-semibold text-foreground">Defaults</h3>
                 </div>
                 <Field label="Default Silver Purity">
-                  <Select
+                  {/* CreatableSelect keeps the three common presets but also
+                      accepts any typed purity (e.g. 90, 80, 999) — manual
+                      entry is validated before it is stored. */}
+                  <CreatableSelect
                     options={[
                       { value: '92.5', label: '92.5% (Sterling)' },
                       { value: '95.8', label: '95.8% (Britannia)' },
                       { value: '99.9', label: '99.9% (Fine)' },
                     ]}
                     value={String(settings.defaultPurity)}
-                    onValueChange={(v) => set('defaultPurity', Number(v))}
+                    onValueChange={(v) => {
+                      const n = Number(v)
+                      if (!Number.isFinite(n) || n <= 0 || n > 999.9) {
+                        toast.error('Purity must be a number up to 999.9 (e.g. 90 or 99.9)')
+                        return
+                      }
+                      set('defaultPurity', n)
+                    }}
+                    placeholder="Pick a purity or type any %"
                     className="w-full"
                   />
                 </Field>
@@ -255,13 +272,23 @@ function SettingsContent() {
                   <Input type="number" value={settings.gstRate} onChange={(e) => set('gstRate', Number(e.target.value))} />
                 </Field>
                 <Field label="Currency">
-                  <Select
+                  {/* Presets plus free typing of any 3-letter ISO code — the
+                      code is stored verbatim and used for labels/formatting. */}
+                  <CreatableSelect
                     options={[
                       { value: 'inr', label: 'Indian Rupee (₹)' },
                       { value: 'usd', label: 'US Dollar ($)' },
                     ]}
                     value={settings.currency}
-                    onValueChange={(v) => set('currency', v)}
+                    onValueChange={(v) => {
+                      const code = v.trim().toLowerCase()
+                      if (!/^[a-z]{3}$/.test(code)) {
+                        toast.error('Currency must be a 3-letter ISO code (e.g. inr, usd, aed)')
+                        return
+                      }
+                      set('currency', code)
+                    }}
+                    placeholder="Pick a currency or type any ISO code"
                     className="w-full"
                   />
                 </Field>
@@ -282,6 +309,9 @@ function SettingsContent() {
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Rate Source">
+                  {/* Fixed two-option enum on purpose: both values drive
+                      backend behaviour (the MCX scheduler vs manual entry),
+                      so a free-typed source could never do anything. */}
                   <Select
                     options={[
                       { value: 'mcx', label: 'MCX Mumbai' },
@@ -472,14 +502,87 @@ function SettingRow({ title, description, checked, onCheckedChange }: { title: s
         <p className="text-sm font-medium text-foreground">{title}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
       </div>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      <Switch checked={checked} onCheckedChange={onCheckedChange} aria-label={title} />
     </div>
   )
 }
 
 function SessionSecurityCard() {
-  const { currentUser } = useAuth()
+  const { currentUser, hasPermission } = useAuth()
   const [revoking, setRevoking] = useState(false)
+  // Login lockout is a per-install setting saved straight to settings (there
+  // is no form-wide Save in this card): the switch plus editable
+  // attempts-before-lockout and lockout-minutes values, mirroring the
+  // recovery-password card. Kept as strings while typing so partial input
+  // (an empty box) doesn't fight the controlled input; validated before save.
+  const [lockout, setLockout] = useState(false)
+  const [threshold, setThreshold] = useState('5')
+  const [durationMin, setDurationMin] = useState('15')
+  const [lockoutSaving, setLockoutSaving] = useState(false)
+  const canEdit = hasPermission('system', 'edit')
+
+  useEffect(() => {
+    dbApi.getSettings()
+      .then((row) => {
+        if (!row) return
+        setLockout(row.loginLockoutEnabled === true)
+        if (row.lockoutThreshold != null) setThreshold(String(row.lockoutThreshold))
+        if (row.lockoutDurationMinutes != null) setDurationMin(String(row.lockoutDurationMinutes))
+      })
+      .catch(() => {})
+  }, [])
+
+  // Same bounds the backend clamps to (src/lockout.ts) — the Save button
+  // stays disabled outside them so a stored rule is always intentional.
+  const thresholdNum = Number(threshold)
+  const durationNum = Number(durationMin)
+  const thresholdValid = Number.isInteger(thresholdNum) && thresholdNum >= 1 && thresholdNum <= 50
+  const durationValid = Number.isInteger(durationNum) && durationNum >= 1 && durationNum <= 1440
+  const lockoutRulesValid = thresholdValid && durationValid
+
+  const persistLockout = async (patch: {
+    loginLockoutEnabled?: boolean
+    lockoutThreshold?: number
+    lockoutDurationMinutes?: number
+  }) => {
+    const previous = { enabled: lockout, threshold, minutes: durationMin }
+    // Optimistic apply, rolled back on error (the switch should feel instant).
+    if (patch.loginLockoutEnabled !== undefined) setLockout(patch.loginLockoutEnabled)
+    if (patch.lockoutThreshold !== undefined) setThreshold(String(patch.lockoutThreshold))
+    if (patch.lockoutDurationMinutes !== undefined) setDurationMin(String(patch.lockoutDurationMinutes))
+    setLockoutSaving(true)
+    try {
+      const saved = await dbApi.updateSettings(patch)
+      if (saved) {
+        setLockout(saved.loginLockoutEnabled === true)
+        if (saved.lockoutThreshold != null) setThreshold(String(saved.lockoutThreshold))
+        if (saved.lockoutDurationMinutes != null) setDurationMin(String(saved.lockoutDurationMinutes))
+      }
+      const nextThreshold = saved?.lockoutThreshold ?? patch.lockoutThreshold ?? Number(previous.threshold)
+      const nextMinutes = saved?.lockoutDurationMinutes ?? patch.lockoutDurationMinutes ?? Number(previous.minutes)
+      toast.success(
+        saved?.loginLockoutEnabled === true
+          ? `Login lockout enabled — ${nextThreshold} failed attempts now lock the account for ${nextMinutes} minutes`
+          : 'Login lockout disabled — failed attempts no longer lock accounts',
+      )
+    } catch (err) {
+      setLockout(previous.enabled)
+      setThreshold(previous.threshold)
+      setDurationMin(previous.minutes)
+      toast.error(err instanceof Error ? err.message : 'Could not update the login lockout')
+    } finally {
+      setLockoutSaving(false)
+    }
+  }
+
+  const toggleLockout = (v: boolean) => { void persistLockout({ loginLockoutEnabled: v }) }
+  const saveLockoutRules = () => {
+    if (!lockoutRulesValid) {
+      toast.error('Attempts must be a whole number 1–50 and duration 1–1440 minutes')
+      return
+    }
+    void persistLockout({ lockoutThreshold: thresholdNum, lockoutDurationMinutes: durationNum })
+  }
 
   const revokeOthers = async () => {
     if (
@@ -518,6 +621,61 @@ function SessionSecurityCard() {
             <LogOut className="h-3.5 w-3.5" /> {revoking ? 'Signing out…' : 'Log out other devices'}
           </Button>
         </div>
+        {canEdit ? (
+          <>
+            <SettingRow
+              title="Login lockout"
+              description="After the set number of failed sign-in attempts, block that account for the set time (recorded in the activity log). Off by default while testing — turn it on for production."
+              checked={lockout}
+              onCheckedChange={toggleLockout}
+            />
+            <div className="grid gap-3 rounded-lg border p-4 sm:grid-cols-2">
+              <div className="space-y-1">
+                <Label htmlFor="lockout-attempts">Attempts before lockout</Label>
+                <Input
+                  id="lockout-attempts"
+                  type="number"
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={threshold}
+                  onChange={(e) => setThreshold(e.target.value)}
+                  disabled={lockoutSaving}
+                />
+                {!thresholdValid ? <p className="text-xs text-destructive">Use a whole number from 1 to 50.</p> : null}
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="lockout-minutes">Lockout duration (minutes)</Label>
+                <Input
+                  id="lockout-minutes"
+                  type="number"
+                  min={1}
+                  max={1440}
+                  step={1}
+                  value={durationMin}
+                  onChange={(e) => setDurationMin(e.target.value)}
+                  disabled={lockoutSaving}
+                />
+                {!durationValid ? <p className="text-xs text-destructive">Use a whole number from 1 to 1440.</p> : null}
+              </div>
+              <div className="sm:col-span-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={saveLockoutRules}
+                  disabled={lockoutSaving || !lockoutRulesValid}
+                >
+                  <Save className="h-3.5 w-3.5" /> Save lockout rules
+                </Button>
+              </div>
+            </div>
+          </>
+        ) : null}
+        {lockoutSaving ? (
+          <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Loader2 className="h-3 w-3 animate-spin" /> Saving…
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   )

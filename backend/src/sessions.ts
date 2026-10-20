@@ -210,12 +210,15 @@ export async function getSessionStats(): Promise<{ active: number; totalCreated:
   return { active, totalCreated }
 }
 
-export async function shutdownSessions(): Promise<void> {
+/**
+ * Process-shutdown housekeeping. Deliberately does NOT delete session rows:
+ * sessions are database-backed with a TTL precisely so they survive restarts
+ * (dev-server restarts, app updates). Wiping the table here logged every user
+ * out of every backend instance sharing the database — including the desktop
+ * app when the dev server was restarted — because the browser kept a cookie
+ * whose row no longer existed. Expired rows are removed by the periodic
+ * sweeper above and on-read in getSessionUserId.
+ */
+export function shutdownSessions(): void {
   stopCleanupInterval()
-  try {
-    const { db, schema } = await import('./db/client')
-    if (db) {
-      await db.delete(schema.sessions)
-    }
-  } catch { /* ignore */ }
 }

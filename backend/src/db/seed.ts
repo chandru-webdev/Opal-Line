@@ -30,6 +30,8 @@ import {
   users as userSeed,
 } from './seedData'
 import { defaultRolePermissions } from '../rbac'
+import { describeDatabaseTarget, isDesktopAppDatabase } from '../lib/seedGuard'
+import { sql } from 'drizzle-orm'
 
 const databaseUrl = process.env.DATABASE_URL
 
@@ -38,9 +40,46 @@ if (!databaseUrl) {
   process.exit(1)
 }
 
+// db:seed truncates core tables before inserting demo data. It refuses to run
+// against the desktop app's bundled database, and against any database that
+// already holds data, unless --force (or SEED_FORCE=1) is passed explicitly.
+const force = process.argv.includes('--force') || process.env.SEED_FORCE === '1'
+
+// Always show where we are about to write — never with credentials.
+console.log(`Seed target: ${describeDatabaseTarget(databaseUrl)}`)
+
+if (isDesktopAppDatabase(databaseUrl) && !force) {
+  console.error(
+    'Refusing to seed: this is the desktop app\'s bundled database (127.0.0.1:47193, database opal_line).\n' +
+      'Seeding would truncate real data. Point DATABASE_URL at a dev/scratch database instead,\n' +
+      'or pass --force (or set SEED_FORCE=1) if you really mean to overwrite this one.',
+  )
+  process.exit(1)
+}
+
 async function main() {
   const client = postgres(databaseUrl!, { max: 1 })
   const db = drizzle(client, { schema })
+
+  if (!force) {
+    const occupied: string[] = []
+    const check = async (name: string, rows: Array<{ n: unknown }>) => {
+      const n = Number(rows[0]?.n ?? 0)
+      if (n > 0) occupied.push(`${name} (${n} rows)`)
+    }
+    await check('users', await db.select({ n: sql`count(*)` }).from(schema.users))
+    await check('products', await db.select({ n: sql`count(*)` }).from(schema.products))
+    await check('sales_invoices', await db.select({ n: sql`count(*)` }).from(schema.salesInvoices))
+    if (occupied.length > 0) {
+      console.error(
+        `Refusing to seed: ${describeDatabaseTarget(databaseUrl!)} already contains data:\n` +
+          `    ${occupied.join(', ')}\n` +
+          '    Seeding truncates it. Use a scratch database, or pass --force (or SEED_FORCE=1) to overwrite.',
+      )
+      await client.end()
+      process.exit(1)
+    }
+  }
 
   console.log('Truncating existing data...')
   for (const table of [
@@ -79,7 +118,10 @@ async function main() {
     roleNames.map((name, i) => ({
       id: `ROLE${i + 1}`,
       name,
-      description: `${name} role with default module permissions`,
+      description:
+        name === 'Super Admin'
+          ? 'Full access to every module'
+          : 'No modules by default — a super admin grants access per user',
       permissions: defaultRolePermissions(name),
       isSystem: true,
       createdAt: new Date().toISOString(),
@@ -104,13 +146,15 @@ async function main() {
   await db.insert(schema.auditLogs).values(auditLogSeed)
   await db.insert(schema.activityLogs).values(activityLogSeed)
   await db.insert(schema.syncLogs).values(syncLogSeed)
-  // Seed admin password: never hardcode a real one. Read from env, or generate
-  // a random password and print it once so the first login is possible.
-  const seedAdminPassword = process.env.SEED_ADMIN_PASSWORD?.trim()
-  const defaultPasswordHash = await argon2.hash(seedAdminPassword || `Opal-${randomBytes(6).toString('base64url')}`, { type: argon2.argon2id })
-  if (!seedAdminPassword) {
-    console.log(`Seed admin (arjun) password: ${seedAdminPassword || '(random — set SEED_ADMIN_PASSWORD to choose one)'}`)
-  }
+  // Seed admin password: same deterministic default as the first-run
+  // bootstrap (SEED_ADMIN_PASSWORD ?? 'Opal@2026', documented in
+  // docs/CONFIGURATION.md). An unset variable must NOT fall back to a random
+  // secret: the docs tell fresh setups to run `npm run db:seed`, and a random
+  // fallback replaced the known bootstrap credential with one that was never
+  // printed — "login not working on the other developers' machines".
+  const seedAdminPassword = process.env.SEED_ADMIN_PASSWORD?.trim() || 'Opal@2026'
+  const defaultPasswordHash = await argon2.hash(seedAdminPassword, { type: argon2.argon2id })
+  console.log(`Seed admin (arjun) password: ${seedAdminPassword}${process.env.SEED_ADMIN_PASSWORD?.trim() ? '' : ' (default — set SEED_ADMIN_PASSWORD to override)'}`)
   const tempPasswordHash = await argon2.hash('Temp@' + randomBytes(8).toString('hex'), { type: argon2.argon2id })
   await db.insert(schema.users).values(userSeed.map((u, i) => ({ 
     ...u, 

@@ -230,7 +230,17 @@ export const purchaseOrders = pgTable('purchase_orders', {
   items: integer('items'),
   qty: integer('qty'),
   weight: numericNumber('weight'),
+  /** Line-item subtotal, before GST and discount. */
   value: numericNumber('value'),
+  /** GST rate in percent — defaults to 3 (silver manufacturing). */
+  gst: numericNumber('gst').default(3),
+  gstAmount: numericNumber('gst_amount'),
+  discount: numericNumber('discount').default(0),
+  /** value + gstAmount − discount. */
+  grandTotal: numericNumber('grand_total'),
+  notes: text('notes'),
+  /** When the supplier is expected to deliver. */
+  expectedDate: ts('expected_date'),
   status: text('status'),
   date: ts('date'),
 }, (table) => ({
@@ -718,6 +728,36 @@ export const settings = pgTable('settings', {
   lowStockAlerts: boolean('low_stock_alerts'),
   dailySummary: boolean('daily_summary'),
   orderImports: boolean('order_imports'),
+  /**
+   * Account lockout after repeated failed logins (5 failures / 15 minutes —
+   * see src/lockout.ts). Default off: the product ships with lockout disabled
+   * for testing and it is switched on per install from Settings → Security →
+   * Login lockout. Read on every login attempt; NULL means disabled.
+   */
+  loginLockoutEnabled: boolean('login_lockout_enabled').default(false),
+  /**
+   * How many failed sign-ins inside the window lock the account
+   * (Settings → Security → Login lockout). NULL → shipped default of 5.
+   */
+  lockoutThreshold: integer('lockout_threshold').default(5),
+  /**
+   * Lockout window/length in minutes (Settings → Security → Login lockout).
+   * NULL → shipped default of 15.
+   */
+  lockoutDurationMinutes: integer('lockout_duration_minutes').default(15),
+  /**
+   * Run days/time for the silver-rate auto-update (Silver Rate page →
+   * Edit schedule). JSONB `{ days: [0=Sun…6=Sat], time: 'HH:MM' }` in
+   * Asia/Kolkata; NULL → every day at 09:00 (the original behaviour).
+   */
+  rateSchedule: jsonb('rate_schedule'),
+  /**
+   * One-off rate changes scheduled from the Silver Rate page: an array of
+   * `{ id, rate, applyAt, requestedBy }` (see src/lib/scheduledRate.ts).
+   * Pending entries only — applied/cancelled ones are removed (the activity
+   * log keeps the trail). NULL → nothing scheduled.
+   */
+  scheduledRateChanges: jsonb('scheduled_rate_changes'),
   shopifyStoreUrlEncrypted: text('shopify_store_url_encrypted'),
   shopifyAccessTokenEncrypted: text('shopify_access_token_encrypted'),
   shopifyApiVersion: text('shopify_api_version'),

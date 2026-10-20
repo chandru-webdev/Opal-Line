@@ -6,6 +6,7 @@ import {
   Eye,
   Loader2,
   PackageMinus,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -218,6 +219,49 @@ export default function PurchaseReturnsPage() {
     }
   }
 
+  // Header-only edit: return number, supplier, date. Line items and stock
+  // are driven by the receive/undo lifecycle, not edited here.
+  const [editTarget, setEditTarget] = useState<PurchaseReturn | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
+  const [editError, setEditError] = useState('')
+  const [editForm, setEditForm] = useState({ number: '', supplier: '', date: '' })
+
+  const openEdit = useCallback((row: PurchaseReturn) => {
+    setEditTarget(row)
+    setEditError('')
+    const d = row.date ? new Date(row.date) : null
+    setEditForm({
+      number: row.number ?? '',
+      supplier: row.supplier ?? '',
+      date: d && !Number.isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : '',
+    })
+    setViewReturn(null)
+  }, [setEditTarget, setEditForm, setViewReturn])
+
+  const submitEdit = async () => {
+    if (!editTarget) return
+    if (!editForm.number.trim()) {
+      setEditError('Return number is required')
+      return
+    }
+    setEditSaving(true)
+    setEditError('')
+    try {
+      await dbApi.update('purchase-returns', editTarget.id, {
+        number: editForm.number.trim(),
+        supplier: editForm.supplier.trim(),
+        ...(editForm.date ? { date: new Date(`${editForm.date}T00:00:00`).toISOString() } : {}),
+      })
+      toast.success('Purchase return updated')
+      setEditTarget(null)
+      load()
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : 'Update failed')
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
   const columns = useMemo<ColumnDef<PurchaseReturn>[]>(
     () => [
       {
@@ -272,13 +316,20 @@ export default function PurchaseReturnsPage() {
         id: 'actions',
         header: 'Actions',
         meta: { align: 'right' as const, headerClassName: 'w-24' },
-        cell: ({ row }) => (
-          <div className="flex items-center justify-end gap-0.5">
+        cell: ({ row }) => (          <div className="flex items-center justify-end gap-0.5">
             <TooltipProvider delayDuration={200}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon-sm" onClick={() => setViewReturn(row.original)}>
-                    <Eye className="h-3.5 w-3.5" />
+            <Tooltip>
+              <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-sm" aria-label={`Edit ${row.original.number}`} onClick={() => openEdit(row.original)}>
+                <Pencil className="h-3.5 w-3.5" />
+              </Button>
+              </TooltipTrigger>
+              <TooltipContent>Edit return header</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+              <Button variant="ghost" size="icon-sm" onClick={() => setViewReturn(row.original)}>
+                <Eye className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>View return details</TooltipContent>
@@ -328,7 +379,7 @@ export default function PurchaseReturnsPage() {
         ),
       },
     ],
-    [setReturnStatus],
+    [setReturnStatus, openEdit],
   )
 
   return (
@@ -385,13 +436,13 @@ export default function PurchaseReturnsPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No purchase returns found"
-            onRowClick={(r) => setViewReturn(r)}
+            onRowClick={setViewReturn}
           />
         </CardContent>
       </Card>
 
       <Dialog open={viewReturn !== null} onOpenChange={(open) => { if (!open) setViewReturn(null) }}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent size="2xl">
           <DialogHeader>
             <DialogTitle>Return {viewReturn?.number}</DialogTitle>
             <DialogDescription>{viewReturn ? formatDate(viewReturn.date) : ''}</DialogDescription>
@@ -451,7 +502,7 @@ export default function PurchaseReturnsPage() {
       </Dialog>
 
       <Dialog open={formOpen} onOpenChange={setFormOpen}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Record Purchase Return</DialogTitle>
             <DialogDescription>
@@ -567,6 +618,47 @@ export default function PurchaseReturnsPage() {
             <Button onClick={submit} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
               Record return
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Return {editTarget?.number ?? ''}</DialogTitle>
+            <DialogDescription>
+              Correct the return number, supplier or date. Line items stay as recorded — receive/undo controls the stock.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Return number">
+                <Input value={editForm.number} onChange={(e) => setEditForm((f) => ({ ...f, number: e.target.value }))} />
+              </Field>
+              <Field label="Supplier">
+                <Select
+                  options={[
+                    { value: '', label: 'Select supplier…' },
+                    ...suppliers.map((s) => ({ value: s.name, label: s.name })),
+                    ...(editForm.supplier && !suppliers.some((s) => s.name === editForm.supplier)
+                      ? [{ value: editForm.supplier, label: editForm.supplier }]
+                      : []),
+                  ]}
+                  value={editForm.supplier}
+                  onValueChange={(v) => setEditForm((f) => ({ ...f, supplier: v }))}
+                />
+              </Field>
+            </div>
+            <Field label="Date">
+              <Input type="date" value={editForm.date} onChange={(e) => setEditForm((f) => ({ ...f, date: e.target.value }))} />
+            </Field>
+            {editError ? <p className="text-sm text-red-600 dark:text-red-400">{editError}</p> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving}>
+              {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Save changes
             </Button>
           </DialogFooter>
         </DialogContent>

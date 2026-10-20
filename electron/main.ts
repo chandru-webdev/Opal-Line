@@ -17,8 +17,10 @@ let localPostgresStarted = false
 // Dedicated desktop port — deliberately different from the dev backend port
 // Opal Line uses a dedicated port block (47191-47198) chosen to avoid
 // collisions with common software on any machine. The installed app uses
-// 47192/47193, distinct from the dev backend (47191), so the dev server and
-// the installed desktop app can run at the same time.
+// 47192/47193, distinct from the dev stack (backend 47191, its own PostgreSQL
+// on 47194 — see scripts/dev.mjs), so the dev server and the installed
+// desktop app run at the same time without sharing anything (separate
+// clusters, sessions and data dirs — a dev login cannot log the app out).
 const BACKEND_PORT = 47192
 const PG_PORT = 47193
 const isDev = !app.isPackaged
@@ -216,6 +218,15 @@ async function ensurePostgres(): Promise<string> {
     }
   }
 
+  if (!isDev) {
+    const bundledRoot = join(process.resourcesPath, 'pgsql')
+    if (existsSync(bundledRoot) && !existsSync(join(bundledRoot, 'bin', 'initdb.exe'))) {
+      // Distinguish "installer shipped without PostgreSQL" from "binaries got
+      // stripped by AV / a broken install" in the diagnostics.
+      console.error(`[postgres] ${bundledRoot} exists but bin/initdb.exe is missing — incomplete installation.`)
+      logLine('postgres', `bundled pgsql incomplete at ${bundledRoot} (no bin/initdb.exe)`)
+    }
+  }
   console.log('[postgres] No bundled/system PostgreSQL found — using DATABASE_URL from .env')
   logLine('postgres', 'no local postgres; using external DATABASE_URL')
   return ''
@@ -513,8 +524,13 @@ function startBackend(envPath: string, managedDbUrl: string | null): Promise<voi
       }
       if (managedDbUrl) backendEnv.DATABASE_URL = managedDbUrl
       if (!backendEnv.DATABASE_URL) {
+        const bundledPgMissing =
+          !isDev && !existsSync(join(process.resourcesPath, 'pgsql', 'bin', 'pg_ctl.exe'))
         dialog.showErrorBox(
           'Database not configured',
+          (bundledPgMissing
+            ? 'The bundled database is missing from this installation — uninstall and reinstall the app.\n\n'
+            : '') +
           'No PostgreSQL database is available.\n\n' +
           'Start the bundled database or set DATABASE_URL in:\n' + envPath,
         )

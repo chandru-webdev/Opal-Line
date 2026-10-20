@@ -1,4 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
+import { ProductDialog } from '@/components/product-dialog'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -44,6 +45,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import {
   DropdownMenu,
@@ -165,6 +167,8 @@ export default function SalesOrdersPage() {
   const [orders, setOrders] = useState<SalesOrder[]>([])
   const [customers, setCustomers] = useState<Customer[]>([])
   const [products, setProducts] = useState<Product[]>([])
+  // Line key whose "New product…" row opened the product dialog (null = closed).
+  const [newProductLineKey, setNewProductLineKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('')
@@ -175,12 +179,12 @@ export default function SalesOrdersPage() {
       return {}
     }
   })
-  const handleColVis = (v: Record<string, boolean>) => {
+  const handleColVis = useCallback((v: Record<string, boolean>) => {
     setColVis(v)
     try {
       localStorage.setItem('ordervis-cols', JSON.stringify(v))
     } catch { /* ignore */ }
-  }
+  }, [])
 
   // Saved views: {name, query, status} persisted in localStorage
   interface SavedView { name: string; query: string; status: string }
@@ -293,7 +297,7 @@ export default function SalesOrdersPage() {
     setBulkBusy(true)
     try {
       const r = await dbApi.bulkOrderStatus(selectedOrders.map((o) => o.id), status)
-      toast.success(`${r.updated} order(s) updated to ${r.status}`)
+      toast.success(`${r.updated} order(s) updated to ${r.status}${r.invoicesCreated ? ` · ${r.invoicesCreated} invoice(s) created` : ''}`)
       setSelectedOrders([])
       reload()
     } catch (err) {
@@ -989,8 +993,8 @@ export default function SalesOrdersPage() {
             </Button>
           </div>
           <DataTable
-            onRowDoubleClick={(o) => startEdit(o)}
-            onRowClick={(o) => setViewOrder(o)}
+            onRowDoubleClick={startEdit}
+            onRowClick={setViewOrder}
             onSelectionChange={setSelectedOrders}
             columns={columns}
             data={filtered}
@@ -1002,19 +1006,45 @@ export default function SalesOrdersPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-3xl grid-rows-[auto_minmax(0,1fr)_auto] max-h-[92vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>{editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}</DialogTitle>
-            <DialogDescription>
-              {editing
-                ? 'Update the order in the ERP. If syncing is on, Shopify is updated with the note, email and shipping address.'
-                : 'Create an order in the ERP and push it to Shopify. The order is created on Shopify with the same payment status you select below.'}
-            </DialogDescription>
-          </DialogHeader>
-
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="3xl"
+        title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
+        description={
+          editing
+            ? 'Update the order in the ERP. If syncing is on, Shopify is updated with the note, email and shipping address.'
+            : 'Create an order in the ERP and push it to Shopify. The order is created on Shopify with the same payment status you select below.'
+        }
+        footer={
+          created ? (
+            <Button onClick={() => setDialogOpen(false)}>Done</Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>Cancel</Button>
+              <Button onClick={createOrder} disabled={saving}>
+                {saving ? (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin" /> {editing ? 'Saving...' : syncToShopify ? 'Creating & Syncing...' : 'Creating...'}
+                  </>
+                ) : editing ? (
+                  syncToShopify ? (
+                    'Save & Sync to Shopify'
+                  ) : (
+                    'Save Changes'
+                  )
+                ) : syncToShopify ? (
+                  'Create & Sync to Shopify'
+                ) : (
+                  'Create Order'
+                )}
+              </Button>
+            </>
+          )
+        }
+      >
           {created ? (
-            <div className="flex min-h-0 flex-col items-center gap-3 overflow-y-auto py-6 text-center">
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
               <div className="flex h-14 w-14 items-center justify-center rounded-full bg-success-50 text-success-700">
                 <CheckCircle2 className="h-7 w-7" />
               </div>
@@ -1043,13 +1073,10 @@ export default function SalesOrdersPage() {
                   </div>
                 )
               ) : null}
-              <Button className="mt-2" onClick={() => setDialogOpen(false)}>
-                Done
-              </Button>
             </div>
           ) : (
             <>
-              <div className="min-h-0 space-y-5 overflow-y-auto pr-1">
+              <div className="space-y-5">
                 <div>
                   <div className="mb-2 flex items-center justify-between">
                     <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Customer</Label>
@@ -1163,9 +1190,20 @@ export default function SalesOrdersPage() {
                           <SearchableSelect
                             placeholder="Select product"
                             searchPlaceholder="Search products..."
-                            options={products.map((p) => ({ value: p.id, label: p.name, keywords: p.sku, subtitle: p.sku }))}
+                            options={[
+                              ...products.map((p) => ({ value: p.id, label: p.name, keywords: p.sku, subtitle: p.sku })),
+                              { value: '__new_product__', label: 'New product…', subtitle: 'Add it without leaving this order' },
+                            ]}
                             value={li.productId}
-                            onValueChange={(v) => selectProduct(li.key, v)}
+                            onValueChange={(v) => {
+                              // Manual-entry escape hatch: open the product
+                              // dialog instead of selecting a line.
+                              if (v === '__new_product__') {
+                                setNewProductLineKey(li.key)
+                                return
+                              }
+                              selectProduct(li.key, v)
+                            }}
                           />
                         </div>
                         <div className="w-20">
@@ -1291,41 +1329,59 @@ export default function SalesOrdersPage() {
                   </div>
                 ) : null}
               </div>
-
-              <DialogFooter className="mt-4">
-                <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>Cancel</Button>
-                <Button onClick={createOrder} disabled={saving}>
-                  {saving ? (
-                    <>
-                      <RefreshCw className="h-4 w-4 animate-spin" /> {editing ? 'Saving...' : syncToShopify ? 'Creating & Syncing...' : 'Creating...'}
-                    </>
-                  ) : editing ? (
-                    syncToShopify ? (
-                      'Save & Sync to Shopify'
-                    ) : (
-                      'Save Changes'
-                    )
-                  ) : syncToShopify ? (
-                    'Create & Sync to Shopify'
-                  ) : (
-                    'Create Order'
-                  )}
-                </Button>
-              </DialogFooter>
             </>
           )}
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
-      <Dialog open={viewOrder !== null} onOpenChange={(open) => { if (!open) setViewOrder(null) }}>
-        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-2xl flex-col gap-0 overflow-visible p-0 print-dialog">
-          <DialogHeader className="shrink-0 space-y-1.5 border-b border-border/60 px-5 py-4 pr-12">
-            <DialogTitle>Order {viewOrder?.shopifyId ?? ''}</DialogTitle>
-            <DialogDescription>
-              {viewOrder ? `${viewOrder.internalId} · placed on ${formatDateTime(viewOrder.date)}` : ''}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <AppDialog
+        open={viewOrder !== null}
+        onOpenChange={(open) => { if (!open) setViewOrder(null) }}
+        size="2xl"
+        className="print-dialog"
+        footerClassName="no-print"
+        title={<>Order {viewOrder?.shopifyId ?? ''}</>}
+        description={viewOrder ? `${viewOrder.internalId} · placed on ${formatDateTime(viewOrder.date)}` : ''}
+        footer={
+          <DialogFooter className="flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setViewOrder(null)}>Close</Button>
+            <Button variant="outline" onClick={() => viewOrder && printOrder(viewOrder)}>
+              <Printer className="h-4 w-4" /> Print / PDF
+            </Button>
+            <Button variant="outline" onClick={() => viewOrder && printFulfilment(viewOrder, 'packing-slip')}>
+              <Package className="h-4 w-4" /> Packing Slip
+            </Button>
+            <Button variant="outline" onClick={() => viewOrder && printFulfilment(viewOrder, 'pick-list')}>
+              <ListChecks className="h-4 w-4" /> Pick List
+            </Button>
+            {(() => {
+              const phone = viewOrder?.shippingAddress?.phone || viewOrder?.billingAddress?.phone || customers.find((c) => c.name === viewOrder?.customer)?.phone || ''
+              if (!phone) return null
+              return (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    const digits = phone.replace(/\D/g, '')
+                    const withCc = digits.length === 10 ? '91' + digits : digits
+                    const text = encodeURIComponent(
+                      `Order ${viewOrder?.shopifyId || viewOrder?.internalId}\nCustomer: ${viewOrder?.customer}\nAmount: ₹${Number(viewOrder?.value ?? 0).toLocaleString('en-IN')}\n\n— Opal Line`,
+                    )
+                    window.open(`https://wa.me/${withCc}?text=${text}`, '_blank')
+                  }}
+                >
+                  <MessageCircle className="h-4 w-4" /> WhatsApp
+                </Button>
+              )
+            })()}
+            <Button
+              disabled={Boolean(viewOrder?.invoice) || invoiceSavingId === viewOrder?.id}
+              onClick={() => viewOrder && createInvoiceFor(viewOrder)}
+            >
+              {invoiceSavingId === viewOrder?.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+              {viewOrder?.invoice ? 'Invoice Raised' : 'Create Invoice'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           {viewOrder ? (
             <div className="space-y-2 text-sm">
               {/* Customer contact: prefer the customer record, fall back to
@@ -1422,50 +1478,10 @@ export default function SalesOrdersPage() {
               <OrderTimeline orderId={viewOrder.id} />
             </div>
           ) : null}
-          </div>
-          <DialogFooter className="no-print shrink-0 flex-wrap gap-2 border-t border-border/60 px-5 py-3">
-            <Button variant="outline" onClick={() => setViewOrder(null)}>Close</Button>
-            <Button variant="outline" onClick={() => viewOrder && printOrder(viewOrder)}>
-              <Printer className="h-4 w-4" /> Print / PDF
-            </Button>
-            <Button variant="outline" onClick={() => viewOrder && printFulfilment(viewOrder, 'packing-slip')}>
-              <Package className="h-4 w-4" /> Packing Slip
-            </Button>
-            <Button variant="outline" onClick={() => viewOrder && printFulfilment(viewOrder, 'pick-list')}>
-              <ListChecks className="h-4 w-4" /> Pick List
-            </Button>
-            {(() => {
-              const phone = viewOrder?.shippingAddress?.phone || viewOrder?.billingAddress?.phone || customers.find((c) => c.name === viewOrder?.customer)?.phone || ''
-              if (!phone) return null
-              return (
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    const digits = phone.replace(/\D/g, '')
-                    const withCc = digits.length === 10 ? '91' + digits : digits
-                    const text = encodeURIComponent(
-                      `Order ${viewOrder?.shopifyId || viewOrder?.internalId}\nCustomer: ${viewOrder?.customer}\nAmount: ₹${Number(viewOrder?.value ?? 0).toLocaleString('en-IN')}\n\n— Opal Line`,
-                    )
-                    window.open(`https://wa.me/${withCc}?text=${text}`, '_blank')
-                  }}
-                >
-                  <MessageCircle className="h-4 w-4" /> WhatsApp
-                </Button>
-              )
-            })()}
-            <Button
-              disabled={Boolean(viewOrder?.invoice) || invoiceSavingId === viewOrder?.id}
-              onClick={() => viewOrder && createInvoiceFor(viewOrder)}
-            >
-              {invoiceSavingId === viewOrder?.id ? <RefreshCw className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-              {viewOrder?.invoice ? 'Invoice Raised' : 'Create Invoice'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       <Dialog open={viewDialogOpen} onOpenChange={setViewDialogOpen}>
-        <DialogContent className="max-w-sm">
+        <DialogContent size="sm">
           <DialogHeader>
             <DialogTitle>Save current view</DialogTitle>
             <DialogDescription>
@@ -1484,6 +1500,28 @@ export default function SalesOrdersPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ProductDialog
+        open={newProductLineKey !== null}
+        onOpenChange={(open) => { if (!open) setNewProductLineKey(null) }}
+        mode="add"
+        onSaved={(product) => {
+          const key = newProductLineKey
+          setNewProductLineKey(null)
+          if (!key) return
+          // Wire the new product straight into the line that opened the
+          // dialog (fields taken from the saved product itself, so no
+          // re-fetch has to land first), then refresh the picker list.
+          setLineItems((prev) =>
+            prev.map((li) =>
+              li.key === key
+                ? { ...li, productId: product.id, title: product.name, sku: product.sku ?? li.sku, price: product.sellingPrice ?? li.price }
+                : li,
+            ),
+          )
+          dbApi.getProducts().then(setProducts).catch(() => {})
+        }}
+      />
     </div>
   )
 }

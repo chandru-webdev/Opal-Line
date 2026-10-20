@@ -3,7 +3,7 @@ import { Router, type Response } from 'express'
 import { eq } from 'drizzle-orm'
 import { db, schema } from '../db/client'
 import { MODULES, MODULE_KEYS, computeUserPermissions, defaultRolePermissions, emptyPermissions } from '../rbac'
-import { requirePermission } from '../rbac'
+import { requirePermission, requireSuperAdmin } from '../rbac'
 import { actorFromRequest, recordActivity } from '../activity'
 import { recountCustomerStatsBoth } from '../customerStats'
 import type { Permissions } from '../types'
@@ -73,7 +73,7 @@ rbacRouter.get('/roles', requirePermission('system', 'view'), async (_req, res) 
   }
 })
 
-rbacRouter.post('/roles', requirePermission('system', 'edit'), async (req, res) => {
+rbacRouter.post('/roles', requireSuperAdmin, async (req, res) => {
   if (!requireDb(res)) return
   try {
     const name = String(req.body?.name ?? '').trim()
@@ -92,7 +92,7 @@ rbacRouter.post('/roles', requirePermission('system', 'edit'), async (req, res) 
   }
 })
 
-rbacRouter.patch('/roles/:id', requirePermission('system', 'edit'), async (req, res) => {
+rbacRouter.patch('/roles/:id', requireSuperAdmin, async (req, res) => {
   if (!requireDb(res)) return
   try {
     const [existing] = await db!.select().from(schema.roles).where(eq(schema.roles.id, routeParam(req.params.id))).limit(1)
@@ -174,7 +174,7 @@ rbacRouter.get('/users/:id/permissions', async (req, res) => {
   }
 })
 
-rbacRouter.put('/users/:id/permissions', requirePermission('system', 'edit'), async (req, res) => {
+rbacRouter.put('/users/:id/permissions', requireSuperAdmin, async (req, res) => {
   if (!requireDb(res)) return
   try {
     if (req.userId === routeParam(req.params.id)) {

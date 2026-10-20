@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { Building2, CheckCircle2, Download, Eye, Loader2, PackageCheck, Plus, Search, ShoppingCart, Trash2, Wallet, Weight, XCircle } from 'lucide-react'
+import { Building2, Check, CheckCircle2, Copy, Download, Eye, Loader2, PackageCheck, Pencil, Plus, Save, Search, ShoppingCart, Trash2, Wallet, Weight, XCircle, X } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
@@ -20,32 +19,41 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { dbApi } from '@/lib/api'
+import { toast } from '@/components/ui/confirm'
 import { exportTable } from '@/lib/export'
 import type { Product, PurchaseOrder, PurchaseOrderReceipt, Supplier } from '@/types'
-import { SupplierPicker } from '@/components/ui/supplier-picker'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
 
 /** One editable line on the new-PO form. */
 interface DraftLine {
   sku: string
   product: string
+  /** True when the row was chosen as "Other / type manually". */
+  custom: boolean
   qty: string
   weight: string
   rate: string
+  /** Ticked with the row's green check — counted, totalled and saved. */
+  confirmed: boolean
 }
 
 function emptyLine(): DraftLine {
-  return { sku: '', product: '', qty: '1', weight: '', rate: '' }
+  return { sku: '', product: '', custom: false, qty: '1', weight: '0', rate: '0', confirmed: false }
 }
 
 /** A "custom" option lets a line be typed in when the SKU is not in the catalog. */
 const CUSTOM_SKU = '__custom__'
 
+/** Line total: Qty × Weight (g) × Rate (₹/g) — weight is the per-piece weight. */
 function lineAmount(line: DraftLine): number {
+  const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
   const weight = Number(line.weight) || 0
   const rate = Number(line.rate) || 0
-  return Math.round(weight * rate * 100) / 100
+  return Math.round(qty * weight * rate * 100) / 100
 }
+
+/** All dialog currency: en-IN locale, ₹ symbol, 2 decimals. */
+const inr = (n: number) => n.toLocaleString('en-IN', { style: 'currency', currency: 'INR' })
 
 const statusBadge: Record<PurchaseOrder['status'], { label: string; variant: 'warning' | 'success' | 'info' | 'muted' }> = {
   open: { label: 'Open', variant: 'warning' },
@@ -66,8 +74,11 @@ export default function PurchaseOrdersPage() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({ supplier: '', supplierId: '' })
+  const [form, setForm] = useState({ supplier: '', supplierId: '', date: '', expectedDate: '', gst: '3' })
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
+  const [fieldErrors, setFieldErrors] = useState<{ supplier?: string; date?: string; lines?: string }>({})
+  const [lineErrors, setLineErrors] = useState<Record<number, string>>({})
   const [viewPo, setViewPo] = useState<PurchaseOrder | null>(null)
   const [receipt, setReceipt] = useState<PurchaseOrderReceipt | null>(null)
   const [receiptLoading, setReceiptLoading] = useState(false)
@@ -104,80 +115,207 @@ export default function PurchaseOrdersPage() {
   }, [])
 
   const openDialog = () => {
-    setForm({ supplier: '', supplierId: '' })
+    setEditingId(null)
+    setForm({
+      supplier: '',
+      supplierId: '',
+      date: new Date().toISOString().slice(0, 10),
+      expectedDate: '',
+      gst: '3',
+    })
     setLines([emptyLine()])
     setError('')
+    setFieldErrors({})
+    setLineErrors({})
     setDialogOpen(true)
   }
 
+  // Edit an existing PO — every field is prefilled and saved through the
+  // full-edit endpoint (header fields + lines in one call).
+  const openEdit = useCallback((po: PurchaseOrder) => {
+    setEditingId(po.id)
+    setForm({
+      supplier: po.supplier ?? '',
+      supplierId: po.supplierId ?? '',
+      date: po.date ? po.date.slice(0, 10) : '',
+      expectedDate: po.expectedDate ? po.expectedDate.slice(0, 10) : '',
+      gst: String(po.gst ?? 3),
+    })
+    // Saved lines arrive already "added" — they open confirmed.
+    setLines(
+      (po.lines ?? []).length > 0
+        ? po.lines!.map((l) => ({
+            sku: l.sku ?? '',
+            product: l.product ?? '',
+            custom: !(l.sku ?? '') && !!(l.product ?? ''),
+            qty: String(l.qty ?? 1),
+            weight: l.weight != null ? String(l.weight) : '0',
+            rate: l.rate != null ? String(l.rate) : '0',
+            confirmed: true,
+          }))
+        : [emptyLine()],
+    )
+    setError('')
+    setFieldErrors({})
+    setLineErrors({})
+    setViewPo(null)
+    setDialogOpen(true)
+  }, [])
+
   const pickProduct = (index: number, sku: string) => {
+    setLineErrors({})
     setLines((prev) =>
       prev.map((l, i) => {
         if (i !== index) return l
-        if (sku === CUSTOM_SKU) return { ...l, sku: '' }
+        if (sku === '') return { ...l, sku: '', custom: false, product: '', confirmed: false }
+        if (sku === CUSTOM_SKU) return { ...l, sku: '', custom: true, product: '', confirmed: false }
         const p = products.find((x) => x.sku === sku)
-        return { ...l, sku, product: p?.name ?? l.product, weight: p ? String(p.netWeight ?? '') : l.weight }
+        return { ...l, sku, custom: false, product: p?.name ?? l.product, weight: p ? String(p.netWeight ?? '') : l.weight }
       }),
     )
   }
 
   const setLine = (index: number, patch: Partial<DraftLine>) => {
+    setLineErrors((prev) => {
+      if (!(index in prev)) return prev
+      const next = { ...prev }
+      delete next[index]
+      return next
+    })
     setLines((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)))
   }
 
+  // Green check: a row only joins the "N items added" counter, the summary
+  // and the saved payload once it has been confirmed.
+  const confirmLine = (index: number) => {
+    const line = lines[index]
+    if (line.sku.trim() === '' && line.product.trim() === '') {
+      setLineErrors((prev) => ({ ...prev, [index]: 'Select a product first' }))
+      return
+    }
+    setLineErrors((prev) => {
+      const next = { ...prev }
+      delete next[index]
+      return next
+    })
+    setFieldErrors((prev) => (prev.lines ? { ...prev, lines: undefined } : prev))
+    setLines((prev) => prev.map((l, i) => (i === index ? { ...l, confirmed: !l.confirmed } : l)))
+  }
+
+  const duplicateLine = (index: number) => {
+    setLineErrors({})
+    setLines((prev) => {
+      const next = [...prev]
+      next.splice(index + 1, 0, { ...prev[index], confirmed: false })
+      return next
+    })
+  }
+
   const removeLine = (index: number) => {
+    setLineErrors({})
     setLines((prev) => (prev.length === 1 ? prev : prev.filter((_, i) => i !== index)))
   }
 
+  // Confirmed rows only — the counter, the summary and the saved payload all
+  // agree on what has actually been "added".
   const lineTotals = useMemo(() => {
-    const usable = lines.filter((l) => l.sku.trim() !== '' || l.product.trim() !== '')
+    const added = lines.filter((l) => l.confirmed && (l.sku.trim() !== '' || l.product.trim() !== ''))
     return {
-      count: usable.length,
-      qty: usable.reduce((a, l) => a + (Math.max(1, Math.floor(Number(l.qty) || 1))), 0),
-      weight: Math.round(usable.reduce((a, l) => a + (Number(l.weight) || 0), 0) * 100) / 100,
-      value: Math.round(usable.reduce((a, l) => a + lineAmount(l), 0) * 100) / 100,
+      count: added.length,
+      qty: added.reduce((a, l) => a + (Math.max(1, Math.floor(Number(l.qty) || 1))), 0),
+      weight: Math.round(added.reduce((a, l) => a + (Number(l.qty) || 1) * (Number(l.weight) || 0), 0) * 100) / 100,
+      value: Math.round(added.reduce((a, l) => a + lineAmount(l), 0) * 100) / 100,
     }
   }, [lines])
 
+  // Live GST breakdown — same math as the server (poMoneyTotals). Discount,
+  // notes and status are not part of this form any more.
+  const money = useMemo(() => {
+    const subtotal = lineTotals.value
+    const gstRate = Math.max(0, Number(form.gst) || 0)
+    const gstAmount = Math.round(subtotal * gstRate) / 100
+    const grandTotal = Math.round((subtotal + gstAmount) * 100) / 100
+    return { subtotal, gstRate, gstAmount, grandTotal }
+  }, [lineTotals.value, form.gst])
+
   const submit = async () => {
-    if (!form.supplier) {
-      setError('Select a supplier')
+    // Required: Supplier and Order Date show inline errors; at least one line
+    // must be confirmed with its green check.
+    const nextErrors: { supplier?: string; date?: string; lines?: string } = {}
+    if (!form.supplierId && !form.supplier) nextErrors.supplier = 'Supplier is required'
+    if (!form.date) nextErrors.date = 'Order date is required'
+    if (lineTotals.count === 0) nextErrors.lines = 'Confirm at least one line item'
+    setFieldErrors(nextErrors)
+    if (nextErrors.supplier || nextErrors.date || nextErrors.lines) return
+
+    const gstRate = Math.max(0, Number(form.gst) || 0)
+    if (gstRate > 100) {
+      setError('GST must be between 0 and 100')
       return
     }
-    const usable = lines.filter((l) => l.sku.trim() !== '' || l.product.trim() !== '')
-    if (usable.length === 0) {
-      setError('Add at least one line item')
-      return
-    }
+    const added = lines.filter((l) => l.confirmed && (l.sku.trim() !== '' || l.product.trim() !== ''))
+    const linePayload = added.map((l) => ({
+      product: l.product.trim(),
+      sku: l.sku.trim(),
+      qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+      weight: Number(l.weight) || 0,
+      rate: Number(l.rate) || 0,
+    }))
     setSaving(true)
     setError('')
     try {
-      const count = orders.length + 1
-      const created =       await dbApi.create<PurchaseOrder>('purchase-orders', {
-        number: `PO-${new Date().getFullYear()}-${String(count + 17).padStart(4, '0')}`,
-        supplier: form.supplier || (suppliers.find((s) => s.id === form.supplierId)?.name ?? ''),
-        supplierId: form.supplierId || null,
-        items: lineTotals.count,
-        qty: lineTotals.qty,
-        weight: lineTotals.weight,
-        value: lineTotals.value,
-        status: 'open',
-        date: new Date().toISOString(),
-      })
-      await dbApi.setPurchaseOrderLines(
-        created.id,
-        usable.map((l) => ({
-          product: l.product.trim(),
-          sku: l.sku.trim(),
-          qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
-          weight: Number(l.weight) || 0,
-          rate: Number(l.rate) || 0,
-        })),
-      )
+      // The backend raises (or refreshes) the order's purchase invoice whenever
+      // its lines are saved — surface the invoice number in the success toast.
+      let autoInvoice: string | undefined
+      const wasEditing = Boolean(editingId)
+      if (editingId) {
+        // One call: header fields + replacement lines. Totals (subtotal,
+        // GST amount, grand total) are recomputed server-side. Discount,
+        // notes and status are not sent — the stored values stay untouched.
+        const res = await dbApi.updatePurchaseOrder(editingId, {
+          supplier: form.supplier,
+          supplierId: form.supplierId || null,
+          // Date-only strings are stored as-is (the quotations validUntil
+          // convention) so re-editing round-trips without timezone drift.
+          date: form.date || undefined,
+          expectedDate: form.expectedDate || null,
+          gst: gstRate,
+          lines: linePayload,
+        }) as PurchaseOrder & { autoInvoice?: string }
+        autoInvoice = res.autoInvoice
+      } else {
+        const count = orders.length + 1
+        const created = await dbApi.create<PurchaseOrder>('purchase-orders', {
+          number: `PO-${new Date().getFullYear()}-${String(count + 17).padStart(4, '0')}`,
+          supplier: form.supplier || (suppliers.find((s) => s.id === form.supplierId)?.name ?? ''),
+          supplierId: form.supplierId || null,
+          items: lineTotals.count,
+          qty: lineTotals.qty,
+          weight: lineTotals.weight,
+          value: lineTotals.value,
+          gst: gstRate,
+          expectedDate: form.expectedDate || null,
+          date: form.date || new Date().toISOString().slice(0, 10),
+          status: 'open',
+        })
+        // Lines second: this endpoint recomputes value + GST + grand total
+        // from them, using the gst stored by the create above — and raises
+        // the linked purchase invoice automatically.
+        const linesRes = await dbApi.setPurchaseOrderLines(created.id, linePayload) as PurchaseOrder & { autoInvoice?: string }
+        autoInvoice = linesRes.autoInvoice
+      }
       setDialogOpen(false)
+      setEditingId(null)
       load()
+      if (autoInvoice) {
+        toast.success(
+          wasEditing
+            ? `Purchase order updated — invoice ${autoInvoice} refreshed`
+            : `Purchase order created — purchase invoice ${autoInvoice} raised automatically`,
+        )
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create purchase order')
+      setError(e instanceof Error ? e.message : editingId ? 'Failed to update purchase order' : 'Failed to create purchase order')
     } finally {
       setSaving(false)
     }
@@ -275,6 +413,14 @@ export default function PurchaseOrdersPage() {
                 </TooltipTrigger>
                 <TooltipContent>View PO</TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon-sm" onClick={() => openEdit(row.original)}>
+                    <Pencil className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit PO</TooltipContent>
+              </Tooltip>
               {row.original.status === 'open' && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -310,7 +456,7 @@ export default function PurchaseOrdersPage() {
         ),
       },
     ],
-    [setStatus, navigate, openView],
+    [setStatus, navigate, openView, openEdit],
   )
 
   return (
@@ -372,13 +518,13 @@ export default function PurchaseOrdersPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No purchase orders found"
-            onRowClick={(o) => openView(o)}
+            onRowClick={openView}
           />
         </CardContent>
       </Card>
 
       <Dialog open={viewPo !== null} onOpenChange={(open) => { if (!open) setViewPo(null) }}>
-        <DialogContent className="max-w-md">
+        <DialogContent size="md">
           <DialogHeader>
             <DialogTitle>Purchase Order {viewPo?.number}</DialogTitle>
             <DialogDescription>{viewPo ? formatDate(viewPo.date) : ''}</DialogDescription>
@@ -419,7 +565,42 @@ export default function PurchaseOrdersPage() {
                 </div>
               ) : null}
 
-              <div className="flex justify-between border-t pt-2 font-semibold"><span>Order value</span><span>{formatCurrency(viewPo.value)}</span></div>
+              {/* GST breakdown: stored values with a computed fallback for
+                  rows that predate the GST columns. */}
+              <div className="space-y-1 border-t pt-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Order value (subtotal)</span>
+                  <span className="tabular-nums">{formatCurrency(viewPo.value)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">GST ({viewPo.gst ?? 3}%)</span>
+                  <span className="tabular-nums">
+                    {formatCurrency(viewPo.gstAmount ?? Math.round((viewPo.value ?? 0) * (viewPo.gst ?? 3)) / 100)}
+                  </span>
+                </div>
+                {(viewPo.discount ?? 0) > 0 && (
+                  <div className="flex justify-between">
+                    <span className="text-muted-foreground">Discount</span>
+                    <span className="tabular-nums">− {formatCurrency(viewPo.discount ?? 0)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between font-semibold">
+                  <span>Grand total</span>
+                  <span className="tabular-nums">
+                    {formatCurrency(
+                      viewPo.grandTotal ??
+                        (viewPo.value ?? 0) + (viewPo.gstAmount ?? Math.round((viewPo.value ?? 0) * (viewPo.gst ?? 3)) / 100) - (viewPo.discount ?? 0),
+                    )}
+                  </span>
+                </div>
+              </div>
+              {viewPo.expectedDate && (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Expected delivery</span>
+                  <span>{formatDate(viewPo.expectedDate)}</span>
+                </div>
+              )}
+              {viewPo.notes && <p className="rounded-md bg-muted/50 p-2 text-xs text-muted-foreground">{viewPo.notes}</p>}
             </div>
           )}
 
@@ -471,118 +652,283 @@ export default function PurchaseOrdersPage() {
               </>
             )}
           </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewPo(null)}>Close</Button>
+            <Button onClick={() => viewPo && openEdit(viewPo)}>
+              <Pencil className="h-4 w-4" /> Edit Purchase Order
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New Purchase Order</DialogTitle>
-            <DialogDescription>Raise a purchase order with a supplier for silver raw material.</DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <Field label="Supplier">
-              <SupplierPicker
-                suppliers={suppliers}
+        <DialogContent hideClose size="lg" className="gap-0 p-0 sm:max-w-[500px]">
+          {/* Header — light divider underneath */}
+          <div className="flex items-center justify-between gap-3 border-b border-gray-200 px-5 py-4">
+            <div className="min-w-0">
+              <DialogTitle className="truncate text-[15px] font-bold text-[#2e1065]">
+                {editingId ? `Edit Purchase Order ${orders.find((o) => o.id === editingId)?.number ?? ''}` : 'New Purchase Order'}
+              </DialogTitle>
+              <DialogDescription className="sr-only">
+                {editingId ? 'Update supplier, dates, line items and GST.' : 'Raise a purchase order with a supplier.'}
+              </DialogDescription>
+            </div>
+            <button
+              type="button"
+              aria-label="Close"
+              onClick={() => setDialogOpen(false)}
+              className="rounded-md p-1 text-[#2e1065]/70 transition-colors hover:bg-[#f5f3ff] hover:text-[#2e1065]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="space-y-4 px-5 py-4">
+            <div className="space-y-1.5">
+              <FormLabel required>Supplier</FormLabel>
+              <Select
+                options={[
+                  { value: '', label: 'Select a supplier' },
+                  ...suppliers.map((s) => ({ value: s.id, label: s.name })),
+                ]}
                 value={form.supplierId}
                 onValueChange={(id) => {
                   const s = suppliers.find((x) => x.id === id)
                   setForm((f) => ({ ...f, supplierId: id, supplier: s?.name ?? '' }))
+                  setFieldErrors((e) => ({ ...e, supplier: undefined }))
                 }}
-                onCreateSupplier={(s) => setSuppliers((prev) => [s, ...prev])}
-                placeholder="Select supplier…"
-                searchPlaceholder="Search suppliers by name, contact, phone or city"
-                emptyText="No supplier found"
-                className="w-full"
+                className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
               />
-            </Field>
+              {fieldErrors.supplier ? <p className="text-[12px] text-red-600">{fieldErrors.supplier}</p> : null}
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <FormLabel required>Order Date</FormLabel>
+                <Input
+                  type="date"
+                  value={form.date}
+                  onChange={(e) => {
+                    setForm((f) => ({ ...f, date: e.target.value }))
+                    setFieldErrors((err) => ({ ...err, date: undefined }))
+                  }}
+                  className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                />
+                {fieldErrors.date ? <p className="text-[12px] text-red-600">{fieldErrors.date}</p> : null}
+              </div>
+              <div className="space-y-1.5">
+                <FormLabel>Expected Delivery Date</FormLabel>
+                <Input
+                  type="date"
+                  value={form.expectedDate}
+                  onChange={(e) => setForm((f) => ({ ...f, expectedDate: e.target.value }))}
+                  className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                />
+              </div>
+            </div>
 
             <div>
               <div className="mb-2 flex items-center justify-between">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Line items</p>
-                <Button variant="outline" size="sm" onClick={() => setLines((prev) => [...prev, emptyLine()])}>
-                  <Plus className="h-3.5 w-3.5" /> Add line
-                </Button>
+                <p className="text-[13px] font-semibold text-[#2e1065]">Line Items</p>
+                <span className="text-[12px] text-muted-foreground">
+                  {lineTotals.count} item{lineTotals.count === 1 ? '' : 's'} added
+                </span>
               </div>
-              <div className="overflow-x-auto rounded-md border border-border/60">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-border/60 text-left text-xs uppercase tracking-wide text-muted-foreground">
-                      <th className="min-w-[190px] px-2 py-2 font-medium">Product / SKU</th>
-                      <th className="w-20 px-2 py-2 text-right font-medium">Qty</th>
-                      <th className="w-28 px-2 py-2 text-right font-medium">Weight (gm)</th>
-                      <th className="w-28 px-2 py-2 text-right font-medium">Rate / gm</th>
-                      <th className="w-24 px-2 py-2 text-right font-medium">Amount</th>
-                      <th className="w-10 px-2 py-2"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {lines.map((line, index) => (
-                      <tr key={index} className="border-b border-border/40 last:border-0">
-                        <td className="px-2 py-1.5">
-                          <Select
-                            options={[
-                              { value: '', label: 'Select a product…' },
-                              ...products.map((p) => ({ value: p.sku, label: `${p.name} (${p.sku})` })),
-                              { value: CUSTOM_SKU, label: 'Other / type manually' },
-                            ]}
-                            value={line.sku === '' ? (line.product ? CUSTOM_SKU : '') : line.sku}
-                            onValueChange={(v) => pickProduct(index, v)}
-                            className="h-8 text-xs"
-                          />
+
+              <div className="space-y-2.5">
+                {lines.map((line, index) => {
+                  const amount = lineAmount(line)
+                  return (
+                    <div
+                      key={index}
+                      className={`space-y-2.5 rounded-lg border p-3 transition-colors ${
+                        line.confirmed ? 'border-[#7c3aed]/40 bg-[#f5f3ff]/60' : 'border-gray-200 bg-white'
+                      }`}
+                    >
+                      <div className="space-y-1.5">
+                        <ColLabel>Product</ColLabel>
+                        <Select
+                          options={[
+                            { value: '', label: 'Select product' },
+                            ...products.map((p) => ({ value: p.sku, label: `${p.name} (${p.sku})` })),
+                            { value: CUSTOM_SKU, label: 'Other / type manually' },
+                          ]}
+                          value={line.custom ? CUSTOM_SKU : line.sku}
+                          onValueChange={(v) => pickProduct(index, v)}
+                          className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
+                        />
+                        {line.custom ? (
                           <Input
                             value={line.product}
                             onChange={(e) => setLine(index, { product: e.target.value })}
                             placeholder="Item name / SKU"
-                            className="mt-1 h-7 text-xs"
+                            className="h-9 rounded-lg border border-gray-200 text-[14px] text-[#2e1065]"
                           />
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} className="h-8 text-right text-xs" />
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <Input type="number" min="0" step="0.001" value={line.weight} onChange={(e) => setLine(index, { weight: e.target.value })} className="h-8 text-right text-xs" />
-                        </td>
-                        <td className="px-2 py-1.5">
-                          <Input type="number" min="0" step="0.01" value={line.rate} onChange={(e) => setLine(index, { rate: e.target.value })} className="h-8 text-right text-xs" />
-                        </td>
-                        <td className="px-2 py-1.5 text-right tabular-nums text-xs">{formatCurrency(lineAmount(line))}</td>
-                        <td className="px-2 py-1.5 text-right">
-                          <Button variant="ghost" size="icon-sm" onClick={() => removeLine(index)} aria-label="Remove line">
-                            <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                        ) : null}
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                        <div className="space-y-1.5">
+                          <ColLabel>Qty</ColLabel>
+                          <Input
+                            type="number"
+                            min="1"
+                            value={line.qty}
+                            onChange={(e) => setLine(index, { qty: e.target.value })}
+                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <ColLabel>Weight (g)</ColLabel>
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.001"
+                            value={line.weight}
+                            onChange={(e) => setLine(index, { weight: e.target.value })}
+                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                          />
+                        </div>
+                        <div className="space-y-1.5">
+                          <ColLabel>Rate (₹/g)</ColLabel>
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={line.rate}
+                            onChange={(e) => setLine(index, { rate: e.target.value })}
+                            className="h-9 rounded-lg border border-gray-200 text-right text-[14px] text-[#2e1065]"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex items-end justify-between gap-2">
+                        <div className="space-y-1.5">
+                          <ColLabel>Total</ColLabel>
+                          <p className="text-[14px] font-semibold tabular-nums text-[#2e1065]">{inr(amount)}</p>
+                        </div>
+                        <div className="flex items-center gap-1 pb-1">
+                          <Button
+                            type="button"
+                            size="icon-sm"
+                            variant="ghost"
+                            aria-label={line.confirmed ? 'Unconfirm item' : 'Confirm item'}
+                            onClick={() => confirmLine(index)}
+                            className={line.confirmed ? 'bg-green-600 text-white hover:bg-green-700' : 'text-green-600 hover:bg-green-50'}
+                          >
+                            <Check className="h-3.5 w-3.5" />
                           </Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                          <Button
+                            type="button"
+                            size="icon-sm"
+                            variant="ghost"
+                            aria-label="Duplicate item"
+                            onClick={() => duplicateLine(index)}
+                            className="text-[#7c3aed] hover:bg-[#f5f3ff] hover:text-[#6d28d9]"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </Button>
+                          <Button
+                            type="button"
+                            size="icon-sm"
+                            variant="ghost"
+                            aria-label="Delete item"
+                            onClick={() => removeLine(index)}
+                            className="text-red-600 hover:bg-red-50"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                      {lineErrors[index] ? <p className="text-[12px] text-red-600">{lineErrors[index]}</p> : null}
+                    </div>
+                  )
+                })}
               </div>
-              <p className="mt-1.5 text-right text-xs text-muted-foreground">
-                {lineTotals.count} line(s) · {lineTotals.qty} pcs · {formatWeight(lineTotals.weight)} · {formatCurrency(lineTotals.value)}
-              </p>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setLineErrors({})
+                  setLines((prev) => [...prev, emptyLine()])
+                }}
+                className="mt-2.5 inline-flex items-center gap-1 text-[13px] font-medium text-[#7c3aed] hover:underline"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add Another Item
+              </button>
+              {fieldErrors.lines ? <p className="mt-1 text-[12px] text-red-600">{fieldErrors.lines}</p> : null}
             </div>
-            {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
+
+            {/* Summary — lavender box with the live GST math (poMoneyTotals) */}
+            <div className="space-y-2.5 rounded-lg bg-[#f5f3ff] p-4">
+              <div className="flex items-center justify-between text-[13px]">
+                <span className="text-[#2e1065]/80">Subtotal</span>
+                <span className="font-medium tabular-nums text-[#2e1065]">{inr(money.subtotal)}</span>
+              </div>
+              <div className="flex items-center justify-between text-[13px]">
+                <span className="flex items-center gap-2 text-[#2e1065]/80">
+                  GST %
+                  <Input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.5"
+                    value={form.gst}
+                    onChange={(e) => setForm((f) => ({ ...f, gst: e.target.value }))}
+                    aria-label="GST percent"
+                    className="h-7 w-16 rounded-md border border-gray-200 bg-white px-2 text-right text-[13px] text-[#2e1065]"
+                  />
+                </span>
+                <span className="tabular-nums text-[#2e1065]">{inr(money.gstAmount)}</span>
+              </div>
+              <div className="border-t border-[#2e1065]" />
+              <div className="flex items-center justify-between">
+                <span className="text-[15px] font-bold text-[#2e1065]">Total Amount</span>
+                <span className="text-[17px] font-bold tabular-nums text-[#2e1065]">{inr(money.grandTotal)}</span>
+              </div>
+            </div>
+
+            {error ? <p className="text-[12.5px] text-red-600">{error}</p> : null}
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Create Purchase Order
+
+          {/* Footer — dark indigo divider, right-aligned actions */}
+          <div className="flex items-center justify-end gap-3 border-t border-[#2e1065] px-5 py-3.5">
+            <button
+              type="button"
+              onClick={() => setDialogOpen(false)}
+              className="px-2 py-1.5 text-[13px] font-medium text-[#7c3aed] hover:underline"
+            >
+              × Cancel
+            </button>
+            <Button
+              type="button"
+              onClick={submit}
+              disabled={saving}
+              className="rounded-lg bg-[#7c3aed] px-4 text-[13px] font-medium text-white shadow-sm hover:bg-[#6d28d9]"
+            >
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {editingId ? 'Save Changes' : 'Save as Draft'}
             </Button>
-          </DialogFooter>
+          </div>
         </DialogContent>
       </Dialog>
     </div>
   )
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+/** Compact form label — 12.5px deep indigo, with an optional required star. */
+function FormLabel({ children, required }: { children: React.ReactNode; required?: boolean }) {
   return (
-    <div className="space-y-1.5">
-      <Label className="text-xs text-muted-foreground">{label}</Label>
+    <p className="text-[12.5px] font-medium text-[#2e1065]">
       {children}
-    </div>
+      {required ? <span className="ml-0.5 text-red-500">*</span> : null}
+    </p>
   )
+}
+
+/** Small column label above each line-item input. */
+function ColLabel({ children }: { children: React.ReactNode }) {
+  return <p className="text-[12px] font-medium text-[#2e1065]/80">{children}</p>
 }
 
 function MiniCard({ icon: Icon, label, value, sub, tint }: { icon: React.ComponentType<{ className?: string }>; label: string; value: string; sub?: string; tint: string }) {

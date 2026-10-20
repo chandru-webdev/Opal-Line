@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Loader2, RefreshCw, GripVertical, Receipt, X, History, ExternalLink, MoveRight } from 'lucide-react'
+import { Loader2, RefreshCw, GripVertical, ListChecks, Receipt, Search, X, History, ExternalLink, MoveRight } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { dbApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
@@ -49,6 +50,7 @@ export default function OrderBoard() {
   const [eventsLoading, setEventsLoading] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [bulkBusy, setBulkBusy] = useState(false)
+  const [query, setQuery] = useState('')
   const navigate = useNavigate()
 
   const load = async () => {
@@ -84,24 +86,46 @@ export default function OrderBoard() {
     }
   }
 
+  // Search across order id, customer, invoice number and tags. Filtering
+  // happens before the per-column grouping so empty columns stay visible.
+  const filteredOrders = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return orders
+    return orders.filter((o) =>
+      (o.customer ?? '').toLowerCase().includes(q) ||
+      (o.internalId ?? '').toLowerCase().includes(q) ||
+      (o.shopifyId ?? '').toLowerCase().includes(q) ||
+      (o.invoice ?? '').toLowerCase().includes(q) ||
+      (o.tags ?? '').toLowerCase().includes(q),
+    )
+  }, [orders, query])
+
   const byStatus = useMemo(() => {
     const map = new Map<string, SalesOrder[]>()
     for (const col of COLUMNS) map.set(col.key, [])
-    for (const o of orders) {
+    for (const o of filteredOrders) {
       const key = (COLUMNS.find((c) => c.key === o.status)?.key ?? 'imported') as SalesOrder['status']
       map.get(key)?.push(o)
     }
     return map
-  }, [orders])
+  }, [filteredOrders])
+
+  // Select every order the current search matched — then bulk-move them.
+  const selectMatches = () => setSelected(new Set(filteredOrders.map((o) => o.id)))
 
   const move = async (orderId: string, status: SalesOrder['status']) => {
     const order = orders.find((o) => o.id === orderId)
     if (!order || order.status === status) return
     setMoving(orderId)
     try {
-      await dbApi.updateOrderStatus(orderId, status)
-      setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status } : o)))
-      if (panelOrder?.id === orderId) setPanelOrder((p) => (p ? { ...p, status } : p))
+      const updated = await dbApi.updateOrderStatus(orderId, status)
+      // The freshly raised invoice (if any) beats the pre-update snapshot.
+      const invoice = updated.autoInvoice ?? updated.invoice ?? order.invoice
+      setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, status, invoice } : o)))
+      if (panelOrder?.id === orderId) setPanelOrder((p) => (p ? { ...p, status, invoice } : p))
+      // Receiving the order auto-raised its sales invoice — surface it so the
+      // counter knows a bill now exists without checking Sales Invoices.
+      if (updated.autoInvoice) toast.success(`Invoice ${updated.autoInvoice} created for ${order.internalId ?? order.shopifyId ?? 'order'}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Status update failed')
     } finally {
@@ -140,7 +164,7 @@ export default function OrderBoard() {
     setBulkBusy(true)
     try {
       const r = await dbApi.bulkOrderStatus(ids, status)
-      toast.success(`${r.updated} order(s) moved to ${r.status}`)
+      toast.success(`${r.updated} order(s) moved to ${r.status}${r.invoicesCreated ? ` · ${r.invoicesCreated} invoice(s) created` : ''}`)
       setSelected(new Set())
       await load()
     } catch (err) {
@@ -163,6 +187,26 @@ export default function OrderBoard() {
       />
 
       {error && <p className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-500 dark:text-red-400">{error}</p>}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-[240px] flex-1">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="Search order id, customer, invoice..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="pl-9"
+          />
+        </div>
+        <Button variant="outline" size="sm" onClick={selectMatches} disabled={filteredOrders.length === 0}>
+          <ListChecks className="h-3.5 w-3.5" /> Select all matches ({filteredOrders.length})
+        </Button>
+        {query.trim() && (
+          <span className="text-xs text-muted-foreground">
+            <span className="font-semibold text-foreground">{filteredOrders.length}</span> of {orders.length} orders
+          </span>
+        )}
+      </div>
 
       {selected.size > 0 && (
         <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 p-2">

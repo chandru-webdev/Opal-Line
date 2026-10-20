@@ -603,7 +603,6 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       : ''
 
   return `<!doctype html><html><head><title>${escapeHtml(doc.number)}</title><style>
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
       *{margin:0;padding:0;box-sizing:border-box;}
       body{font-family:${FONTS[c.font]};color:#232733;margin:0;padding:${c.margins.top}mm ${c.margins.right}mm ${c.margins.bottom}mm ${c.margins.left}mm;background:${c.paperTint === 'cream' ? '#fdfbf5' : '#fff'};font-size:${(11 * c.fontScale).toFixed(1)}px;max-width:${pageWidth};}
       .header-banner{background:linear-gradient(135deg, ${c.accent2} 0%, #2a2a45 100%);color:#fff;padding:18px 22px;border-radius:${radius};margin-bottom:18px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 1px 3px rgba(15,23,42,.18);}

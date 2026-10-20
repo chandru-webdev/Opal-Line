@@ -154,12 +154,14 @@ describe('agingBucketFor', () => {
 })
 
 describe('normalizeOrderLines / orderLineTotals', () => {
-  it('totals what was ordered from its lines', () => {
+  it('totals what was ordered as qty × weight × rate (per-piece weight)', () => {
     const lines = normalizeOrderLines([
       { sku: 'AG-1', qty: 2, weight: 100, rate: 50 },
       { sku: 'AG-2', qty: 1, weight: 50, rate: 60 },
     ])
-    assert.deepEqual(orderLineTotals(lines), { items: 2, qty: 3, weight: 150, value: 8000 })
+    // line amounts: 2×100×50 = 10 000 and 1×50×60 = 3 000; header weight is
+    // the total grams: 2×100 + 1×50 = 250.
+    assert.deepEqual(orderLineTotals(lines), { items: 2, qty: 3, weight: 250, value: 13000 })
   })
 
   it('ignores blank lines', () => {

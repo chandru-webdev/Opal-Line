@@ -1,10 +1,12 @@
-import { mkdir, writeFile, readdir, readFile, stat } from 'node:fs/promises'
+import { mkdir, writeFile, readdir, readFile, stat, copyFile, unlink } from 'node:fs/promises'
 import { unlinkSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { desc, eq, gte, isNotNull, lte, ne, sql, and } from 'drizzle-orm'
 import { exportScopeData, backupDirectory } from './routes/backup'
 import { logger } from './logger'
 import { notifyBackupComplete, notifyLowStock, notifyDailySummary } from './notifications'
+import { loadNotificationPrefs, resolveOwnerRecipient } from './notificationPrefs'
 import { db, getRawClient } from './db/client'
 import * as schema from './db/schema'
 import { escapeHtml } from './htmlEscape'
@@ -17,6 +19,41 @@ export const DAILY_SUMMARY_MINUTE = 0
 
 export function autoBackupDirectory(): string {
   return backupDirectory()
+}
+
+/**
+ * A second, human-visible copy of every daily auto backup is written here so
+ * the archives land in plain "local files" (Documents by default) instead of
+ * only the app's hidden data directory.
+ *
+ *  - `AUTO_BACKUP_LOCAL_DIR=/some/path` overrides the destination
+ *  - `AUTO_BACKUP_LOCAL_DIR=off` disables the local copy entirely
+ */
+export function autoBackupLocalDirectory(): string | null {
+  const raw = (process.env.AUTO_BACKUP_LOCAL_DIR ?? '').trim()
+  if (raw === 'off' || raw === 'disabled' || raw === 'false') return null
+  if (raw) return path.resolve(raw)
+  return path.join(os.homedir(), 'Documents', 'Opal Line Backups')
+}
+
+// The local folder is the user's own, but our archives should not pile up
+// forever — keep the newest LOCAL_KEEP of the files WE wrote (the name prefix
+// scopes the prune so nothing else in the folder is ever touched).
+const LOCAL_KEEP = 30
+async function pruneLocalCopies(dir: string): Promise<void> {
+  try {
+    const names = (await readdir(dir)).filter((n) => n.startsWith('auto-backup-full-') && n.endsWith('.json'))
+    if (names.length <= LOCAL_KEEP) return
+    // File names embed an IST timestamp (YYYY-MM-DD-HH-MM-SS) — lexicographic
+    // order is chronological order.
+    const stale = names.sort().slice(0, names.length - LOCAL_KEEP)
+    for (const name of stale) {
+      try { await unlink(path.join(dir, name)) } catch { /* skip */ }
+    }
+    if (stale.length > 0) logger.info({ dir, pruned: stale.length }, 'Pruned old local auto-backup copies')
+  } catch (err) {
+    logger.error({ err, dir }, 'Local auto-backup prune failed')
+  }
 }
 
 const IST_TIMEZONE = 'Asia/Kolkata'
@@ -79,7 +116,10 @@ export async function setBackupEmailEnabled(value: boolean): Promise<void> {
   await db.update(schema.settings).set({ notificationSettings: { ...current, autoBackupEmail: value } }).where(eq(schema.settings.id, 'app'))
 }
 
-async function runAutoBackup(): Promise<void> {
+// Exported so the daily run can be triggered/verified outside the 7 PM
+// scheduler (ops tooling + tests); the scheduler remains the only caller in
+// normal operation.
+export async function runAutoBackup(): Promise<void> {
   const result = await exportScopeData('full')
   if (!result.ok) {
     logger.error({ err: result.error }, 'Auto backup export failed')
@@ -104,6 +144,20 @@ async function runAutoBackup(): Promise<void> {
     }
     logger.info({ file: fileName, tables: Object.keys(result.data).length, encrypted }, 'Auto backup completed')
     await pruneOldBackups()
+
+    // Local-files copy: same archive bytes, dropped into a folder the user
+    // can actually browse (Documents/Opal Line Backups unless overridden).
+    const localDir = autoBackupLocalDirectory()
+    if (localDir) {
+      try {
+        await mkdir(localDir, { recursive: true })
+        await copyFile(path.join(dir, fileName), path.join(localDir, fileName))
+        await pruneLocalCopies(localDir)
+        logger.info({ file: fileName, dir: localDir }, 'Auto backup copied to local folder')
+      } catch (err) {
+        logger.error({ err, dir: localDir }, 'Local auto-backup copy failed')
+      }
+    }
 
     // Off-site push (no-op when BACKUP_OFFSITE_* env vars are absent)
     try {
@@ -187,14 +241,20 @@ function msUntilNextSummary(now = new Date()): number {
   return next.getTime() - now.getTime()
 }
 
-async function runDailySummary(): Promise<void> {
+export async function runDailySummary(): Promise<void> {
   try {
     if (!db) return
     const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
-    if (settingsRow && settingsRow.dailySummary === false) return
-    const recipient = process.env.NOTIFICATION_EMAIL?.trim() || settingsRow?.email?.trim()
+    // Both switches control this email: the Notification Settings toggle and
+    // the legacy Business Settings toggle (kept in sync on write; either can disable).
+    const prefs = await loadNotificationPrefs()
+    if (!prefs.dailySummaryEnabled || (settingsRow && settingsRow.dailySummary === false)) {
+      logger.info('Daily summary email skipped — disabled in notification settings')
+      return
+    }
+    const recipient = resolveOwnerRecipient(prefs, settingsRow?.email)
     if (!recipient) {
-      logger.debug('Daily summary skipped — no NOTIFICATION_EMAIL or settings.email')
+      logger.debug('Daily summary skipped — no recipient address configured')
       return
     }
     const sent = await sendDailySummaryEmail(recipient)
@@ -416,6 +476,8 @@ export async function getAutoBackupStatus(): Promise<{
   nextRunAt: string
   lastBackup: { fileName: string; exportedAt: string | null; sizeBytes: number } | null
   backupCount: number
+  localDir: string | null
+  lastLocalCopy: string | null
 }> {
   const nextRun = new Date()
   nextRun.setHours(AUTO_BACKUP_HOUR, AUTO_BACKUP_MINUTE, 0, 0)
@@ -446,12 +508,26 @@ export async function getAutoBackupStatus(): Promise<{
     lastBackup = files[0] ?? null
   } catch { /* directory missing → no backups yet */ }
 
+  // Newest file in the local-files copy folder (null when the copy is off).
+  let lastLocalCopy: string | null = null
+  const localDir = autoBackupLocalDirectory()
+  if (localDir) {
+    try {
+      const names = (await readdir(localDir))
+        .filter((n) => n.startsWith('auto-backup-full-') && n.endsWith('.json'))
+        .sort()
+      lastLocalCopy = names[names.length - 1] ?? null
+    } catch { /* folder not created yet → no copies */ }
+  }
+
   return {
     enabled: scheduler.armed,
     scheduleLabel: `Daily at ${String(AUTO_BACKUP_HOUR).padStart(2, '0')}:${String(AUTO_BACKUP_MINUTE).padStart(2, '0')} IST`,
     nextRunAt: nextRun.toISOString(),
     lastBackup,
     backupCount,
+    localDir,
+    lastLocalCopy,
   }
 }
 

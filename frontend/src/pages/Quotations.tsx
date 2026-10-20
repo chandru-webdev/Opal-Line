@@ -17,6 +17,7 @@ import {
   XCircle,
   Mail,
   MessageCircle,
+  Pencil,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -27,14 +28,7 @@ import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi, backupApi } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
 import type { AppSettings, Quotation } from '@/types'
@@ -97,6 +91,7 @@ export default function QuotationsPage() {
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [form, setForm] = useState({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
@@ -198,9 +193,43 @@ export default function QuotationsPage() {
   const grandTotal = Math.round((itemsTotal + gstAmount - discount) * 100) / 100
 
   const openDialog = () => {
+    setEditingId(null)
     setForm({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
     setItems([{ ...emptyItem }])
     setError('')
+    setDialogOpen(true)
+  }
+
+  // Reopen the same dialog prefilled to edit an existing quotation. Closed
+  // quotes (converted/cancelled/expired) are read-only downstream.
+  const openEdit = (q: Quotation) => {
+    setEditingId(q.id)
+    setForm({
+      customer: q.customer ?? '',
+      phone: q.customerPhone ?? '',
+      email: q.customerEmail ?? '',
+      city: q.customerCity ?? '',
+      notes: q.notes ?? '',
+      gst: String(q.gst ?? 3),
+      discount: String(q.discount ?? 0),
+      // Date input wants yyyy-mm-dd; keep the date part of the stored instant.
+      validUntil: q.validUntil ? q.validUntil.slice(0, 10) : '',
+    })
+    const existingItems = q.items ?? []
+    setItems(
+      existingItems.length > 0
+        ? existingItems.map((it) => ({
+            product: it.product ?? '',
+            sku: it.sku ?? '',
+            qty: String(it.qty ?? 1),
+            weight: it.weight ? String(it.weight) : '',
+            silverRate: it.silverRate ? String(it.silverRate) : '',
+            makingCharge: it.makingCharge ? String(it.makingCharge) : '',
+          }))
+        : [{ ...emptyItem }],
+    )
+    setError('')
+    setViewQuote(null)
     setDialogOpen(true)
   }
 
@@ -214,29 +243,39 @@ export default function QuotationsPage() {
     if (validItems.length === 0) { setError('Add at least one product line'); return }
     setSaving(true)
     setError('')
+    const payload = {
+      customer: form.customer.trim(),
+      customerPhone: form.phone.trim() || null,
+      customerEmail: form.email.trim() || null,
+      customerCity: form.city.trim() || null,
+      notes: form.notes.trim() || null,
+      validUntil: form.validUntil || null,
+      gst: gstRate,
+      discount,
+      items: validItems.map((it) => ({
+        product: it.product.trim(),
+        sku: it.sku.trim(),
+        qty: Math.max(1, parseInt(it.qty, 10) || 1),
+        weight: parseFloat(it.weight) || 0,
+        silverRate: parseFloat(it.silverRate) || 0,
+        makingCharge: parseFloat(it.makingCharge) || 0,
+      })),
+    }
     try {
-      await dbApi.createQuotation({
-        customer: form.customer.trim(),
-        customerPhone: form.phone.trim() || null,
-        customerEmail: form.email.trim() || null,
-        customerCity: form.city.trim() || null,
-        notes: form.notes.trim() || null,
-        validUntil: form.validUntil || null,
-        gst: gstRate,
-        discount,
-        items: validItems.map((it) => ({
-          product: it.product.trim(),
-          sku: it.sku.trim(),
-          qty: Math.max(1, parseInt(it.qty, 10) || 1),
-          weight: parseFloat(it.weight) || 0,
-          silverRate: parseFloat(it.silverRate) || 0,
-          makingCharge: parseFloat(it.makingCharge) || 0,
-        })),
-      })
+      if (editingId) {
+        await dbApi.updateQuotation(editingId, payload)
+        toast.success('Quotation updated')
+      } else {
+        await dbApi.createQuotation(payload)
+      }
       setDialogOpen(false)
       load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create quotation')
+      setError(
+        err instanceof Error
+          ? err.message
+          : editingId ? 'Failed to update quotation' : 'Failed to create quotation',
+      )
     } finally {
       setSaving(false)
     }
@@ -312,7 +351,7 @@ export default function QuotationsPage() {
     }
   }
 
-  const convert = async (q: Quotation) => {
+  const convert = useCallback(async (q: Quotation) => {
     if (!(await confirmDialog({ title: `Convert ${q.number} into a tax invoice?`, description: 'Stock will be deducted and an invoice number generated.', confirmLabel: 'Convert' }))) return
     setConvertingId(q.id)
     setMessage(null)
@@ -325,7 +364,12 @@ export default function QuotationsPage() {
     } finally {
       setConvertingId(null)
     }
-  }
+  }, [load])
+
+  // Stable DataTable row handler: an inline lambda would change identity every
+  // render and defeat the table memo, re-rendering all rows on each dialog
+  // keystroke (felt as input lag).
+  const convertRow = useCallback((q: Quotation) => { void convert(q) }, [convert])
 
   const convertToOrder = async (q: Quotation) => {
     if (!(await confirmDialog({ title: `Convert ${q.number} into a sales order?`, description: 'Creates a confirmed order without stock movement — invoicing happens when the order is fulfilled.', confirmLabel: 'Convert' }))) return
@@ -588,6 +632,16 @@ export default function QuotationsPage() {
                   <TooltipContent>Invoice {row.original.convertedInvoice}</TooltipContent>
                 </Tooltip>
               )}
+              {isLive(row.original.status) && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon-sm" aria-label={`Edit ${row.original.number}`} onClick={() => openEdit(row.original)}>
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Edit quotation</TooltipContent>
+                </Tooltip>
+              )}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button variant="ghost" size="icon-sm" onClick={() => removeQuote(row.original.id)}>
@@ -669,19 +723,29 @@ export default function QuotationsPage() {
             data={filtered}
             loading={loading}
             emptyMessage="No quotations found"
-            onRowClick={(q) => setViewQuote(q)}
-            onRowDoubleClick={(q) => convert(q)}
+            onRowClick={setViewQuote}
+            onRowDoubleClick={convertRow}
           />
         </CardContent>
       </Card>
 
       {/* Create dialog */}
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-h-[calc(100vh-4rem)] max-w-2xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>New Quotation</DialogTitle>
-            <DialogDescription>Create a pre-sale estimate. Nothing is billed until you convert it.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        size="2xl"
+        title={editingId ? 'Edit Quotation' : 'New Quotation'}
+        description={editingId ? 'Update the estimate. Totals recompute automatically.' : 'Create a pre-sale estimate. Nothing is billed until you convert it.'}
+        footer={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {editingId ? 'Save Changes' : 'Create Quotation'}
+            </Button>
+          </>
+        }
+      >
           <div className="grid gap-3">
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Field label="Customer name *">
@@ -766,24 +830,32 @@ export default function QuotationsPage() {
 
             {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
-            <Button size="sm" onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Create Quotation
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* View dialog */}
-      <Dialog open={viewQuote !== null} onOpenChange={(open) => { if (!open) setViewQuote(null) }}>
-        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-2xl flex-col gap-0 overflow-visible p-0">
-          <DialogHeader className="shrink-0 space-y-1.5 border-b border-border/60 px-5 py-4 pr-12">
-            <DialogTitle>Quotation {viewQuote?.number}</DialogTitle>
-            <DialogDescription>{viewQuote ? formatDate(viewQuote.date) : ''}</DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+      <AppDialog
+        open={viewQuote !== null}
+        onOpenChange={(open) => { if (!open) setViewQuote(null) }}
+        size="2xl"
+        title={<>Quotation {viewQuote?.number}</>}
+        description={viewQuote ? formatDate(viewQuote.date) : ''}
+        footer={
+          viewQuote && viewQuote.status !== 'converted' && viewQuote.status !== 'cancelled' ? (
+            <div className="flex flex-wrap gap-2">
+              <PrintTemplatePicker docType="quotation" onSelect={(config) => printQuotation(viewQuote, config)} />
+              <Button variant="outline" className="flex-1" size="sm" onClick={() => printQuotation(viewQuote)}>
+                <Printer className="h-4 w-4" /> Print / PDF
+              </Button>
+              <Button variant="outline" className="flex-1" size="sm" onClick={() => backupApi.downloadQuotationPDF(viewQuote.id)}>
+                <Download className="h-4 w-4" /> Download PDF
+              </Button>
+              <Button className="flex-1" size="sm" disabled={convertingId === viewQuote.id} onClick={() => { const q = viewQuote; setViewQuote(null); void convert(q) }}>
+                <Wallet className="h-4 w-4" /> Convert to Invoice
+              </Button>
+            </div>
+          ) : undefined
+        }
+      >
           {viewQuote && (
             <div className="space-y-3 text-sm">
               <div className="flex justify-between"><span className="text-muted-foreground">Customer</span><span className="font-medium">{viewQuote.customer ?? '—'}</span></div>
@@ -813,23 +885,7 @@ export default function QuotationsPage() {
               {viewQuote.notes && <p className="rounded-md bg-muted/50 p-2 text-xs text-muted-foreground">{viewQuote.notes}</p>}
             </div>
           )}
-          </div>
-          {viewQuote && viewQuote.status !== 'converted' && viewQuote.status !== 'cancelled' && (
-            <div className="flex shrink-0 flex-wrap gap-2 border-t border-border/60 px-5 py-3">
-              <PrintTemplatePicker docType="quotation" onSelect={(config) => printQuotation(viewQuote, config)} />
-              <Button variant="outline" className="flex-1" size="sm" onClick={() => printQuotation(viewQuote)}>
-                <Printer className="h-4 w-4" /> Print / PDF
-              </Button>
-              <Button variant="outline" className="flex-1" size="sm" onClick={() => backupApi.downloadQuotationPDF(viewQuote.id)}>
-                <Download className="h-4 w-4" /> Download PDF
-              </Button>
-              <Button className="flex-1" size="sm" disabled={convertingId === viewQuote.id} onClick={() => { const q = viewQuote; setViewQuote(null); convert(q) }}>
-                <Wallet className="h-4 w-4" /> Convert to Invoice
-              </Button>
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

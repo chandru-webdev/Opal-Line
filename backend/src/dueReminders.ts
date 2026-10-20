@@ -3,6 +3,7 @@ import { db } from './db/client'
 import * as schema from './db/schema'
 import { logger } from './logger'
 import { sendEmail } from './notifications'
+import { loadNotificationPrefs } from './notificationPrefs'
 import { escapeHtml } from './htmlEscape'
 import { createScheduler } from './lib/scheduler'
 
@@ -24,6 +25,11 @@ function msUntilNextRun(now = new Date()): number {
 
 export async function runDueReminders(): Promise<{ sent: number; invoices: number }> {
   if (!db) return { sent: 0, invoices: 0 }
+  const prefs = await loadNotificationPrefs()
+  if (!prefs.dueRemindersEnabled) {
+    logger.info('Due-date reminders skipped — disabled in notification settings')
+    return { sent: 0, invoices: 0 }
+  }
   const fromD = new Date()
   fromD.setHours(0, 0, 0, 0)
   const toD = new Date(fromD.getTime() + WINDOW_DAYS * 86_400_000)

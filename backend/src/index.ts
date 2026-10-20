@@ -33,7 +33,14 @@ import { recountCustomerStats } from './customerStats'
 import { startAutoBackup, startDailySummary } from './autoBackup'
 import { startOrderEmailIngest, stopOrderEmailIngest, pollOrderMailbox, isEmailIngestConfigured, kickEmailIngest } from './orderEmailIngest'
 import { isPiiAccessDenied, missingPiiCustomerCount, normalizeShopifyCustomerId } from './shopifyDataEnhance'
-import { fetchSilverRateNow, getSchedulerStatus, setAutoRateEnabled, SILVER_RATE_HOUR, SILVER_RATE_MINUTE, startSilverRateScheduler } from './silverRateScheduler'
+import { applyRateSchedule, fetchSilverRateNow, getSchedulerStatus, setAutoRateEnabled, startSilverRateScheduler } from './silverRateScheduler'
+import {
+  addScheduledRateChange,
+  getScheduledRateChanges,
+  removeScheduledRateChange,
+  startScheduledRateApplier,
+  updateScheduledRateChange,
+} from './scheduledRateApplier'
 import { ensureUploadsDir, UPLOADS_DIR, uploadImageHandler } from './uploads'
 import { routeParam } from './lib/routeParams'
 
@@ -479,6 +486,10 @@ app.use('/api/v1/auth', authRouter)
 app.use('/api/v1/system', requireAuth, systemRouter)
 app.use('/api/v1/reports', requireAuth, reportsRouter)
 app.use('/api/v1/silver', requireAuth, enforceRbac)
+// Mirror of the silver mount: /gold routes use bare requirePermission, which
+// reads req.userId — without this mount gold/rate answered 401 for every
+// caller, session or not.
+app.use('/api/v1/gold', requireAuth, enforceRbac)
 
 // Shopify Flow webhook — must be BEFORE requireAuth since it's called from Shopify servers (no browser session)
 app.post('/api/v1/shopify/flow-webhook', express.json({ limit: '1mb' }), async (req, res) => {
@@ -974,7 +985,13 @@ app.get('/api/v1/silver/rate', requirePermission('silver-rate', 'view'), async (
   }
 })
 
-app.get('/api/v1/gold/rate', requirePermission('gold-rate', 'view'), async (_req, res) => {
+// Auth-only, by design: `gold-rate` was never a real RBAC module (MODULES has
+// no such key), so requirePermission('gold-rate', …) answered 401/403 for
+// every caller and the endpoint was unreachable. The same data is already
+// readable by any logged-in user through GET /db/gold-rates (no module check),
+// so this mirrors that exposure exactly. When gold rates get their own module
+// + UI, re-add requirePermission('gold-rate', 'view') here.
+app.get('/api/v1/gold/rate', async (_req, res) => {
   try {
     if (!db) return res.json({ rate: 0, purity: 99.9, updatedAt: null, currency: 'INR', source: null })
     const rows = await db.select().from(schema.goldRates).orderBy(desc(schema.goldRates.updatedAt)).limit(1)
@@ -1004,7 +1021,7 @@ app.post('/api/v1/silver/update', requirePermission('silver-rate', 'edit'), vali
 
 // ─── Silver rate approval workflow: staff submit, Admin/Super Admin decide ───
 const SILVER_APPROVER_ROLES = ['Admin', 'Super Admin']
-const pad2 = (n: number) => String(n).padStart(2, '0')
+
 
 async function userNameById(userId: string): Promise<string> {
   if (!db) return 'Unknown'
@@ -1221,8 +1238,9 @@ app.get('/api/v1/silver/auto-rate/status', requirePermission('silver-rate', 'vie
     // always true. isApprover tells the UI who may apply a change directly.
     const isApprover = await isSilverApprover(req.userId!)
     res.json({
+      // Rides along as { days, time } — the Silver Rate page renders it and
+      // offers the Edit-schedule dialog that PUTs back to /auto-rate/schedule.
       ...getSchedulerStatus(),
-      schedule: `${pad2(SILVER_RATE_HOUR)}:${pad2(SILVER_RATE_MINUTE)} IST`,
       apiUrlConfigured: Boolean(process.env.SILVER_RATE_API_URL?.trim()),
       approvalRequired: true,
       isApprover,
@@ -1254,6 +1272,124 @@ app.post('/api/v1/silver/auto-rate/fetch-now', requirePermission('silver-rate', 
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
+  }
+})
+
+// Run schedule for the auto silver-rate update: which days (weekends
+// included — plenty of shops want Saturday/Sunday updates too) and at what
+// time, Asia/Kolkata. Invalid input is normalised server-side, and the
+// timer is re-armed immediately so the new schedule applies at once.
+app.put('/api/v1/silver/auto-rate/schedule', requirePermission('system', 'edit'), async (req, res) => {
+  try {
+    const schedule = await applyRateSchedule({ days: req.body?.days, time: req.body?.time })
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Silver Rate Schedule Changed',
+      module: 'silver-rate',
+      entity: 'Auto Rate',
+      details: `Update schedule set to ${schedule.days.join(',')} at ${schedule.time} IST`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, schedule })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    res.status(500).json({ error: message })
+  }
+})
+
+// ─── One-off scheduled rate changes (Silver Rate page) ───────────────────────
+// Queue one specific rate for one specific date/time; applied automatically
+// then (reprices products, pushes to Shopify, audited) — the weekend-rate
+// workflow: schedule it on Friday, it lands Saturday morning.
+app.get('/api/v1/silver/scheduled-changes', requirePermission('silver-rate', 'view'), async (_req, res) => {
+  res.json({ changes: getScheduledRateChanges() })
+})
+
+app.post('/api/v1/silver/scheduled-changes', requirePermission('silver-rate', 'edit'), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database unavailable' })
+  try {
+    // Scheduling IS pre-approving the change — approvers only (like fetch-now).
+    if (!(await isSilverApprover(req.userId!))) {
+      return res.status(403).json({ error: 'Only Admin or Super Admin can schedule a rate change' })
+    }
+    const [user] = await db.select({ name: schema.users.name }).from(schema.users).where(eq(schema.users.id, req.userId!)).limit(1)
+    const { change, changes } = await addScheduledRateChange({
+      rate: req.body?.rate,
+      applyAt: req.body?.applyAt,
+      note: req.body?.note,
+      requestedBy: user?.name ?? null,
+    })
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Silver Rate Change Scheduled',
+      module: 'silver-rate',
+      entity: `Silver Rate ₹${change.rate.toFixed(2)}/gm`,
+      details: `Will apply automatically at ${change.applyAt}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.status(201).json({ ok: true, change, changes })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    // addScheduledRateChange throws user-facing validation messages; anything
+    // else is unexpected and stays a 500.
+    const validation = /must|At most/.test(message)
+    res.status(validation ? 400 : 500).json({ error: message })
+  }
+})
+
+// Edit a queued change in place (rate / time / note) — same validation and
+// approver gate as scheduling; the audit trail records both sides.
+app.patch('/api/v1/silver/scheduled-changes/:id', requirePermission('silver-rate', 'edit'), async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database unavailable' })
+  try {
+    if (!(await isSilverApprover(req.userId!))) {
+      return res.status(403).json({ error: 'Only Admin or Super Admin can edit a scheduled rate change' })
+    }
+    const { change, changes } = await updateScheduledRateChange(String(req.params.id), {
+      rate: req.body?.rate,
+      applyAt: req.body?.applyAt,
+      note: req.body?.note,
+    })
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Silver Rate Change Edited',
+      module: 'silver-rate',
+      entity: `Silver Rate ₹${change.rate.toFixed(2)}/gm`,
+      details: `Now applies at ${change.applyAt}${change.note ? ` — "${change.note}"` : ''}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, change, changes })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    // "not found" means the change already fired or was cancelled.
+    if (/not found/i.test(message)) return res.status(404).json({ error: message })
+    const validation = /must|At most/.test(message)
+    res.status(validation ? 400 : 500).json({ error: message })
+  }
+})
+
+app.delete('/api/v1/silver/scheduled-changes/:id', requirePermission('silver-rate', 'edit'), async (req, res) => {
+  try {
+    if (!(await isSilverApprover(req.userId!))) {
+      return res.status(403).json({ error: 'Only Admin or Super Admin can cancel a scheduled rate change' })
+    }
+    const id = String(req.params.id)
+    const changes = await removeScheduledRateChange(id)
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Silver Rate Change Cancelled',
+      module: 'silver-rate',
+      entity: `Scheduled change ${id.slice(0, 8)}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, changes })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error'
+    res.status(500).json({ error: message })
   }
 })
 
@@ -2028,6 +2164,8 @@ async function startServer() {
     // Weekly owner insights (Monday 08:00).
     void import('./ownerWeekly').then((w) => w.startWeeklyOwnerReport())
     startSilverRateScheduler()
+    // One-off rate changes scheduled from the Silver Rate page.
+    startScheduledRateApplier()
     // Poll the order-notification mailbox so redacted Shopify PII still reaches the ERP
     startOrderEmailIngest()
     // Register Shopify webhooks when a public base URL is configured (non-fatal)

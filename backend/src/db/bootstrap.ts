@@ -3,7 +3,8 @@ import postgres from 'postgres'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import { eq } from 'drizzle-orm'
 import * as schema from './schema'
-import { defaultRolePermissions, MODULE_KEYS } from '../rbac'
+import { defaultRolePermissions, emptyPermissions, MODULE_KEYS, MODULES } from '../rbac'
+import type { Permissions } from '../types'
 import { roleNames } from './seedData'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -185,6 +186,11 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         low_stock_alerts boolean,
         daily_summary boolean,
         order_imports boolean,
+        login_lockout_enabled boolean DEFAULT false,
+        lockout_threshold integer DEFAULT 5,
+        lockout_duration_minutes integer DEFAULT 15,
+        rate_schedule jsonb,
+        scheduled_rate_changes jsonb,
         shopify_store_url_encrypted text,
         shopify_access_token_encrypted text,
         shopify_api_version text,
@@ -504,6 +510,12 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         qty integer,
         weight numeric,
         value numeric,
+        gst numeric DEFAULT 3,
+        gst_amount numeric,
+        discount numeric DEFAULT 0,
+        grand_total numeric,
+        notes text,
+        expected_date timestamp,
         status text,
         date timestamp
       )`)
@@ -938,7 +950,10 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
     await db.insert(schema.roles).values({
       id: `ROLE${i + 1}`,
       name,
-      description: `${name} role with default module permissions`,
+      description:
+        name === 'Super Admin'
+          ? 'Full access to every module'
+          : 'No modules by default — a super admin grants access per user',
       permissions: defaultRolePermissions(name),
       isSystem: true,
       createdAt: new Date().toISOString(),
@@ -969,11 +984,11 @@ async function seedDefaults(db: ReturnType<typeof drizzle>): Promise<{ adminPass
       email: 'admin@opalline.local',
       username: 'admin',
       passwordHash,
-      role: 'Admin',
+      role: 'Super Admin',
       status: 'active',
       requirePasswordChange: true,
-      // No personal override: the owner must inherit the Admin role so that
-      // later fixes to the role's defaults actually reach this account.
+      // No personal override: the owner is the superadmin who turns modules on
+      // for everyone else, and must always inherit the Super Admin role.
       permissions: null,
     })
     logger.info('Bootstrap: created initial admin user')
@@ -1106,6 +1121,112 @@ async function repairAdminUserOverride(db: ReturnType<typeof drizzle>): Promise<
 }
 
 /**
+ * Frozen copy of the per-role module defaults that shipped before module
+ * access became superadmin-controlled. Role rows store a snapshot of their
+ * defaults, so changing defaultRolePermissions() alone never reaches an
+ * existing database. repairDefaultRolePermissions() matches this legacy shape
+ * to recognise stock rows; it is deliberately frozen here — it must keep
+ * describing what OLD installs stored, not what the code does today.
+ */
+function legacyDefaultRolePermissions(name: string): Permissions {
+  const p = emptyPermissions()
+  const all = { view: true, create: true, edit: true, delete: true }
+  const view = { view: true, create: false, edit: false, delete: false }
+  switch (name) {
+    case 'Admin':
+      for (const m of MODULES) p[m.key] = { ...all }
+      break
+    case 'Manager':
+      p.dashboard = { ...view }
+      p.sales = { ...all }
+      p.inventory = { ...all }
+      p.purchase = { view: true, create: true, edit: true, delete: false }
+      p['silver-rate'] = { ...all }
+      p.accounts = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Accounts':
+      p.accounts = { ...all }
+      p.sales = { view: true, create: false, edit: true, delete: false }
+      p.purchase = { ...view }
+      p.reports = { ...view }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Purchase':
+      p.purchase = { ...all }
+      p.inventory = { view: true, create: false, edit: true, delete: false }
+      p.reports = { ...view }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Sales':
+      p.sales = { ...all }
+      p.dashboard = { ...view }
+      p.inventory = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    case 'Shopify Manager':
+      p.shopify = { ...all }
+      p.inventory = { view: true, create: false, edit: true, delete: false }
+      p.dashboard = { ...view }
+      break
+    case 'Customer Support':
+      p.sales = { view: true, create: false, edit: true, delete: false }
+      p.dashboard = { ...view }
+      p.shopify = { view: true, create: false, edit: false, delete: false }
+      break
+    default:
+      return p // unknown name: legacy default was empty, nothing to recognise
+  }
+  return p
+}
+
+function samePermissions(a: Permissions | null, b: Permissions): boolean {
+  const x = (a ?? {}) as Permissions
+  return MODULE_KEYS.every((k) => {
+    const lhs = x[k]
+    const rhs = b[k]
+    if (!lhs || !rhs) return false
+    return lhs.view === rhs.view && lhs.create === rhs.create && lhs.edit === rhs.edit && lhs.delete === rhs.delete
+  })
+}
+
+/**
+ * Module access is now superadmin-controlled: no role except Super Admin
+ * ships with modules, so the install owner must actually BE a Super Admin —
+ * otherwise the account that is supposed to switch modules on would have no
+ * modules itself. Promotes the bootstrap owner (username "admin", role Admin)
+ * once; afterwards the role no longer reads 'Admin', so the repair is a no-op.
+ */
+async function repairOwnerSuperAdmin(db: ReturnType<typeof drizzle>): Promise<void> {
+  const [owner] = await db.select().from(schema.users).where(eq(schema.users.username, 'admin')).limit(1)
+  if (!owner || owner.role !== 'Admin') return
+  await db.update(schema.users).set({ role: 'Super Admin' }).where(eq(schema.users.id, owner.id))
+  logger.info('Bootstrap: promoted the install owner (admin) to Super Admin')
+}
+
+/**
+ * One-time reset of the stock role snapshots to the new empty defaults.
+ *
+ * Only rows that exactly match the legacy default shape are rewritten — a
+ * role an admin customised by hand, a custom role, and the Super Admin role
+ * itself are left untouched. Once cleared a row no longer matches a legacy
+ * shape, so re-running (every start) is a no-op.
+ */
+async function repairDefaultRolePermissions(db: ReturnType<typeof drizzle>): Promise<void> {
+  const roles = await db.select().from(schema.roles)
+  for (const role of roles) {
+    if (role.isSystem !== true || role.name === 'Super Admin') continue
+    const legacy = legacyDefaultRolePermissions(role.name)
+    if (!MODULE_KEYS.some((k) => legacy[k]?.view || legacy[k]?.create || legacy[k]?.edit || legacy[k]?.delete)) continue
+    if (!samePermissions(role.permissions as Permissions | null, legacy)) continue
+    await db.update(schema.roles).set({ permissions: emptyPermissions() }).where(eq(schema.roles.id, role.id))
+    logger.info({ role: role.name }, 'Bootstrap: cleared default module access (now superadmin-controlled)')
+  }
+}
+
+/**
  * Run bootstrap when the database is fresh (no users table). Idempotent and
  * safe on every start; upgrades add missing columns/tables for existing DBs.
  */
@@ -1137,10 +1258,22 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
     const upgradeDb = drizzle(sql, { schema })
     await repairAdminRolePermissions(upgradeDb).catch(() => undefined)
     await repairAdminUserOverride(upgradeDb).catch(() => undefined)
+    await repairOwnerSuperAdmin(upgradeDb).catch(() => undefined)
+    await repairDefaultRolePermissions(upgradeDb).catch(() => undefined)
     // Stock balances predate the movement ledger. Give them a dated opening
     // entry so an upgraded install has real history instead of a balance that
     // appears from nowhere on the day of its first sale.
     await import('../stock').then((m) => m.backfillOpeningBalances(upgradeDb)).catch(() => undefined)
+    // Invoice items raised before the weight snapshot carried weight 0. Fill
+    // them from the catalogue (net weight × qty) so totals, prints and the
+    // dashboard agree with new invoices. Idempotent; failures are logged but
+    // never block boot.
+    await import('../invoiceWeights')
+      .then((m) => m.backfillInvoiceItemWeights(upgradeDb))
+      .then((n) => {
+        if (n > 0) logger.info({ items: n }, 'Bootstrap: backfilled invoice item weights')
+      })
+      .catch((err) => logger.warn({ err: (err as Error)?.message }, 'Bootstrap: invoice weight backfill failed'))
     return { ran: true, tablesCreated: false }
   } finally {
     await sql.end({ timeout: 5 })
@@ -1157,6 +1290,14 @@ export async function bootstrapDatabase(): Promise<{ ran: boolean; tablesCreated
 async function applyUpgrades(sql: postgres.Sql): Promise<void> {
   const upgrades: string[] = [
     ...STOCK_LEDGER_DDL,
+    // Login lockout became a per-install switch (Settings → Security → Login
+    // lockout), off by default. Existing installs get the column as false,
+    // which keeps today's behaviour (no lockout) until it is turned on.
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS login_lockout_enabled boolean DEFAULT false`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_threshold integer DEFAULT 5`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_duration_minutes integer DEFAULT 15`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS rate_schedule jsonb`,
+    `ALTER TABLE settings ADD COLUMN IF NOT EXISTS scheduled_rate_changes jsonb`,
     `INSERT INTO inventory_locations (id, name, type) VALUES ('LOC-DEFAULT', 'Main Store', 'store') ON CONFLICT DO NOTHING`,
       `CREATE TABLE IF NOT EXISTS loyalty_transactions (
         id text PRIMARY KEY,
@@ -1449,6 +1590,12 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
         qty integer,
         weight numeric,
         value numeric,
+        gst numeric DEFAULT 3,
+        gst_amount numeric,
+        discount numeric DEFAULT 0,
+        grand_total numeric,
+        notes text,
+        expected_date timestamp,
         status text,
         date timestamp
       )`,
@@ -1566,6 +1713,20 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_id text`,
       `CREATE INDEX IF NOT EXISTS products_supplier_id_idx ON products (supplier_id)`,
       `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS supplier_id text`,
+      // Purchase order detail page: GST breakdown (3% default), discount,
+      // grand total, notes and expected delivery date. Existing rows get the
+      // default rate and a computed GST/grand total so old POs display the
+      // same way new ones do.
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS gst numeric DEFAULT 3`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS gst_amount numeric`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS discount numeric DEFAULT 0`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS grand_total numeric`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS notes text`,
+      `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS expected_date timestamp`,
+      `UPDATE purchase_orders SET gst = 3 WHERE gst IS NULL`,
+      `UPDATE purchase_orders SET gst_amount = round(coalesce(value, 0) * 0.03, 2) WHERE gst_amount IS NULL`,
+      `UPDATE purchase_orders SET discount = 0 WHERE discount IS NULL`,
+      `UPDATE purchase_orders SET grand_total = round(coalesce(value, 0) + coalesce(gst_amount, 0) - coalesce(discount, 0), 2) WHERE grand_total IS NULL`,
     ]
     for (const stmt of upgrades) {
       await sql.unsafe(stmt).catch(() => undefined)
