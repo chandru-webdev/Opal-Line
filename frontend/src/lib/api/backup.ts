@@ -7,6 +7,8 @@ import type {
   SystemStatusInfo,
 } from '@/types'
 import { API_BASE, request, requestText } from './core'
+import type { LabelPreset } from '../labelPresets'
+export type { LabelPreset, LabelPresetDesign } from '../labelPresets'
 
 export interface BackupResult {
   ok: boolean
@@ -244,7 +246,16 @@ export const backupApi = {
    */
   downloadLabelsZpl: async (
     productIds: string[],
-    opts?: { preset?: string; copies?: number; format?: 'qr' | 'code128'; showPrice?: boolean; brandName?: string },
+    opts?: {
+      preset?: string
+      copies?: number
+      format?: 'qr' | 'code128'
+      showPrice?: boolean
+      showWeight?: boolean
+      showQR?: boolean
+      showBrand?: boolean
+      brandName?: string
+    },
   ): Promise<string> => {
     const text = await requestText('/db/products/labels/zpl', {
       method: 'POST',
@@ -267,7 +278,7 @@ export const backupApi = {
       method: 'POST',
       body: JSON.stringify({ productIds, ...opts }),
     }),
-  getLabelPresets: (): Promise<Array<{ key: string; label: string; width: number; height: number; columns: number; rows: number; reference: boolean }>> =>
+  getLabelPresets: (): Promise<LabelPreset[]> =>
     request('/db/products/labels/presets'),
   whatsappStatus: (): Promise<{ configured: boolean }> =>
     request('/backup/whatsapp/status'),

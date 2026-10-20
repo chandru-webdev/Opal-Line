@@ -22,14 +22,11 @@ import {
 } from './barcodeLabels'
 import { renderZpl } from './zpl'
 
-// ─── Transcription of the supplied `.prn` streams ─────────────────────────────
+// ─── Recorded reference ZPL coordinates ──────────────────────────────────────
 //
-// Everything below is measured from the `.prn` files in the store's Downloads
-// folder. The numbers are the raw `^A0N,h,w` and `^FT` values in dots at 203 dpi,
-// so these tests fail loudly if anyone edits the design table away from the
-// samples. `50x40` and `50x25` were authored two-up on 799-dot media and
-// `35x22` three-up on 831 dots; the x values here are label-local, i.e. modulo
-// the label's own width.
+// No `.prn` files are present in this checkout. These values preserve the
+// previously transcribed ^A0N,h,w and ^FT coordinates at 203 dpi; the reference
+// images are useful visual constraints but do not establish printer origins.
 
 interface RefField {
   kind: LabelFieldKind
@@ -103,7 +100,7 @@ const fieldFontSizePt = (capHeightMm: number) => (capHeightMm / ZPL_EM_RATIO) / 
 /** The condensation the reference's own `w` asks for at that size. */
 const fieldBaseScale = (refWidthMm: number, capHeightMm: number) => refWidthMm / (capHeightMm / ZPL_EM_RATIO)
 
-test('the design table is the transcription of the supplied .prn streams', () => {
+test('the design table matches the recorded reference ZPL coordinate fixture', () => {
   for (const ref of REFERENCES) {
     const design = labelDesignFor(ref.widthMm, ref.heightMm)
     assert.ok(design, `no design for ${ref.label}`)
@@ -360,14 +357,14 @@ test('the sample placeholder values are never printed as production data', () =>
   const real = { name: 'Diamond Ring', sku: 'SKU-1', barcode: 'OLABC12345', price: 1234.5, weight: 3.2, category: 'Rings' }
   const texts = designFieldTexts(
     real,
-    { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' },
+    { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' },
     design,
   )
   const joined = texts.map((t) => t.text).join('\n')
   for (const sample of ['W12345', '0012535', '99999.00', '39999.00', 'FUSION OF KEMPU', 'FLOWER CRYSTAL']) {
     assert.ok(!joined.includes(sample), `placeholder ${sample} leaked into ${joined}`)
   }
-  assert.ok(joined.includes('Diamond Ring'))
+  assert.ok(joined.includes('DIAMOND RING'))
   assert.ok(joined.includes('OLABC12345'))
   assert.ok(joined.includes('Rings'))
   assert.ok(joined.includes('Rate: 1234.50/-'))
@@ -378,20 +375,21 @@ test('every line comes from the product, and the code carries the identifier', (
   const product = { name: 'Ring', sku: 'SKU-9', price: 10, category: 'Gold' }
   const texts = designFieldTexts(
     product,
-    { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' },
+    { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' },
     design,
   )
   assert.equal(texts.find((t) => t.kind === 'code')?.text, 'Code: SKU-9')
   assert.equal(texts.find((t) => t.kind === 'attr1')?.text, 'Gold')
   // No weight → no second chip, and never an empty field.
   assert.equal(texts.find((t) => t.kind === 'attr2'), undefined)
+  assert.deepEqual(labelAttributes({ ...product, collection: 'Classic' }, { showPrice: true, showWeight: true }), ['Gold', 'Classic'])
   assert.deepEqual(labelAttributes(product, { showPrice: true, showWeight: true }), ['Gold'])
   assert.equal(labelCode(product), 'SKU-9')
 
   // The slim 10 mm sample prints the bare identifier instead of "Code: …".
   const slimTexts = designFieldTexts(
     product,
-    { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' },
+    { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' },
     labelDesignFor(50, 10)!,
   )
   assert.equal(slimTexts.find((t) => t.kind === 'code')?.text, 'SKU-9')
@@ -406,7 +404,7 @@ test('a missing brand or price simply drops the line', () => {
   )
   assert.equal(texts.find((t) => t.kind === 'brand'), undefined)
   assert.equal(texts.find((t) => t.kind === 'rate'), undefined)
-  assert.equal(texts.find((t) => t.kind === 'name')?.text, 'Plain')
+  assert.equal(texts.find((t) => t.kind === 'name')?.text, 'PLAIN')
 })
 
 test('a design only exists for the four physical reference sizes', () => {
@@ -459,7 +457,7 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
       height: h,
       copies: 1,
       symbology: 'qr',
-      brand: 'SREE KANDHAS',
+      brand: 'OPAL LINE',
       showPrice: true,
       showWeight: true,
       showQR: true,
@@ -476,7 +474,7 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
     // Exactly the lines the product calls for — the sample's own text.
     const expected = designFieldTexts(
       sample.product as never,
-      { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' },
+      { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' },
       design,
     )
     assert.deepEqual(
@@ -502,7 +500,7 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
     }
     // The reference's own strings really are what came out.
     assert.equal(fields.get('name')!.text, sample.product.name, `${sample.label} name text`)
-    assert.equal(fields.get('brand')!.text, 'SREE KANDHAS', `${sample.label} brand text`)
+    assert.equal(fields.get('brand')!.text, 'OPAL LINE', `${sample.label} brand text`)
 
     // The QR carries the sample's command, magnification and anchor.
     assert.match(
@@ -519,7 +517,7 @@ test('the ZPL stream reproduces the sample ^FT/^A0N/^BQ grid', () => {
 test('the ZPL stream never contains the sample placeholders for real products', () => {
   const zpl = renderZpl(
     [{ name: 'Diamond Ring', sku: 'SKU-1', barcode: 'OLABC12345', price: 1234.5, weight: 3.2, category: 'Rings' } as never],
-    { width: 50, height: 40, copies: 1, symbology: 'qr', brand: 'SREE KANDHAS', showPrice: true, showWeight: true, showQR: true },
+    { width: 50, height: 40, copies: 1, symbology: 'qr', brand: 'OPAL LINE', showPrice: true, showWeight: true, showQR: true },
   )
   for (const sample of ['W12345', '0012535', '99999.00', '39999.00']) {
     assert.ok(!zpl.includes(sample), `placeholder ${sample} leaked into the ZPL`)
@@ -528,4 +526,3 @@ test('the ZPL stream never contains the sample placeholders for real products', 
   assert.ok(zpl.includes('^FDRate: 1234.50/-^FS'))
   assert.ok(zpl.includes('^FDLA,OLABC12345^FS'))
 })
-

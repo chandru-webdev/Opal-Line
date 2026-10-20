@@ -1,8 +1,8 @@
 // Safe ZPL (Zebra Programming Language) label renderer.
 //
-// The supplied reference `.prn` files are Zebra ZPL authored at 203 dpi
-// (8 dots/mm) and print a QR symbol with `^BQN` encoding the product code. This
-// module reproduces that command set for the four physical sizes.
+// The recorded reference labels use Zebra ZPL at 203 dpi (8 dots/mm) and print
+// a QR symbol with `^BQN` encoding the product code. This module reproduces that
+// command set for the four physical sizes.
 //
 // Safety properties:
 //  - one `^XA … ^XZ` block per physical label, so labels can never be clipped or
@@ -32,6 +32,8 @@ export interface ZplOptions {
   showPrice?: boolean
   showWeight?: boolean
   showQR?: boolean
+  showBrand?: boolean
+  codeLength?: number
 }
 
 export interface ZplLabelInput extends ProductLabel {}
@@ -108,8 +110,7 @@ function computeGeometry(width: number, height: number): ZplGeometry {
 }
 
 // ─── Reference-design ZPL ────────────────────────────────────────
-// Emits the same `^FT`/`^A0N`/`^BQ` grid the supplied `.prn` streams use, so a
-// ZPL-capable printer lays the label out identically to the samples.
+// Emits the recorded `^FT`/`^A0N`/`^BQ` grid so the PDF and ZPL stay aligned.
 
 /**
  * Fit one line of `^A0N,h,w`.
@@ -140,8 +141,9 @@ function zplDesignLabel(product: ZplLabelInput, options: ZplOptions, design: Lab
     {
       showPrice: options.showPrice !== false,
       showWeight: options.showWeight !== false,
-      showBrand: true,
+      showBrand: options.showBrand !== false,
       brand: options.brand ?? '',
+      codeLength: options.codeLength,
     },
     design,
   )
@@ -202,7 +204,7 @@ export function zplLabel(product: ZplLabelInput, options: ZplOptions): string | 
   const symbology: ZplSymbology = options.symbology === 'code128' ? 'code128' : 'qr'
   const copies = Math.min(Math.max(Math.floor(options.copies ?? 1) || 1, 1), 999)
   const code = zplEscape(labelCode(product))
-  const brand = zplEscape((options.brand ?? 'Opal Line').trim())
+  const brand = options.showBrand === false ? '' : zplEscape((options.brand ?? 'Opal Line').trim())
   const name = zplEscape(product.name || 'Product')
 
   const lines: string[] = []
@@ -259,15 +261,19 @@ export function renderZpl(products: ZplLabelInput[], options: ZplOptions): strin
 
 /** Build options from a preset key, so callers share one source of dimensions. */
 export function zplOptionsForPreset(preset: string | undefined, overrides: Partial<ZplOptions> = {}): ZplOptions {
-  const base = LABEL_PRESETS[preset ?? ''] ?? LABEL_PRESETS['label-50x40'] ?? { width: 50, height: 40 }
+  const key = preset || 'label-50x40'
+  const base = LABEL_PRESETS[key]
+  if (!base) throw new Error(`Unknown label preset: ${key}`)
   return {
     width: (overrides.width ?? (base as { width?: number }).width ?? 50),
     height: (overrides.height ?? (base as { height?: number }).height ?? 40),
     copies: overrides.copies ?? 1,
     symbology: overrides.symbology ?? 'qr',
-    brand: overrides.brand ?? 'Opal Line',
+    brand: overrides.brand ?? base.brand ?? 'Opal Line',
     showPrice: overrides.showPrice ?? true,
     showWeight: overrides.showWeight ?? true,
     showQR: overrides.showQR ?? true,
+    showBrand: overrides.showBrand ?? true,
+    ...(overrides.codeLength ?? base.codeLength ? { codeLength: overrides.codeLength ?? base.codeLength } : {}),
   }
 }

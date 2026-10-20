@@ -8,11 +8,15 @@ import { randomBytes, createHash } from 'node:crypto'
 import { pruneLogIfTooBig } from './logrotate'
 import { consolidateUserData } from './userdata'
 import { printHtml, previewHtml, pdfFromHtml, exportPagePdf, printWebContents, type PrintResult, type PdfResult, type PrintMode } from './print'
+import { dataDirMajor, binaryMajor, systemPostgresBinDirs, selectPostgres, logDiagnostics, pgTool, type PgCandidate } from './postgres'
 import * as https from 'node:https'
 
 let mainWindow: BrowserWindow | null = null
 let backendProcess: ChildProcess | null = null
 let localPostgresStarted = false
+// pg_ctl we actually started the cluster with — guaranteed to be the major that
+// matches PGDATA, so stopPostgres() never calls a mismatched binary.
+let activePgCtl: string | null = null
 
 // Dedicated desktop port — deliberately different from the dev backend port
 // Opal Line uses a dedicated port block (47191-47198) chosen to avoid
@@ -69,29 +73,10 @@ function pgRoot(): string | null {
   return existsSync(bundled) ? bundled : null
 }
 
-function pgBin(name: string): string | null {
+/** The bundled portable PostgreSQL `bin` directory, or null when not shipped. */
+function bundledPgBinDir(): string | null {
   const root = pgRoot()
-  if (!root) return null
-  const candidates = [join(root, 'bin', `${name}.exe`), join(root, 'bin', name)]
-  for (const c of candidates) if (existsSync(c)) return c
-  return null
-}
-
-function haveSystemPostgres(): boolean {
-  try {
-    execSync('psql --version', { encoding: 'utf8', timeout: 4000, stdio: 'pipe', windowsHide: true })
-    return true
-  } catch { return false }
-}
-
-function systemPostgresRoot(): string | null {
-  const candidates = [
-    'C:\\Program Files\\PostgreSQL\\17\\bin',
-    'C:\\Program Files\\PostgreSQL\\16\\bin',
-    'C:\\Program Files\\PostgreSQL\\15\\bin',
-  ]
-  for (const c of candidates) if (existsSync(c)) return c
-  return null
+  return root ? join(root, 'bin') : null
 }
 
 function getOrCreatePgPassword(): string {
@@ -147,9 +132,15 @@ function startPostgresWithRetry(pgCtl: string): void {
     }
     if (attempt < ATTEMPTS) sleep(1500)
   }
+  const diag =
+    logDiagnostics(join(LOG_DIR, 'postgres.log'), 8) ||
+    logDiagnostics(join(LOG_DIR, 'pgctl.log'), 8)
   throw new Error(
-    `PostgreSQL could not start after ${ATTEMPTS} attempts.\n\n` +
-    `See the database logs for the reason:\n${join(LOG_DIR, 'postgres.log')}\n${join(LOG_DIR, 'pgctl.log')}`,
+    [
+      `PostgreSQL could not start after ${ATTEMPTS} attempts.`,
+      diag ? `Reason reported by the server:\n${diag}` : 'The server left no error in its log.',
+      `Logs:\n${join(LOG_DIR, 'postgres.log')}\n${join(LOG_DIR, 'pgctl.log')}`,
+    ].join('\n\n'),
   )
 }
 
@@ -158,69 +149,68 @@ async function ensurePostgres(): Promise<string> {
   const dbName = 'opal_line'
   const url = `postgresql://postgres:${pgPassword}@127.0.0.1:${PG_PORT}/${dbName}`
 
-  const initdb = pgBin('initdb')
-  const pgCtl = pgBin('pg_ctl')
-  const createdb = pgBin('createdb')
-
-  if (initdb && pgCtl) {
-    if (!existsSync(join(PGDATA, 'PG_VERSION'))) {
-      console.log('[postgres] Initializing data directory…')
-      logLine('postgres', 'initdb ' + PGDATA)
-      try {
-        execFileSync(initdb, ['-D', PGDATA, '-U', 'postgres', '-E', 'UTF8', '--auth=trust'], { stdio: 'pipe', windowsHide: true })
-      } catch (err: any) {
-        console.error('[postgres] initdb failed:', err.message)
-        logLine('postgres', 'initdb failed: ' + err.message)
-        throw new Error(`PostgreSQL initdb failed: ${err.stderr?.toString() || err.message}`)
-      }
-    }
-    if (!isPostgresRunning()) {
-      console.log('[postgres] Starting bundled PostgreSQL…')
-      logLine('postgres', 'starting bundled postgres on ' + PG_PORT)
-      startPostgresWithRetry(pgCtl)
-    }
-    waitForPostgres(PG_PORT)
-    if (createdb) {
-      try {
-        execFileSync(createdb, ['-h', '127.0.0.1', '-p', String(PG_PORT), '-U', 'postgres', dbName], { stdio: 'pipe', windowsHide: true })
-        console.log('[postgres] Database created')
-      } catch { /* already exists */ }
-    }
-    return url
+  // The data directory's major version dictates which binaries may open it.
+  // PostgreSQL refuses to start a cluster created by a different major, and a
+  // newer cluster's postgresql.conf can hold GUCs older servers reject (PG 18
+  // writes autovacuum_worker_slots, which PG 16/17 refuse), so the app must
+  // never blindly prefer its bundled portable server over the matching one.
+  const dataMajor = dataDirMajor(PGDATA)
+  const candidates: PgCandidate[] = []
+  const bundledBin = bundledPgBinDir()
+  if (bundledBin) {
+    candidates.push({ source: 'bundled', bin: bundledBin, major: binaryMajor(pgTool(bundledBin, 'pg_ctl')) })
+  }
+  for (const sys of systemPostgresBinDirs()) {
+    candidates.push({ source: 'system', bin: sys.bin, major: sys.major })
   }
 
-  if (haveSystemPostgres()) {
-    const sysPgRootW = systemPostgresRoot()
-    if (sysPgRootW) {
-      const sysInitdb = join(sysPgRootW, 'initdb.exe')
-      const sysPgCtl = join(sysPgRootW, 'pg_ctl.exe')
-      if (existsSync(sysInitdb) && existsSync(sysPgCtl)) {
-        if (!existsSync(join(PGDATA, 'PG_VERSION'))) {
-          console.log('[postgres] Initializing data directory (system postgres)…')
-          try {
-            execFileSync(sysInitdb, ['-D', PGDATA, '-U', 'postgres', '-E', 'UTF8', '--auth=trust'], { stdio: 'pipe', windowsHide: true })
-          } catch (err: any) {
-            throw new Error(`PostgreSQL initdb failed: ${err.stderr?.toString() || err.message}`)
-          }
-        }
-        if (!isPostgresRunning()) {
-          startPostgresWithRetry(sysPgCtl)
-        }
-        waitForPostgres(PG_PORT)
-        const sysCreatedb = join(sysPgRootW, 'createdb.exe')
-        if (existsSync(sysCreatedb)) {
-          try {
-            execFileSync(sysCreatedb, ['-h', '127.0.0.1', '-p', String(PG_PORT), '-U', 'postgres', dbName], { stdio: 'pipe', windowsHide: true })
-          } catch { /* exists */ }
-        }
-        return url
-      }
+  const picked = selectPostgres(dataMajor, candidates)
+  if ('error' in picked) {
+    // No local cluster yet: keep the documented fallback to DATABASE_URL from
+    // .env (an external/remote server) instead of hard-failing.
+    if (dataMajor == null) {
+      console.log('[postgres] No local PostgreSQL found — using DATABASE_URL from .env')
+      logLine('postgres', 'no local postgres; using external DATABASE_URL')
+      return ''
     }
+    // A cluster exists but nothing can open it. Report the real reason.
+    console.error('[postgres] ' + picked.error)
+    logLine('postgres', 'binary selection failed: ' + picked.error.split('\n')[0])
+    throw new Error(picked.error)
   }
 
-  console.log('[postgres] No bundled/system PostgreSQL found — using DATABASE_URL from .env')
-  logLine('postgres', 'no local postgres; using external DATABASE_URL')
-  return ''
+  const initdb = pgTool(picked.bin, 'initdb')
+  const pgCtl = pgTool(picked.bin, 'pg_ctl')
+  const createdb = pgTool(picked.bin, 'createdb')
+  activePgCtl = pgCtl
+
+  if (picked.source === 'system') {
+    console.log(`[postgres] Using system PostgreSQL ${picked.major} at ${picked.bin}`)
+    logLine('postgres', `using system postgres ${picked.major} at ${picked.bin}`)
+  }
+
+  if (!existsSync(join(PGDATA, 'PG_VERSION'))) {
+    console.log('[postgres] Initializing data directory…')
+    logLine('postgres', 'initdb ' + PGDATA)
+    try {
+      execFileSync(initdb, ['-D', PGDATA, '-U', 'postgres', '-E', 'UTF8', '--auth=trust'], { stdio: 'pipe', windowsHide: true })
+    } catch (err: any) {
+      console.error('[postgres] initdb failed:', err.message)
+      logLine('postgres', 'initdb failed: ' + err.message)
+      throw new Error(`PostgreSQL initdb failed: ${err.stderr?.toString() || err.message}`)
+    }
+  }
+  if (!isPostgresRunning()) {
+    console.log(`[postgres] Starting PostgreSQL ${picked.major}…`)
+    logLine('postgres', 'starting postgres ' + picked.major + ' on ' + PG_PORT)
+    startPostgresWithRetry(pgCtl)
+  }
+  waitForPostgres(PG_PORT)
+  try {
+    execFileSync(createdb, ['-h', '127.0.0.1', '-p', String(PG_PORT), '-U', 'postgres', dbName], { stdio: 'pipe', windowsHide: true })
+    console.log('[postgres] Database created')
+  } catch { /* already exists */ }
+  return url
 }
 
 function toPgOptionPort(): string {
@@ -759,7 +749,7 @@ ipcMain.handle('print:page', (_e, mode: unknown): Promise<PrintResult> | PrintRe
 function stopPostgres(): void {
   if (!localPostgresStarted) return
   try {
-    const pgCtl = pgBin('pg_ctl') ?? join(systemPostgresRoot() ?? '', 'pg_ctl.exe')
+    const pgCtl = activePgCtl ?? (bundledPgBinDir() ? pgTool(bundledPgBinDir()!, 'pg_ctl') : null)
     if (pgCtl && existsSync(PGDATA)) {
       execFileSync(pgCtl, ['-D', PGDATA, 'stop', '-m', 'fast'], { stdio: 'pipe', timeout: 10000, windowsHide: true })
     }

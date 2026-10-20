@@ -5,35 +5,96 @@ import {
   LABEL_PRESETS,
   computeLabelGeometry,
   computeLabelLines,
+  designFieldTexts,
   formatLabelRate,
+  generateLabelQrBuffer,
   generateLabelsPDF,
   labelCode,
   resolveLabelPreset,
 } from './barcodeLabels'
 
-// 14. All four physical-size templates ---------------------------------------
+// Reference-size templates ---------------------------------------------------
 
-test('the four reference sizes are present with their real physical dimensions', () => {
+test('the six reference templates are selectable with their physical dimensions', () => {
   const byKey = new Map(LABEL_PRESET_LIST.map((p) => [p.key, p]))
   assert.deepEqual(
-    ['label-50x40', 'label-50x25', 'label-50x10', 'label-35x22'].map((k) => {
+    [
+      'label-50x40',
+      'label-50x25',
+      'label-35x22',
+      'label-50x10',
+      'label-50x10-loni',
+      'label-50x10-compact',
+    ].map((k) => {
       const p = byKey.get(k)
       assert.ok(p, `missing preset ${k}`)
+      assert.ok(p.design, `${k} must include preview/print geometry`)
+      assert.equal(p.design.width, p.width, `${k} design width`)
+      assert.equal(p.design.height, p.height, `${k} design height`)
       return [p.width, p.height]
     }),
     [
       [50, 40],
       [50, 25],
-      [50, 10],
       [35, 22],
+      [50, 10],
+      [50, 10],
+      [50, 10],
     ],
   )
 })
 
 test('reference presets are flagged and listed first', () => {
-  const firstFour = LABEL_PRESET_LIST.slice(0, 4).map((p) => p.key)
-  assert.deepEqual(firstFour, ['label-50x40', 'label-50x25', 'label-35x22', 'label-50x10'])
-  assert.ok(LABEL_PRESET_LIST.slice(0, 4).every((p) => p.reference))
+  const firstSix = LABEL_PRESET_LIST.slice(0, 6).map((p) => p.key)
+  assert.deepEqual(firstSix, [
+    'label-50x40',
+    'label-50x25',
+    'label-35x22',
+    'label-50x10',
+    'label-50x10-loni',
+    'label-50x10-compact',
+  ])
+  assert.ok(LABEL_PRESET_LIST.slice(0, 6).every((p) => p.reference))
+})
+
+test('same-size 50x10 templates retain distinct identities and compact code rules', () => {
+  const byKey = new Map(LABEL_PRESET_LIST.map((p) => [p.key, p]))
+  assert.equal(byKey.get('label-50x10')?.brand, 'OPAL LINE')
+  assert.equal(byKey.get('label-50x10-loni')?.brand, 'OPAL LINE')
+  assert.equal(byKey.get('label-50x10-compact')?.brand, 'OPAL LINE')
+  assert.equal(byKey.get('label-50x10')?.label, '50 × 10 mm · Standard')
+  assert.equal(byKey.get('label-50x10-loni')?.label, '50 × 10 mm · Alternate')
+  assert.equal(byKey.get('label-50x10-compact')?.codeLength, 3)
+  assert.notEqual(byKey.get('label-50x10')?.key, byKey.get('label-50x10-loni')?.key)
+  assert.notEqual(byKey.get('label-50x10-loni')?.key, byKey.get('label-50x10-compact')?.key)
+})
+
+test('all six reference presets default to OPAL LINE and retain complete geometry', () => {
+  const references = LABEL_PRESET_LIST.slice(0, 6)
+  assert.equal(references.length, 6)
+  for (const preset of references) {
+    assert.equal(preset.brand, 'OPAL LINE', `${preset.key} brand`)
+    assert.ok(preset.design, `${preset.key} geometry`)
+    assert.equal(preset.design!.width, preset.width)
+    assert.equal(preset.design!.height, preset.height)
+    assert.ok(preset.design!.fields.length > 0, `${preset.key} fields`)
+    assert.ok(preset.design!.qr.size > 0, `${preset.key} QR size`)
+  }
+})
+
+test('compact label fields use live product data and the short product identifier', () => {
+  const preset = resolveLabelPreset('label-50x10-compact')
+  const design = LABEL_PRESET_LIST.find((item) => item.key === 'label-50x10-compact')?.design
+  assert.ok(design)
+  const fields = designFieldTexts(
+    { name: 'Fusion of Kempu & NA', sku: '0012535', barcode: '0012535', price: 39999 },
+    preset,
+    design!,
+  )
+  assert.equal(fields.find((field) => field.kind === 'brand')?.text, 'OPAL LINE')
+  assert.equal(fields.find((field) => field.kind === 'name')?.text, 'FUSION OF KEMPU & NA')
+  assert.equal(fields.find((field) => field.kind === 'code')?.text, '001')
+  assert.equal(fields.find((field) => field.kind === 'rate')?.text, 'Rate: 39999.00/-')
 })
 
 test('the grid for every preset fits an A4 sheet', () => {
@@ -56,15 +117,13 @@ test('resolveLabelPreset clamps copies into a printable range', () => {
   assert.equal(resolveLabelPreset('label-50x40').copies, 1)
 })
 
-test('resolveLabelPreset falls back to the default size for an unknown key', () => {
-  const opts = resolveLabelPreset('does-not-exist')
-  assert.equal(opts.width, 50)
-  assert.equal(opts.height, 40)
+test('resolveLabelPreset rejects an unknown key rather than silently choosing another layout', () => {
+  assert.throws(() => resolveLabelPreset('does-not-exist'), /Unknown label preset/)
 })
 
 test('resolveLabelPreset honours a legacy businessName override', () => {
-  const opts = resolveLabelPreset('label-50x40', { businessName: 'SREE KANDHAS' } as never)
-  assert.equal(opts.brand, 'SREE KANDHAS')
+  const opts = resolveLabelPreset('label-50x40', { businessName: 'OPAL LINE' } as never)
+  assert.equal(opts.brand, 'OPAL LINE')
 })
 
 // 11/12. Content, long names, missing optional fields -------------------------
@@ -85,11 +144,19 @@ test('formatLabelRate matches the reference "Rate: x/-" shape', () => {
   assert.equal(formatLabelRate(Number.NaN), 'Rate: 0.00/-')
 })
 
-const product = { name: 'Diamond Ring', sku: 'SKU-1', barcode: 'OLABC12345', price: 1234.5, weight: 3.2, category: 'Rings' }
+const product = {
+  name: 'Diamond Ring',
+  sku: 'SKU-1',
+  barcode: 'OLABC12345',
+  price: 1234.5,
+  weight: 3.2,
+  category: 'Rings',
+  collection: 'Classic',
+}
 
 test('a full label shows brand, name, code and price', () => {
   const geo = computeLabelGeometry((50 / 25.4) * 72, (40 / 25.4) * 72, true)
-  const lines = computeLabelLines(geo, product, { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' })
+  const lines = computeLabelLines(geo, product, { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' })
   const kinds = lines.map((l) => l.kind)
   assert.ok(kinds.includes('brand'))
   assert.ok(kinds.includes('name'))
@@ -101,7 +168,7 @@ test('a full label shows brand, name, code and price', () => {
 
 test('a tiny label drops optional lines but keeps the name and price', () => {
   const geo = computeLabelGeometry((50 / 25.4) * 72, (10 / 25.4) * 72, true)
-  const lines = computeLabelLines(geo, product, { showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS' })
+  const lines = computeLabelLines(geo, product, { showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE' })
   const kinds = lines.map((l) => l.kind)
   assert.ok(kinds.includes('name'), 'name must never be dropped')
   assert.ok(kinds.includes('price'), 'price should survive on the smallest label')
@@ -147,10 +214,18 @@ test('label geometry leaves no code space when QR is disabled', () => {
 // Scannable payload + smoke test of the real PDF pipeline ---------------------
 
 test('generateLabelsPDF produces a PDF and encodes the identifier', async () => {
-  const pdf = await generateLabelsPDF([product], { width: 50, height: 25, columns: 4, rows: 11, showPrice: true, showWeight: true, showQR: true, showBarcode: true, showBrand: true, brand: 'SREE KANDHAS', copies: 1 })
+  const pdf = await generateLabelsPDF([product], { width: 50, height: 25, columns: 4, rows: 11, showPrice: true, showWeight: true, showQR: true, showBarcode: true, showBrand: true, brand: 'OPAL LINE', copies: 1 })
   assert.ok(pdf, 'expected a PDF buffer')
   assert.ok(pdf!.length > 500)
   assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-')
+})
+
+test('PDF print rendering accepts each of the six selected reference template IDs', async () => {
+  for (const preset of LABEL_PRESET_LIST.slice(0, 6)) {
+    const pdf = await generateLabelsPDF([product], { preset: preset.key })
+    assert.ok(pdf && pdf.length > 500, `${preset.key} should produce a PDF`)
+    assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-', `${preset.key} PDF signature`)
+  }
 })
 
 test('generateLabelsPDF repeats the product once per copy', async () => {
@@ -165,11 +240,17 @@ test('generateLabelsPDF returns null for an empty product list', async () => {
   assert.equal(await generateLabelsPDF([]), null)
 })
 
+test('the label preview/export QR encoder returns a real PNG symbol', async () => {
+  const png = await generateLabelQrBuffer('OLABC12345', 7.875)
+  assert.ok(png.length > 100)
+  assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
+})
+
 test('labels survive a long name and a missing barcode', async () => {
   const longName = 'Antique Finish Hand Crafted Temple Design Silver Necklace With Gemstones'
   const pdf = await generateLabelsPDF(
     [{ name: longName, sku: 'SKU-LONG', price: 99999, weight: 42.5 }],
-    { width: 35, height: 22, columns: 5, rows: 13, showQR: true, showPrice: true, showWeight: true, showBrand: true, brand: 'SREE KANDHAS', copies: 1 } as never,
+    { width: 35, height: 22, columns: 5, rows: 13, showQR: true, showPrice: true, showWeight: true, showBrand: true, brand: 'OPAL LINE', copies: 1 } as never,
   )
   assert.ok(pdf)
   assert.equal(pdf!.subarray(0, 5).toString('latin1'), '%PDF-')

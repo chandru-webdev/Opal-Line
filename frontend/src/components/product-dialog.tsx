@@ -6,6 +6,7 @@ import { Label } from '@/components/ui/label'
 import { CreatableSelect } from '@/components/ui/creatable-select'
 import { Switch } from '@/components/ui/switch'
 import { AppDialog } from '@/components/ui/app-dialog'
+import { toast } from '@/components/ui/confirm'
 import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
 import { findDuplicateProduct, generateBarcode, generateSku, type DuplicateMatch } from '@/lib/productCodes'
 import type { Product, Supplier } from '@/types'
@@ -278,9 +279,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }, [open, mode, product])
 
   // Edit mode: the product already exists, so the server can assign a real,
-  // globally-unique barcode immediately. In add mode we leave the field blank
-  // and the backend generates one on save (see createProductHandler).
-  const generateBarcode = async () => {
+  // globally-unique barcode immediately. Add mode pre-fills a locally generated
+  // EAN-13 (see the effect above) and the backend still assigns one on save if
+  // the field is left blank (see the create route).
+  const generateServerBarcode = async () => {
     if (!product?.id) return
     setBarcodeBusy(true)
     try {
@@ -629,7 +631,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                       variant="outline"
                       size="icon"
                       disabled={barcodeBusy}
-                      onClick={generateBarcode}
+                      onClick={generateServerBarcode}
                       title="Generate a unique barcode"
                     >
                       <Wand2 className={cn('h-4 w-4', barcodeBusy && 'animate-pulse')} />

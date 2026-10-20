@@ -38,7 +38,7 @@ test('a malicious product name cannot inject a ZPL command', () => {
   // The only real ^XZ is the renderer's own closing marker at the very end.
   assert.equal((zpl!.match(/\^XZ/g) ?? []).length, 1)
   assert.equal((zpl!.match(/\^FS/g) ?? []).length, (zpl!.match(/\^FD/g) ?? []).length)
-  assert.ok(zpl!.includes('Evil\\5EFS\\5EXZ\\5EXA'))
+  assert.ok(zpl!.includes('EVIL\\5EFS\\5EXZ\\5EXA'))
 })
 
 // 17. Valid, scannable payloads ----------------------------------------------
@@ -111,7 +111,7 @@ test('renderZpl returns an empty string when there is nothing to print', () => {
   assert.equal(renderZpl([], { width: 50, height: 40 }), '')
 })
 
-test('zplOptionsForPreset resolves the physical size from the shared preset list', () => {
+test('zplOptionsForPreset resolves physical sizes and rejects unknown template keys', () => {
   assert.deepEqual(
     (({ width, height }) => ({ width, height }))(zplOptionsForPreset('label-50x10')),
     { width: 50, height: 10 },
@@ -120,11 +120,33 @@ test('zplOptionsForPreset resolves the physical size from the shared preset list
     (({ width, height }) => ({ width, height }))(zplOptionsForPreset('label-35x22')),
     { width: 35, height: 22 },
   )
-  // Unknown key falls back to the default size rather than throwing.
-  assert.deepEqual(
-    (({ width, height }) => ({ width, height }))(zplOptionsForPreset('nope')),
-    { width: 50, height: 40 },
-  )
+  assert.throws(() => zplOptionsForPreset('nope'), /Unknown label preset/)
+})
+
+test('all six reference template keys keep their brand and code layout in ZPL', () => {
+  const references = [
+    { key: 'label-50x40', brand: 'OPAL LINE', width: 50, height: 40 },
+    { key: 'label-50x25', brand: 'OPAL LINE', width: 50, height: 25 },
+    { key: 'label-35x22', brand: 'OPAL LINE', width: 35, height: 22 },
+    { key: 'label-50x10', brand: 'OPAL LINE', width: 50, height: 10 },
+    { key: 'label-50x10-loni', brand: 'OPAL LINE', width: 50, height: 10 },
+    { key: 'label-50x10-compact', brand: 'OPAL LINE', width: 50, height: 10 },
+  ]
+  for (const ref of references) {
+    const options = zplOptionsForPreset(ref.key, { showPrice: true })
+    const zpl = zplLabel(
+      { name: 'Fusion of Kempu & NA', sku: '0012535', barcode: '0012535', price: 39999 },
+      options,
+    )
+    assert.ok(zpl, ref.key)
+    assert.ok(zpl!.includes(`^PW${ref.width * ZPL_DOTS_PER_MM}`), `${ref.key} width`)
+    assert.ok(zpl!.includes(`^LL${ref.height * ZPL_DOTS_PER_MM}`), `${ref.key} height`)
+    assert.ok(zpl!.includes(`^FD${ref.brand}^FS`), `${ref.key} brand`)
+    assert.ok(zpl!.includes('^FDFUSION OF KEMPU & NA^FS'), `${ref.key} product description`)
+    assert.ok(zpl!.includes('^FDRate: 39999.00/-^FS'), `${ref.key} rate`)
+    assert.ok(zpl!.includes('^FDLA,0012535^FS'), `${ref.key} QR payload`)
+    if (ref.key === 'label-50x10-compact') assert.ok(zpl!.includes('^FD001^FS'), 'compact short code')
+  }
 })
 
 test('missing optional fields never produce an empty ZPL field', () => {
@@ -133,5 +155,5 @@ test('missing optional fields never produce an empty ZPL field', () => {
   // An empty brand is skipped entirely rather than emitting `^FD^FS`, and the
   // name still falls back to a placeholder.
   assert.ok(!zpl!.includes('^FD^FS'))
-  assert.ok(zpl!.includes('^FDProduct^FS'))
+  assert.ok(zpl!.includes('^FDPRODUCT^FS'))
 })

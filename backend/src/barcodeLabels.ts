@@ -10,6 +10,7 @@ export interface ProductLabel {
   price: number
   weight?: number
   category?: string
+  collection?: string
   hsn?: string
   huid?: string
 }
@@ -26,6 +27,7 @@ interface LabelOptions {
   showBrand: boolean
   brand: string
   copies: number
+  codeLength?: number
 }
 
 const DEFAULT_OPTIONS: LabelOptions = {
@@ -38,19 +40,20 @@ const DEFAULT_OPTIONS: LabelOptions = {
   showQR: true,
   showBarcode: true,
   showBrand: true,
-  brand: 'Opal Line',
+  brand: 'OPAL LINE',
   copies: 1,
 }
 
 // ─── Reference designs ───────────────────────────────────────────
-// Every number in LABEL_DESIGNS is transcribed from the supplied Zebra `.prn`
-// print streams (authored at 203 dpi = 8 dots per mm) and converted to
-// millimetres, so a printed label lands on the same grid as the samples:
+// LABEL_DESIGNS retains the recorded Zebra reference geometry (203 dpi = 8
+// dots per mm) converted to millimetres. The original `.prn` files are not
+// present in this checkout, so coordinate changes must be checked against the
+// recorded fixture and reference images rather than inferred from canvas size:
 //
-//   50x40.prn   ^PW799 ^LL320  → two 400×320-dot labels per row (50×40 mm)
-//   50x25.prn   ^PW799 ^LL200  → two 400×200-dot labels per row (50×25 mm)
-//   35x22.prn   ^PW831 ^LL176  → three 280×176-dot labels per row (35×22 mm)
-//   50x 10.prn  ^PW831 ^LL80   → slim strip, content block mapped to 50×10 mm
+//   50×40: ^PW799 ^LL320 → two 400×320-dot labels per row
+//   50×25: ^PW799 ^LL200 → two 400×200-dot labels per row
+//   35×22: ^PW831 ^LL176 → three 280×176-dot labels per row
+//   50×10: ^PW831 ^LL80  → slim strip, artwork mapped to 50×10 mm
 //
 // ZPL places a text field on its BASELINE using the scalable `^A0` font's
 // nominal character height, so each field carries a baseline and a cap height;
@@ -58,7 +61,7 @@ const DEFAULT_OPTIONS: LabelOptions = {
 // reference streams overflow the label if `^BQN` is read as top-anchored, and
 // all four fit exactly when read as bottom-anchored).
 //
-// The 50×10 stream is authored on 104 mm-wide media with its content starting
+// The recorded 50×10 stream is authored on 104 mm-wide media with its content starting
 // at 14.75 mm. That content block (52.4 mm of artwork) is mapped into the real
 // 50 mm label — a uniform 0.897× horizontal compression with every height and
 // the reference's left-to-right ordering preserved. Its two right-hand lines
@@ -70,12 +73,9 @@ export const CAP_HEIGHT = 0.718
 
 /**
  * `^A0N,h,w` measures `h` from ascender to descender rather than to the cap
- * line. Measuring the supplied reference rasterisations — which are pixel-exact
- * 203 dpi renderings of the `.prn` streams — confirms the printed capitals are
- * 718/925 of `h`, i.e. Helvetica's cap height over its cap-plus-descender, and
- * that the em size is therefore `h / 0.925`. Applying the same relation in the
- * PDF is what makes both renderers draw type of identical height: an `h` of 53
- * dots prints 41 dots of capitals on the reference and in the PDF alike.
+ * line. This ratio is retained from recorded reference measurements, but
+ * cannot be independently checked against printer streams in this checkout.
+ * The em size used by PDF and preview is `h / 0.925`.
  */
 export const ZPL_CAP_RATIO = 0.718 / 0.925
 export const ZPL_EM_RATIO = 0.925
@@ -283,7 +283,8 @@ export function textEmWidth(text: string): number {
 export function labelAttributes(product: LabelLineInput, opts: LabelLineOptions): string[] {
   const out: string[] = []
   if (product.category) out.push(String(product.category))
-  if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
+  if (product.collection) out.push(String(product.collection))
+  else if (opts.showWeight !== false && product.weight) out.push(`${product.weight}g`)
   return out
 }
 
@@ -304,13 +305,13 @@ export function designFieldTexts(
     switch (field.kind) {
       case 'brand': {
         const brand = (opts.brand ?? '').trim()
-        if (opts.showBrand !== false && brand) out.push({ kind: 'brand', text: brand })
+        if (opts.showBrand !== false && brand) out.push({ kind: 'brand', text: brand.toLocaleUpperCase() })
         break
       }
       case 'name': {
         // Every reference size prints a name line; a product without one still
         // gets the placeholder rather than an empty field.
-        const name = String(product.name ?? '').trim() || 'Product'
+        const name = (String(product.name ?? '').trim() || 'Product').toLocaleUpperCase()
         out.push({ kind: 'name', text: name })
         break
       }
@@ -318,7 +319,8 @@ export function designFieldTexts(
         if (opts.showPrice !== false) out.push({ kind: 'rate', text: formatLabelRate(product.price) })
         break
       case 'code': {
-        const code = labelCode(product)
+        const rawCode = labelCode(product)
+        const code = opts.codeLength ? rawCode.slice(0, opts.codeLength) : rawCode
         // The slim 50×10 reference prints the bare identifier; every other size
         // prefixes it with "Code:" exactly like the samples.
         if (code) out.push({ kind: 'code', text: design.height <= 12 ? code : `Code: ${code}` })
@@ -339,15 +341,47 @@ export function designFieldTexts(
 // `columns`/`rows` describe how many labels are laid out per A4 sheet; they are
 // derived from the physical label size so the grid always fits the page.
 //
-// The four reference sizes supplied by the store (50×40, 50×25, 50×10, 35×22)
-// are listed first. The remaining entries are kept for backwards compatibility
-// with label stock already in use.
-export const LABEL_PRESETS: Record<string, Partial<LabelOptions>> = {
+// The six reference templates cover four physical sizes; the three 50×10
+// templates share the recorded geometry but retain their own brand/code rules.
+// Remaining entries stay available for backwards compatibility.
+interface LabelPresetOptions extends Partial<LabelOptions> {
+  label?: string
+  reference?: boolean
+}
+
+export const LABEL_PRESETS: Record<string, LabelPresetOptions> = {
   // Requested reference sizes
-  'label-50x40': { width: 50, height: 40, columns: 4, rows: 7 },
-  'label-50x25': { width: 50, height: 25, columns: 4, rows: 11 },
-  'label-35x22': { width: 35, height: 22, columns: 5, rows: 13 },
-  'label-50x10': { width: 50, height: 10, columns: 4, rows: 28 },
+  'label-50x40': { width: 50, height: 40, columns: 4, rows: 7, brand: 'OPAL LINE', reference: true },
+  'label-50x25': { width: 50, height: 25, columns: 4, rows: 11, brand: 'OPAL LINE', reference: true },
+  'label-35x22': { width: 35, height: 22, columns: 5, rows: 13, brand: 'OPAL LINE', reference: true },
+  'label-50x10': {
+    width: 50,
+    height: 10,
+    columns: 4,
+    rows: 28,
+    label: '50 × 10 mm · Standard',
+    brand: 'OPAL LINE',
+    reference: true,
+  },
+  'label-50x10-loni': {
+    width: 50,
+    height: 10,
+    columns: 4,
+    rows: 28,
+    label: '50 × 10 mm · Alternate',
+    brand: 'OPAL LINE',
+    reference: true,
+  },
+  'label-50x10-compact': {
+    width: 50,
+    height: 10,
+    columns: 4,
+    rows: 28,
+    label: '50 × 10 mm · Compact',
+    brand: 'OPAL LINE',
+    codeLength: 3,
+    reference: true,
+  },
   // Existing sizes (kept for backwards compatibility)
   'label-50x22': { width: 50, height: 22, columns: 4, rows: 13 },
   'avery-5160': { width: 63.5, height: 25.4, columns: 3, rows: 10 },
@@ -364,30 +398,34 @@ export interface LabelPresetMeta {
   height: number
   columns: number
   rows: number
-  /** The four sizes supplied as physical design references. */
+  /** A template supplied as a physical design reference. */
   reference: boolean
+  brand?: string
+  codeLength?: number
   /**
    * The transcribed reference geometry (millimetres), when this preset is one
-   * of the four supplied sizes. The print UI uses it to draw a preview that
+   * of the supplied templates. The print UI uses it to draw a preview that
    * matches the printed label exactly instead of an approximation.
    */
   design?: LabelDesign
 }
 
-const REFERENCE_PRESETS = ['label-50x40', 'label-50x25', 'label-50x10', 'label-35x22']
-
 /** Ordered preset list (reference sizes first) for the print UI. */
 export const LABEL_PRESET_LIST: LabelPresetMeta[] = Object.entries(LABEL_PRESETS).map(([key, val]) => {
-  const v = val as LabelOptions
+  const v = val as LabelPresetOptions
+  const width = v.width ?? DEFAULT_OPTIONS.width
+  const height = v.height ?? DEFAULT_OPTIONS.height
   return {
     key,
-    label: `${v.width} × ${v.height} mm`,
-    width: v.width,
-    height: v.height,
-    columns: v.columns,
-    rows: v.rows,
-    reference: REFERENCE_PRESETS.includes(key),
-    design: labelDesignFor(v.width, v.height) ?? undefined,
+    label: v.label ?? `${width} × ${height} mm`,
+    width,
+    height,
+    columns: v.columns ?? DEFAULT_OPTIONS.columns,
+    rows: v.rows ?? DEFAULT_OPTIONS.rows,
+    reference: v.reference ?? false,
+    ...(v.brand ? { brand: v.brand } : {}),
+    ...(v.codeLength ? { codeLength: v.codeLength } : {}),
+    design: labelDesignFor(width, height) ?? undefined,
   }
 })
 
@@ -395,8 +433,10 @@ export const DEFAULT_PRESET = 'label-50x40'
 
 /** Resolve a preset key to a full options object, defaulting unknown keys. */
 export function resolveLabelPreset(preset: string | undefined, overrides: Partial<LabelOptions> = {}): LabelOptions {
-  const base = LABEL_PRESETS[preset ?? ''] ?? LABEL_PRESETS[DEFAULT_PRESET] ?? {}
-  const merged = { ...DEFAULT_OPTIONS, ...base, ...overrides }
+  const key = preset || DEFAULT_PRESET
+  const base = LABEL_PRESETS[key]
+  if (!base) throw new Error(`Unknown label preset: ${key}`)
+  const merged: LabelOptions = { ...DEFAULT_OPTIONS, ...base, ...overrides }
   // `brand` may arrive as `businessName` from older callers.
   const businessName = (overrides as { businessName?: string }).businessName
   if (businessName && !overrides.brand) merged.brand = businessName
@@ -412,6 +452,7 @@ function mapRow(p: any): ProductLabel {
     price: Number(p.selling_price || 0),
     weight: Number(p.net_weight || 0),
     category: p.category || undefined,
+    collection: p.collection || undefined,
     hsn: p.hsn || '7113',
     huid: p.huid || undefined,
   }
@@ -422,7 +463,7 @@ export async function fetchProductLabels(productIds: string[]): Promise<ProductL
   if (!client || productIds.length === 0) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, barcode, selling_price, net_weight, category, hsn, huid FROM products WHERE id = ANY($1)`,
+      `SELECT name, sku, barcode, selling_price, net_weight, category, collection, hsn, huid FROM products WHERE id = ANY($1)`,
       [productIds]
     )
     // Preserve the caller's order — the printed sheet should match the order the
@@ -441,7 +482,7 @@ export async function fetchAllProductLabels(): Promise<ProductLabel[]> {
   if (!client) return []
   try {
     const products = await client.unsafe(
-      `SELECT name, sku, barcode, selling_price, net_weight, category, hsn, huid FROM products ORDER BY name`
+      `SELECT name, sku, barcode, selling_price, net_weight, category, collection, hsn, huid FROM products ORDER BY name`
     )
     return products.map(mapRow)
   } catch (err) {
@@ -472,22 +513,18 @@ export function labelCode(product: Pick<ProductLabel, 'barcode' | 'sku'>): strin
  * (`^FDLA,<data>` means "level L, auto data type"), and keeping the module count
  * whole is what stops a tiny label's code from being blurred by resampling.
  */
-async function generateQRBuffer(data: string, sizeMm: number): Promise<Buffer | null> {
-  try {
-    const qr = await QRCode.create(data, { errorCorrectionLevel: 'L' })
-    const modules = qr.modules.size
-    // ~12 device pixels per point keeps the symbol crisp on a high-res print.
-    const targetPx = mmToPt(sizeMm) * 12
-    const px = Math.max(modules, Math.round(targetPx / modules) * modules)
-    return await QRCode.toBuffer(data, {
-      width: px,
-      margin: 0,
-      errorCorrectionLevel: 'L',
-      color: { dark: '#000000', light: '#ffffff' },
-    })
-  } catch {
-    return null
-  }
+export async function generateLabelQrBuffer(data: string, sizeMm: number): Promise<Buffer> {
+  const qr = await QRCode.create(data, { errorCorrectionLevel: 'L' })
+  const modules = qr.modules.size
+  // ~12 device pixels per point keeps the symbol crisp on a high-res print.
+  const targetPx = mmToPt(sizeMm) * 12
+  const px = Math.max(modules, Math.round(targetPx / modules) * modules)
+  return QRCode.toBuffer(data, {
+    width: px,
+    margin: 0,
+    errorCorrectionLevel: 'L',
+    color: { dark: '#000000', light: '#ffffff' },
+  })
 }
 
 // ─── Adaptive label layout ────────────────────────────────────────
@@ -548,6 +585,7 @@ export interface LabelLineInput {
   price: number
   weight?: number
   category?: string
+  collection?: string
 }
 
 export interface LabelLineOptions {
@@ -557,6 +595,7 @@ export interface LabelLineOptions {
   brand?: string
   /** On very short labels the "Code:" prefix wastes room — drop it. */
   compact?: boolean
+  codeLength?: number
 }
 
 const LINE_HEIGHT = 1.15
@@ -880,15 +919,11 @@ function drawDesignLabel(
 
 export async function generateLabelsPDF(
   products: ProductLabel[],
-  options: Partial<LabelOptions> = {}
+  options: Partial<LabelOptions> & { preset?: string } = {}
 ): Promise<Buffer | null> {
   if (products.length === 0) return null
 
-  const opts = resolveLabelPreset(undefined, { ...options } as Partial<LabelOptions>)
-  // Honour an explicit preset key too (callers pass either the preset name or a
-  // full width/height); resolveLabelPreset already merged the direct fields.
-  const presetKey = (options as { preset?: string }).preset
-  const resolved = presetKey ? resolveLabelPreset(presetKey, options) : opts
+  const resolved = resolveLabelPreset(options.preset, options)
 
   const labelW = mmToPt(resolved.width)
   const labelH = mmToPt(resolved.height)
@@ -907,7 +942,8 @@ export async function generateLabelsPDF(
   const qrBuffers: (Buffer | null)[] = []
   if (resolved.showQR && qrSizeMm > 0) {
     for (const product of expanded) {
-      qrBuffers.push(await generateQRBuffer(labelCode(product), qrSizeMm))
+      const code = labelCode(product)
+      qrBuffers.push(code ? await generateLabelQrBuffer(code, qrSizeMm) : null)
     }
   }
 

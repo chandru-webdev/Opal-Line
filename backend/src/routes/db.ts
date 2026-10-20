@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, or, sql, and, gte, lte } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, isNotNull } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import {
   barcodeFormatError,
@@ -316,6 +316,12 @@ async function labelRequestOptions(source: Record<string, unknown>) {
   return opts
 }
 
+function unknownLabelPresetMessage(error: unknown): string | null {
+  return error instanceof Error && error.message.startsWith('Unknown label preset:')
+    ? error.message
+    : null
+}
+
 dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
     const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF } = await import('../barcodeLabels')
@@ -330,6 +336,8 @@ dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (
     res.send(pdf)
   } catch (err) {
     logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
@@ -348,6 +356,8 @@ dbRouter.post('/products/labels', requirePermission('inventory', 'view'), async 
     res.send(pdf)
   } catch (err) {
     logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
@@ -370,6 +380,7 @@ dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), as
       showPrice: req.body?.showPrice !== false,
       showWeight: req.body?.showWeight !== false,
       showQR: req.body?.showQR !== false && req.body?.qr !== 'false',
+      showBrand: req.body?.showBrand !== false,
       ...(brandName ? { brand: brandName } : {}),
     })
     const zpl = renderZpl(products, opts)
@@ -379,6 +390,8 @@ dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), as
     res.send(zpl)
   } catch (err) {
     logger.error({ err }, 'label ZPL generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
@@ -3482,6 +3495,16 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
     if (!body.id) body.id = randomUUID()
+
+    // A create may state the barcode explicitly; validate it up front so a bad
+    // code is a clean 400 rather than a mid-transaction failure. Otherwise the
+    // product gets a generated code below.
+    const requested = normalizeBarcode(body.barcode)
+    if (requested) {
+      const fmtError = barcodeFormatError(requested)
+      if (fmtError) return res.status(400).json({ error: fmtError })
+    }
+    delete body.barcode
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
