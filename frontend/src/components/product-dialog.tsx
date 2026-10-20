@@ -191,6 +191,15 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
   }
 }
 
+/** One editable stock count in the edit dialog — a row per location. */
+interface StockRow {
+  locationId: string
+  name: string
+  /** Balance the ledger currently holds at this location (whole pcs). */
+  original: number
+  value: string
+}
+
 function Field({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
     <div className={cn('space-y-1.5', className)}>
@@ -228,6 +237,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // Latest catalogue for code generation + duplicate checks without turning
   // `products` into a dependency of the open effect.
   const productsRef = useRef<Product[]>([])
+  // Edit-mode stock counts: one editable row per location. products.stock is
+  // only the cross-location rollup, so the per-location truth comes from the
+  // ledger when the dialog opens.
+  const [levelDraft, setLevelDraft] = useState<StockRow[]>([])
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
 
@@ -274,6 +287,48 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       setError('')
       setDuplicate(null)
     })
+  }, [open, mode, product])
+
+  // Stock levels behind the edit dialog: clear first (deferred — sync setState
+  // in an effect is linted), then load this product's per-location balances.
+  // Products never counted through the ledger have no level rows — seed Main
+  // Store with products.stock; the backend's adoption rule makes saving it
+  // unchanged a no-op instead of a double-count.
+  useEffect(() => {
+    queueMicrotask(() => setLevelDraft((prev) => (prev.length === 0 ? prev : [])))
+    if (!open || mode !== 'edit' || !product?.sku) return
+    const pid = product.id
+    const seed = Math.floor(Number(product.stock ?? 0))
+    let cancelled = false
+    Promise.all([dbApi.getStockLevels(product.sku), dbApi.getInventoryLocations()])
+      .then(([rows, locs]) => {
+        if (cancelled) return
+        const nameFor = (id: string) => locs.find((l) => l.id === id)?.name ?? id
+        const mine = rows
+          .filter((r) => r.productId === pid)
+          .sort((a, b) => String(a.locationId).localeCompare(String(b.locationId)))
+        const draft: StockRow[] =
+          mine.length > 0
+            ? mine.map((r) => {
+                const qty = Math.floor(Number(r.qty) || 0)
+                return { locationId: r.locationId, name: nameFor(r.locationId), original: qty, value: String(qty) }
+              })
+            : [
+                {
+                  locationId: 'LOC-DEFAULT',
+                  name: locs.find((l) => l.id === 'LOC-DEFAULT')?.name ?? 'Main Store',
+                  original: seed,
+                  value: String(seed),
+                },
+              ]
+        setLevelDraft(draft)
+      })
+      .catch(() => {
+        if (!cancelled) setLevelDraft([])
+      })
+    return () => {
+      cancelled = true
+    }
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
@@ -420,12 +475,21 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       }
       let saved: Product
       if (mode === 'edit' && product) {
-        // Stock is owned by the ledger now. Sending it would be rejected, and
-        // even if it were not, the next movement of any kind would recompute
-        // products.stock and silently undo the edit. Change stock with a stock
-        // count at a location, or a transfer.
+        // Stock is owned by the ledger: sending it here would be rejected. The
+        // per-location counts below go through the dedicated endpoint, which
+        // records a count_adjust movement per changed location instead of a
+        // silent overwrite of the rollup.
         const { stock: _stock, ...editable } = body
         saved = await dbApi.update<Product>('products', product.id, editable)
+        const changedRows = levelDraft.filter((r) => Math.floor(Number(r.value) || 0) !== r.original)
+        for (const r of changedRows) {
+          await dbApi.setProductStock(product.id, Math.floor(Number(r.value) || 0), r.locationId)
+        }
+        if (changedRows.length > 0) {
+          // Keep the list in sync without a refetch: the rollup is the sum of
+          // the per-location counts just written.
+          saved = { ...saved, stock: levelDraft.reduce((a, r) => a + Math.floor(Number(r.value) || 0), 0) }
+        }
       } else {
         saved = await dbApi.create<Product>('products', {
           ...body,
@@ -660,13 +724,48 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
               <Field label="Compare-at price (₹)">
                 <Input type="number" step="0.01" value={form.compareAtPrice} onChange={(e) => set('compareAtPrice', e.target.value)} placeholder="Optional strikethrough" />
               </Field>
-              <Field label={mode === 'edit' ? 'Stock (pcs)' : 'Opening stock (pcs)'}>
-                <Input type="number" step="1" value={form.stock} onChange={(e) => set('stock', e.target.value)} disabled={mode === 'edit'} />
-              </Field>
+              {mode === 'edit' ? (
+                <Field label="Stock (pcs)">
+                  {levelDraft.length > 0 ? (
+                    <div className="space-y-1.5">
+                      {levelDraft.map((row, i) => (
+                        <div key={row.locationId} className="flex items-center justify-between gap-2">
+                          <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{row.name}</span>
+                          <Input
+                            type="number"
+                            min={0}
+                            step="1"
+                            aria-label={`Stock at ${row.name}`}
+                            className="w-24"
+                            value={row.value}
+                            onChange={(e) =>
+                              setLevelDraft((prev) => prev.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))
+                            }
+                          />
+                        </div>
+                      ))}
+                      <p className="flex justify-between text-[11px] text-muted-foreground">
+                        <span>Total</span>
+                        <span className="font-medium tabular-nums text-foreground">
+                          {levelDraft.reduce((a, r) => a + Math.floor(Number(r.value) || 0), 0)}
+                        </span>
+                      </p>
+                    </div>
+                  ) : (
+                    // Loading (or a product with no SKU): keep the rollup visible.
+                    <Input type="number" step="1" value={form.stock} disabled />
+                  )}
+                </Field>
+              ) : (
+                <Field label="Opening stock (pcs)">
+                  <Input type="number" step="1" value={form.stock} onChange={(e) => set('stock', e.target.value)} />
+                </Field>
+              )}
               {mode === 'edit' ? (
                 <p className="text-[11px] text-muted-foreground">
-                  Managed by the stock ledger. Use <span className="font-medium text-foreground">Scan Stock Count</span> for
-                  this location or a <span className="font-medium text-foreground">Stock Transfer</span> to move stock.
+                  Saved as a <span className="font-medium text-foreground">count correction</span> in that location's stock
+                  ledger. Use <span className="font-medium text-foreground">Stock Transfer</span> to move stock between
+                  locations.
                 </p>
               ) : null}
             </div>

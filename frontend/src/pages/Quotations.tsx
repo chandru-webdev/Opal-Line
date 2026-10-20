@@ -17,6 +17,7 @@ import {
   XCircle,
   Mail,
   MessageCircle,
+  Pencil,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -90,6 +91,7 @@ export default function QuotationsPage() {
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [form, setForm] = useState({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
@@ -191,9 +193,43 @@ export default function QuotationsPage() {
   const grandTotal = Math.round((itemsTotal + gstAmount - discount) * 100) / 100
 
   const openDialog = () => {
+    setEditingId(null)
     setForm({ customer: '', phone: '', email: '', city: '', notes: '', gst: '3', discount: '0', validUntil: '' })
     setItems([{ ...emptyItem }])
     setError('')
+    setDialogOpen(true)
+  }
+
+  // Reopen the same dialog prefilled to edit an existing quotation. Closed
+  // quotes (converted/cancelled/expired) are read-only downstream.
+  const openEdit = (q: Quotation) => {
+    setEditingId(q.id)
+    setForm({
+      customer: q.customer ?? '',
+      phone: q.customerPhone ?? '',
+      email: q.customerEmail ?? '',
+      city: q.customerCity ?? '',
+      notes: q.notes ?? '',
+      gst: String(q.gst ?? 3),
+      discount: String(q.discount ?? 0),
+      // Date input wants yyyy-mm-dd; keep the date part of the stored instant.
+      validUntil: q.validUntil ? q.validUntil.slice(0, 10) : '',
+    })
+    const existingItems = q.items ?? []
+    setItems(
+      existingItems.length > 0
+        ? existingItems.map((it) => ({
+            product: it.product ?? '',
+            sku: it.sku ?? '',
+            qty: String(it.qty ?? 1),
+            weight: it.weight ? String(it.weight) : '',
+            silverRate: it.silverRate ? String(it.silverRate) : '',
+            makingCharge: it.makingCharge ? String(it.makingCharge) : '',
+          }))
+        : [{ ...emptyItem }],
+    )
+    setError('')
+    setViewQuote(null)
     setDialogOpen(true)
   }
 
@@ -207,29 +243,39 @@ export default function QuotationsPage() {
     if (validItems.length === 0) { setError('Add at least one product line'); return }
     setSaving(true)
     setError('')
+    const payload = {
+      customer: form.customer.trim(),
+      customerPhone: form.phone.trim() || null,
+      customerEmail: form.email.trim() || null,
+      customerCity: form.city.trim() || null,
+      notes: form.notes.trim() || null,
+      validUntil: form.validUntil || null,
+      gst: gstRate,
+      discount,
+      items: validItems.map((it) => ({
+        product: it.product.trim(),
+        sku: it.sku.trim(),
+        qty: Math.max(1, parseInt(it.qty, 10) || 1),
+        weight: parseFloat(it.weight) || 0,
+        silverRate: parseFloat(it.silverRate) || 0,
+        makingCharge: parseFloat(it.makingCharge) || 0,
+      })),
+    }
     try {
-      await dbApi.createQuotation({
-        customer: form.customer.trim(),
-        customerPhone: form.phone.trim() || null,
-        customerEmail: form.email.trim() || null,
-        customerCity: form.city.trim() || null,
-        notes: form.notes.trim() || null,
-        validUntil: form.validUntil || null,
-        gst: gstRate,
-        discount,
-        items: validItems.map((it) => ({
-          product: it.product.trim(),
-          sku: it.sku.trim(),
-          qty: Math.max(1, parseInt(it.qty, 10) || 1),
-          weight: parseFloat(it.weight) || 0,
-          silverRate: parseFloat(it.silverRate) || 0,
-          makingCharge: parseFloat(it.makingCharge) || 0,
-        })),
-      })
+      if (editingId) {
+        await dbApi.updateQuotation(editingId, payload)
+        toast.success('Quotation updated')
+      } else {
+        await dbApi.createQuotation(payload)
+      }
       setDialogOpen(false)
       load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create quotation')
+      setError(
+        err instanceof Error
+          ? err.message
+          : editingId ? 'Failed to update quotation' : 'Failed to create quotation',
+      )
     } finally {
       setSaving(false)
     }
@@ -586,6 +632,16 @@ export default function QuotationsPage() {
                   <TooltipContent>Invoice {row.original.convertedInvoice}</TooltipContent>
                 </Tooltip>
               )}
+              {isLive(row.original.status) && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon-sm" aria-label={`Edit ${row.original.number}`} onClick={() => openEdit(row.original)}>
+                      <Pencil className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Edit quotation</TooltipContent>
+                </Tooltip>
+              )}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button variant="ghost" size="icon-sm" onClick={() => removeQuote(row.original.id)}>
@@ -678,14 +734,14 @@ export default function QuotationsPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         size="2xl"
-        title="New Quotation"
-        description="Create a pre-sale estimate. Nothing is billed until you convert it."
+        title={editingId ? 'Edit Quotation' : 'New Quotation'}
+        description={editingId ? 'Update the estimate. Totals recompute automatically.' : 'Create a pre-sale estimate. Nothing is billed until you convert it.'}
         footer={
           <>
             <Button variant="outline" size="sm" onClick={() => setDialogOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={submit} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              Create Quotation
+              {editingId ? 'Save Changes' : 'Create Quotation'}
             </Button>
           </>
         }

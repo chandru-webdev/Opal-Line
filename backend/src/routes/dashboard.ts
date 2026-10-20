@@ -4,7 +4,7 @@ import { db, schema } from '../db/client'
 import { CONSTANTS } from '../constants'
 import { logger } from '../logger'
 import { computeInputGst, computeTcs, netPayable } from '../gst'
-import { LOCKOUT_DURATION_MS, LOCKOUT_THRESHOLD } from '../lockout'
+import { getLockoutPolicy } from './auth'
 import { computeUserPermissions } from '../rbac'
 import { routeParam } from '../lib/routeParams'
 import { resolveDashboardRange, enumerateBuckets, type DashboardRange } from '../lib/dashboardRange'
@@ -679,19 +679,24 @@ dashboardRouter.get('/dashboard/security', async (req, res) => {
       gte(schema.auditLogs.timestamp, range.from),
       sql`${schema.auditLogs.timestamp} < ${range.to}`,
     )
-    // Locked = threshold reached AND the lockout window still open — the same
-    // rule checkLockout() applies at login (routes/auth.ts), so a stale row
-    // whose window has lapsed no longer reads as a locked account here.
-    const lockCutoff = new Date(Date.now() - LOCKOUT_DURATION_MS).toISOString()
+    // Locked = the install's configured threshold (Settings → Security →
+    // Login lockout) AND the lockout window still open — the same rule
+    // checkLockout() applies at login (routes/auth.ts); a stale row whose
+    // window has lapsed no longer reads as a locked account here, and when
+    // lockout is off nothing is enforced, so the widget reports zero.
+    const policy = await getLockoutPolicy()
+    const lockCutoff = new Date(Date.now() - policy.durationMs).toISOString()
     const [failedActivity, failedAudit, locked, recentActivity, recentAudit] = await Promise.all([
       db!.select({ n: sql<number>`count(*)` }).from(schema.activityLogs).where(failedActivityWhere),
       db!.select({ n: sql<number>`count(*)` }).from(schema.auditLogs).where(failedAuditWhere),
-      db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(
-        and(
-          gte(schema.loginAttempts.count, LOCKOUT_THRESHOLD),
-          gte(schema.loginAttempts.lastAttempt, lockCutoff),
-        ),
-      ),
+      policy.enabled
+        ? db!.select({ n: sql<number>`count(*)` }).from(schema.loginAttempts).where(
+            and(
+              gte(schema.loginAttempts.count, policy.threshold),
+              gte(schema.loginAttempts.lastAttempt, lockCutoff),
+            ),
+          )
+        : Promise.resolve([{ n: 0 }]),
       db!
         .select({ entity: schema.activityLogs.entity, details: schema.activityLogs.details, timestamp: schema.activityLogs.timestamp })
         .from(schema.activityLogs)

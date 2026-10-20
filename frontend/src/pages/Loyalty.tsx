@@ -3,6 +3,7 @@ import {
   Gift,
   History,
   Loader2,
+  Pencil,
   Plus,
   Search,
   Settings,
@@ -85,6 +86,42 @@ export default function LoyaltyPage() {
 
   // Settings dialog (static config display)
   const [showSettings, setShowSettings] = useState(false)
+
+  // Per-row edit: set a customer's balance to an absolute value by applying
+  // the difference as a manual adjustment.
+  const [editPointsFor, setEditPointsFor] = useState<CustomerWithBalance | null>(null)
+  const [editPointsValue, setEditPointsValue] = useState('')
+  const [editPointsReason, setEditPointsReason] = useState('')
+
+  const openEditPoints = useCallback((c: CustomerWithBalance) => {
+    setEditPointsFor(c)
+    setEditPointsValue(String(Math.round(c.balance)))
+    setEditPointsReason('')
+    setError('')
+  }, [])
+
+  const editPointsDelta = editPointsFor
+    ? Math.round(Number(editPointsValue || 0) - editPointsFor.balance)
+    : 0
+
+  const handleEditPoints = async () => {
+    if (!editPointsFor) return
+    const target = Math.round(Number(editPointsValue))
+    if (!Number.isFinite(target) || target < 0) { setError('Enter a valid balance (0 or more)'); return }
+    if (editPointsDelta === 0) { setEditPointsFor(null); return }
+    setSaving(true)
+    setError('')
+    try {
+      await dbApi.loyaltyAdjust(editPointsFor.name, editPointsDelta, editPointsReason.trim() || `Balance set to ${target}`)
+      setMessage({ ok: true, text: `${editPointsFor.name}'s balance updated to ${target.toLocaleString('en-IN')} points` })
+      setEditPointsFor(null)
+      loadData()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update points')
+    } finally {
+      setSaving(false)
+    }
+  }
 
   // All loyalty entries for recent transactions table
   const [allEntries, setAllEntries] = useState<LoyaltyEntry[]>([])
@@ -299,8 +336,23 @@ export default function LoyaltyPage() {
           return <Badge className={t.color} variant="outline">{t.label}</Badge>
         },
       },
+      {
+        id: 'actions',
+        header: 'Actions',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Edit points for ${row.original.name}`}
+            onClick={() => openEditPoints(row.original)}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </Button>
+        ),
+      },
     ],
-    []
+    [openEditPoints]
   )
 
   const transactionColumns = useMemo<ColumnDef<LoyaltyEntry>[]>(
@@ -580,6 +632,53 @@ export default function LoyaltyPage() {
             <Button size="sm" onClick={handleRedeemPoints} disabled={saving}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <TrendingDown className="h-4 w-4" />}
               Redeem Points
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Points Dialog */}
+      <Dialog open={editPointsFor !== null} onOpenChange={(open) => { if (!open) setEditPointsFor(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Points — {editPointsFor?.name}</DialogTitle>
+            <DialogDescription>Set this customer's balance to an absolute value.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-sm">
+              <span className="text-muted-foreground">Current balance</span>
+              <span className="font-semibold tabular-nums text-foreground">{editPointsFor ? editPointsFor.balance.toLocaleString('en-IN') : '0'} pts</span>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-points-value">New balance</Label>
+              <Input
+                id="edit-points-value"
+                type="number"
+                min="0"
+                value={editPointsValue}
+                onChange={(e) => setEditPointsValue(e.target.value)}
+                placeholder="e.g. 250"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Adjustment applied: <b className={editPointsDelta >= 0 ? 'text-emerald-600' : 'text-rose-600'}>{editPointsDelta >= 0 ? '+' : ''}{editPointsDelta}</b> points · 1 point = ₹1
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-points-reason">Reason</Label>
+              <Input
+                id="edit-points-reason"
+                value={editPointsReason}
+                onChange={(e) => setEditPointsReason(e.target.value)}
+                placeholder="e.g. Manual correction, promo bonus..."
+              />
+            </div>
+            {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setEditPointsFor(null)}>Cancel</Button>
+            <Button size="sm" onClick={() => void handleEditPoints()} disabled={saving}>
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Pencil className="h-3.5 w-3.5" />}
+              Save Points
             </Button>
           </DialogFooter>
         </DialogContent>

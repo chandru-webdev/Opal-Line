@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import {
   AlertTriangle,
   ArrowRight,
+  CalendarClock,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -11,6 +12,7 @@ import {
   Gem,
   History,
   IndianRupee,
+  Pencil,
   RefreshCw,
   ShieldCheck,
   Tag,
@@ -37,7 +39,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
-import type { Product, SilverRate, SilverRateAutoStatus, SilverRateRequestRow, SilverRateRow } from '@/types'
+import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateRequestRow, SilverRateRow } from '@/types'
 import { formatCurrency, formatDateTime, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -88,6 +90,21 @@ export default function SilverRatePage() {
   const [togglingAuto, setTogglingAuto] = useState(false)
   const [fetchingNow, setFetchingNow] = useState(false)
   const [fetchNowResult, setFetchNowResult] = useState<{ ok: boolean; message: string } | null>(null)
+  // One-off scheduled rate changes: a rate + a specific date/time applied
+  // automatically then (queue lives in settings.scheduled_rate_changes).
+  // Guided dialog state — rate → when → preview, plus edit-in-place.
+  const [scheduled, setScheduled] = useState<PendingRateChange[]>([])
+  const [schOpen, setSchOpen] = useState(false)
+  const [schStep, setSchStep] = useState(0)
+  const [schRate, setSchRate] = useState('')
+  const [schDate, setSchDate] = useState('')
+  const [schTime, setSchTime] = useState('')
+  const [schNote, setSchNote] = useState('')
+  const [schEditId, setSchEditId] = useState<string | null>(null)
+  const [schSaving, setSchSaving] = useState(false)
+  const [schError, setSchError] = useState('')
+  const [schSuccess, setSchSuccess] = useState('')
+  const [whenPresets, setWhenPresets] = useState<Array<{ key: string; label: string; date: Date }>>([])
 
   const loadAll = useCallback(() => {
     refreshSilverRate()
@@ -102,6 +119,7 @@ export default function SilverRatePage() {
       setIsApprover(false)
     })
     dbApi.getSilverRateAutoStatus().then(setAutoStatus).catch(() => setAutoStatus(null))
+    dbApi.getScheduledRateChanges().then((r) => setScheduled(r.changes ?? [])).catch(() => setScheduled([]))
   }, [refreshSilverRate])
 
   useEffect(() => {
@@ -196,6 +214,171 @@ export default function SilverRatePage() {
       setError(e instanceof Error ? e.message : 'Failed to toggle auto rate')
     } finally {
       setTogglingAuto(false)
+    }
+  }
+
+  // Edit-schedule dialog state — seeded from the live status when opened.
+  const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [schedDays, setSchedDays] = useState<number[]>([0, 1, 2, 3, 4, 5, 6])
+  const [schedTime, setSchedTime] = useState('09:00')
+  const [savingSchedule, setSavingSchedule] = useState(false)
+
+  const scheduleDialogRate = parseFloat(schRate)
+  const scheduleRateValid = Number.isFinite(scheduleDialogRate) && scheduleDialogRate > 0
+
+  /** Local-time instant the dialog's date+time fields describe, or null. */
+  const scheduleInstant = useMemo(() => {
+    if (!schDate || !schTime) return null
+    const at = new Date(`${schDate}T${schTime}:00`)
+    return Number.isNaN(at.getTime()) ? null : at
+  }, [schDate, schTime])
+
+  /** Old → new prices for every product at the dialog's rate (preview step). */
+  const scheduleImpact = useMemo(() => {
+    if (!scheduleRateValid || !scheduleInstant) return null
+    return products.map((p) => {
+      const makingTotal = p.netWeight * p.makingCharge
+      const gstPct = p.gst ?? 3
+      const oldPrice = (p.netWeight * currentRate.rate + makingTotal) * (1 + gstPct / 100)
+      const newPrice = (p.netWeight * scheduleDialogRate + makingTotal) * (1 + gstPct / 100)
+      return { product: p, oldPrice, newPrice }
+    })
+  }, [products, currentRate.rate, scheduleDialogRate, scheduleRateValid, scheduleInstant])
+
+  const scheduleTotalDelta = useMemo(
+    () => (scheduleImpact ? scheduleImpact.reduce((acc, a) => acc + (a.newPrice - a.oldPrice), 0) : 0),
+    [scheduleImpact],
+  )
+
+  const openScheduleDialog = (edit?: PendingRateChange) => {
+    setSchError('')
+    setSchSuccess('')
+    setSchEditId(edit?.id ?? null)
+    // One-click "when" presets — computed here (an event, not render) so the
+    // clock is read exactly when the dialog opens and never goes stale.
+    const tomorrow = (new Date().getDay() + 1) % 7
+    setWhenPresets([
+      { key: 'tmr-9', label: presetLabel(upcomingWeekdayAt(tomorrow, 9), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 9) },
+      { key: 'tmr-18', label: presetLabel(upcomingWeekdayAt(tomorrow, 18), 'Tomorrow'), date: upcomingWeekdayAt(tomorrow, 18) },
+      { key: 'sat-10', label: presetLabel(upcomingWeekdayAt(6, 10), 'Saturday'), date: upcomingWeekdayAt(6, 10) },
+      { key: 'mon-9', label: presetLabel(upcomingWeekdayAt(1, 9), 'Monday'), date: upcomingWeekdayAt(1, 9) },
+    ])
+    if (edit) {
+      const at = new Date(edit.applyAt)
+      setSchRate(String(edit.rate))
+      setSchDate(toDateInputValue(at))
+      setSchTime(toTimeInputValue(at))
+      setSchNote(edit.note ?? '')
+    } else {
+      setSchRate(String(currentRate.rate))
+      // Sensible default: an hour from now, easy to nudge with the presets.
+      const soon = new Date(Date.now() + 60 * 60_000)
+      setSchDate(toDateInputValue(soon))
+      setSchTime(toTimeInputValue(soon))
+      setSchNote('')
+    }
+    setSchStep(0)
+    setSchOpen(true)
+  }
+
+  const goNextFromRate = () => {
+    if (!scheduleRateValid) {
+      setSchError('Enter a valid rate — ₹/gm greater than 0')
+      return
+    }
+    setSchError('')
+    setSchStep(1)
+  }
+
+  const goNextFromWhen = () => {
+    if (!scheduleInstant) {
+      setSchError('Pick the date and time to apply the rate')
+      return
+    }
+    if (scheduleInstant.getTime() <= Date.now() + 60_000) {
+      setSchError('Schedule the change at least a minute in the future')
+      return
+    }
+    setSchError('')
+    setSchStep(2)
+  }
+
+  const submitSchedule = async () => {
+    const rate = parseFloat(schRate)
+    if (!Number.isFinite(rate) || rate <= 0) {
+      setSchError('Enter the rate to schedule (₹/gm)')
+      return
+    }
+    // Date + time are interpreted in this device's zone (IST for the shop).
+    const at = new Date(`${schDate}T${schTime}:00`)
+    if (Number.isNaN(at.getTime())) {
+      setSchError('Invalid date or time')
+      return
+    }
+    if (at.getTime() <= Date.now() + 60_000) {
+      setSchError('Schedule the change at least a minute in the future')
+      return
+    }
+    setSchSaving(true)
+    setSchError('')
+    try {
+      const note = schNote.trim() || undefined
+      const res = schEditId
+        ? await dbApi.updateScheduledRateChange(schEditId, { rate, applyAt: at.toISOString(), note })
+        : await dbApi.scheduleSilverRateChange({ rate, applyAt: at.toISOString(), note })
+      setScheduled(res.changes)
+      setSchOpen(false)
+      setSchSuccess(
+        schEditId
+          ? `Updated — ₹${rate.toFixed(2)}/gm now applies ${formatDateTime(at.toISOString())}.`
+          : `Scheduled — ₹${rate.toFixed(2)}/gm applies ${formatDateTime(at.toISOString())}, automatically.`,
+      )
+    } catch (e) {
+      setSchError(
+        e instanceof Error
+          ? e.message
+          : schEditId
+            ? 'Failed to update the scheduled change'
+            : 'Failed to schedule the rate change',
+      )
+    } finally {
+      setSchSaving(false)
+    }
+  }
+
+  const cancelScheduled = async (id: string) => {
+    setSchError('')
+    try {
+      const res = await dbApi.cancelScheduledRateChange(id)
+      setScheduled(res.changes)
+    } catch (e) {
+      setSchError(e instanceof Error ? e.message : 'Failed to cancel the scheduled change')
+    }
+  }
+
+  const openScheduleEditor = () => {
+    if (autoStatus?.schedule) {
+      setSchedDays(autoStatus.schedule.days)
+      setSchedTime(autoStatus.schedule.time)
+    }
+    setScheduleOpen(true)
+  }
+
+  const saveSchedule = async () => {
+    if (schedDays.length === 0) {
+      setError('Pick at least one day for the silver rate update')
+      return
+    }
+    setSavingSchedule(true)
+    setError('')
+    try {
+      await dbApi.setSilverRateSchedule({ days: schedDays, time: schedTime })
+      setAutoStatus(await dbApi.getSilverRateAutoStatus())
+      setScheduleOpen(false)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save the schedule')
+    } finally {
+      setSavingSchedule(false)
     }
   }
 
@@ -370,7 +553,7 @@ export default function SilverRatePage() {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="rounded-lg border p-3">
                     <p className="text-[10.5px] uppercase tracking-wide text-muted-foreground">Schedule</p>
-                    <p className="mt-0.5 text-[13px] font-semibold text-foreground">Daily {autoStatus.schedule}</p>
+                    <p className="mt-0.5 text-[13px] font-semibold text-foreground">{autoStatus.schedule ? describeRateSchedule(autoStatus.schedule) : 'Every day at 09:00 IST'}</p>
                     <p className="text-[11px] text-muted-foreground">Next: {formatDateTime(autoStatus.nextRunAt)}</p>
                   </div>
                   <div className="rounded-lg border p-3">
@@ -416,6 +599,9 @@ export default function SilverRatePage() {
                   <Button size="sm" variant={autoStatus.enabled ? 'outline' : 'soft-primary'} onClick={toggleAuto} disabled={togglingAuto}>
                     {togglingAuto ? 'Saving…' : autoStatus.enabled ? 'Disable auto rate' : 'Enable auto rate'}
                   </Button>
+                  <Button size="sm" variant="outline" className="gap-1.5" onClick={openScheduleEditor}>
+                    <CalendarClock className="h-3.5 w-3.5" /> Edit schedule
+                  </Button>
                 </div>
               </>
             ) : (
@@ -423,6 +609,417 @@ export default function SilverRatePage() {
             )}
           </CardContent>
         </Card>
+
+        <Card className="lg:col-span-2">
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <div className="flex items-center gap-2">
+              <CalendarClock className="h-4 w-4 text-muted-foreground" />
+              <div>
+                <CardTitle className="text-sm">Scheduled Rate Changes</CardTitle>
+                <CardDescription className="mt-0.5">
+                  One-off: set a rate for an exact date &amp; time — applied automatically then, even while the
+                  app is closed (products repriced and pushed to Shopify).
+                </CardDescription>
+              </div>
+            </div>
+            <Badge variant={scheduled.length > 0 ? 'warning' : 'muted'} dot>
+              {scheduled.length > 0 ? `${scheduled.length} queued` : 'None'}
+            </Badge>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {!schOpen && schError ? (
+              <div className="flex items-start gap-2 rounded-md border border-red-200 bg-red-50/60 px-3 py-2 text-xs text-red-700">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{schError}</span>
+              </div>
+            ) : null}
+            {schSuccess ? (
+              <div className="flex items-start gap-2 rounded-md border border-success-100 bg-success-50/60 px-3 py-2 text-xs text-success-700">
+                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{schSuccess}</span>
+              </div>
+            ) : null}
+            {canApprove ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button className="gap-1.5" onClick={() => openScheduleDialog()}>
+                  <CalendarClock className="h-4 w-4" /> Schedule rate change
+                </Button>
+                <p className="text-[11px] text-muted-foreground">
+                  Changed your mind? Any queued change can be edited or cancelled until it applies.
+                </p>
+              </div>
+            ) : (
+              <p className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-[11px] text-amber-800">
+                <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  Only Admin or Super Admin can schedule a rate change — submit a rate change request instead
+                  and it will be applied once approved.
+                </span>
+              </p>
+            )}
+            {scheduled.length === 0 ? (
+              <p className="text-[12px] text-muted-foreground">
+                Nothing scheduled yet — e.g. set Saturday's rate on Friday afternoon and forget about it.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {scheduled.map((c) => (
+                  <div key={c.id} className="rounded-lg border p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-bold tabular-nums text-foreground">₹{c.rate.toFixed(2)} / gm</span>
+                        <Badge variant={c.rate >= currentRate.rate ? 'success' : 'danger'}>
+                          {c.rate >= currentRate.rate ? '+' : '−'}₹{Math.abs(c.rate - currentRate.rate).toFixed(2)} vs today
+                        </Badge>
+                        <Badge variant="warning" className="gap-1">
+                          <Clock className="h-3 w-3" /> {timeUntil(c.applyAt)}
+                        </Badge>
+                      </div>
+                      {canApprove ? (
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" className="gap-1" onClick={() => openScheduleDialog(c)}>
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => cancelScheduled(c.id)}>
+                            Cancel
+                          </Button>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                      <span className="flex items-center gap-1">
+                        <CalendarClock className="h-3 w-3" /> {formatDateTime(c.applyAt)}
+                      </span>
+                      {c.note ? <span className="italic text-foreground">“{c.note}”</span> : null}
+                      {c.requestedBy ? <span>by {c.requestedBy}</span> : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Dialog open={scheduleOpen} onOpenChange={setScheduleOpen}>
+          <DialogContent size="md">
+            <DialogHeader>
+              <DialogTitle>Silver rate update schedule</DialogTitle>
+              <DialogDescription>
+                Choose the days and the time (IST) the automatic silver-rate update runs. Weekend days are
+                allowed — note that MCX is closed on Saturdays and Sundays, so on those days the fetch may
+                return the last traded rate or fail; manual entry stays available on this page.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <Label>Run on days</Label>
+                <div className="flex flex-wrap gap-1.5">
+                  {[1, 2, 3, 4, 5, 6, 0].map((d) => {
+                    const active = schedDays.includes(d)
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() =>
+                          setSchedDays((prev) => (active ? prev.filter((x) => x !== d) : [...prev, d]))
+                        }
+                        className={cn(
+                          'h-9 w-11 rounded-md border text-xs font-semibold transition-colors',
+                          active
+                            ? 'border-primary-500 bg-primary-50 text-primary-700'
+                            : 'border-border bg-card text-muted-foreground hover:bg-muted',
+                        )}
+                      >
+                        {DAY_LABELS[d]}
+                      </button>
+                    )
+                  })}
+                </div>
+                {schedDays.length === 0 ? (
+                  <p className="text-xs text-destructive">Pick at least one day — the update never runs otherwise.</p>
+                ) : null}
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="rate-schedule-time">Run at (IST)</Label>
+                <Input
+                  id="rate-schedule-time"
+                  type="time"
+                  value={schedTime}
+                  onChange={(e) => setSchedTime(e.target.value)}
+                  className="w-40"
+                />
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Currently active: {autoStatus?.schedule ? describeRateSchedule(autoStatus.schedule) : '—'}
+              </p>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => setScheduleOpen(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={saveSchedule} disabled={savingSchedule || schedDays.length === 0}>
+                {savingSchedule ? 'Saving…' : 'Save schedule'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <Dialog
+          open={schOpen}
+          onOpenChange={(next) => {
+            setSchOpen(next)
+            if (!next) setSchError('')
+          }}
+        >
+          <DialogContent size="2xl">
+            <DialogHeader>
+              <DialogTitle>{schEditId ? 'Edit scheduled rate change' : 'Schedule a silver rate change'}</DialogTitle>
+              <DialogDescription>
+                Set the rate and the exact date &amp; time to apply it — like pressing “Approve &amp; Update
+                Shopify” at that moment, automatically.
+              </DialogDescription>
+            </DialogHeader>
+
+            <ScheduleStepper step={schStep} />
+
+            {schStep === 0 ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="rounded-lg border bg-muted/40 p-3">
+                    <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Current rate</Label>
+                    <p className="mt-1 text-lg font-bold tabular-nums text-foreground">₹{currentRate.rate.toFixed(2)} / gm</p>
+                  </div>
+                  <div className="rounded-lg border border-primary-200 bg-primary-50/60 p-3">
+                    <Label htmlFor="sch-rate" className="text-[11px] uppercase tracking-wide text-primary-700">
+                      Rate to apply
+                      {scheduleRateValid
+                        ? ` (${scheduleDialogRate >= currentRate.rate ? '+' : '−'}₹${Math.abs(scheduleDialogRate - currentRate.rate).toFixed(2)} vs today)`
+                        : ''}
+                    </Label>
+                    <div className="mt-1 flex items-center gap-1.5">
+                      <span className="text-lg font-bold text-foreground">₹</span>
+                      <Input
+                        id="sch-rate"
+                        autoFocus
+                        type="number"
+                        min="0"
+                        step="0.1"
+                        value={schRate}
+                        onChange={(e) => setSchRate(e.target.value)}
+                        className="h-8 w-32 border-primary-200 font-bold tabular-nums focus-visible:ring-primary"
+                      />
+                      <span className="text-sm font-medium text-muted-foreground">/ gm</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick adjustments</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {[-1, -0.5, 0.5, 1].map((delta) => (
+                      <button
+                        key={delta}
+                        type="button"
+                        onClick={() => {
+                          const base = Number.isFinite(parseFloat(schRate)) ? parseFloat(schRate) : currentRate.rate
+                          setSchRate((Math.round((base + delta) * 100) / 100).toFixed(2))
+                        }}
+                        className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold tabular-nums text-muted-foreground transition-colors hover:bg-muted"
+                      >
+                        {delta > 0 ? '+' : '−'}₹{Math.abs(delta).toFixed(2)}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setSchRate(String(currentRate.rate))}
+                      className="h-9 rounded-md border border-border bg-card px-3 text-xs font-semibold text-muted-foreground transition-colors hover:bg-muted"
+                    >
+                      Same as today
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">
+                    Adjustments apply to the number in the box. You'll see the product price impact before saving.
+                  </p>
+                </div>
+              </div>
+            ) : schStep === 1 ? (
+              <div className="space-y-4">
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick picks</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {whenPresets.map((p) => {
+                      const active = schDate === toDateInputValue(p.date) && schTime === toTimeInputValue(p.date)
+                      return (
+                        <button
+                          key={p.key}
+                          type="button"
+                          aria-pressed={active}
+                          onClick={() => {
+                            setSchDate(toDateInputValue(p.date))
+                            setSchTime(toTimeInputValue(p.date))
+                          }}
+                          className={cn(
+                            'h-9 rounded-md border px-3 text-xs font-semibold transition-colors',
+                            active
+                              ? 'border-primary-500 bg-primary-50 text-primary-700'
+                              : 'border-border bg-card text-muted-foreground hover:bg-muted',
+                          )}
+                        >
+                          {p.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-end gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="sch-date" className="text-[11px] uppercase tracking-wide">Date</Label>
+                    <Input
+                      id="sch-date"
+                      type="date"
+                      value={schDate}
+                      onChange={(e) => setSchDate(e.target.value)}
+                      className="h-9 w-44"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="sch-time" className="text-[11px] uppercase tracking-wide">Time (IST)</Label>
+                    <Input
+                      id="sch-time"
+                      type="time"
+                      value={schTime}
+                      onChange={(e) => setSchTime(e.target.value)}
+                      className="h-9 w-32"
+                    />
+                  </div>
+                </div>
+                {scheduleInstant ? (
+                  <p className="text-[12px] text-foreground">
+                    Applies on <span className="font-semibold">{formatDateTime(scheduleInstant.toISOString())}</span>
+                    {' '}· <span className="text-muted-foreground">{timeUntil(scheduleInstant.toISOString())}</span>
+                  </p>
+                ) : null}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="sch-note" className="text-[11px] uppercase tracking-wide">Note (optional)</Label>
+                    <span className="text-[10px] tabular-nums text-muted-foreground">{schNote.length}/120</span>
+                  </div>
+                  <Input
+                    id="sch-note"
+                    maxLength={120}
+                    placeholder="e.g. weekend rate, festival offer…"
+                    value={schNote}
+                    onChange={(e) => setSchNote(e.target.value)}
+                    className="h-9"
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-3">
+                  <MiniBadge label="Rate" value={`₹${scheduleDialogRate.toFixed(2)}`} />
+                  <MiniBadge
+                    label="Change"
+                    value={`${scheduleDialogRate >= currentRate.rate ? '+' : '−'}₹${Math.abs(scheduleDialogRate - currentRate.rate).toFixed(2)}`}
+                    accent={scheduleDialogRate >= currentRate.rate ? 'green' : 'red'}
+                  />
+                  <MiniBadge label="Applies" value={scheduleInstant ? formatDateTime(scheduleInstant.toISOString()) : '—'} />
+                </div>
+                {schNote.trim() ? (
+                  <p className="text-[12px] text-muted-foreground">
+                    Note: <span className="italic text-foreground">“{schNote.trim()}”</span>
+                  </p>
+                ) : null}
+                {scheduleImpact ? (
+                  <div>
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Preview — price changes ({products.length} products)
+                      </p>
+                      <Badge variant="warning">{formatCurrency(scheduleTotalDelta)} total shift</Badge>
+                    </div>
+                    <div className="max-h-64 overflow-auto rounded-lg border">
+                      <Table>
+                        <TableHeader>
+                          <TableRow className="sticky top-0 bg-muted/60">
+                            <TableHead>Product</TableHead>
+                            <TableHead className="text-right">Net Wt</TableHead>
+                            <TableHead className="text-right">Old Price</TableHead>
+                            <TableHead className="text-right">New Price</TableHead>
+                            <TableHead className="text-right">Difference</TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {scheduleImpact.map(({ product, oldPrice, newPrice }) => {
+                            const diff = newPrice - oldPrice
+                            const rounded = Math.abs(diff) < 0.01
+                            return (
+                              <TableRow key={product.id}>
+                                <TableCell>
+                                  <div className="flex items-center gap-2">
+                                    <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                                      <Gem className="h-3.5 w-3.5" />
+                                    </div>
+                                    <div>
+                                      <p className="font-medium text-foreground">{product.name}</p>
+                                      <p className="text-[10px] text-muted-foreground">{product.sku}</p>
+                                    </div>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="text-right tabular-nums text-muted-foreground">{formatWeight(product.netWeight)}</TableCell>
+                                <TableCell className="text-right tabular-nums">{formatCurrency(oldPrice)}</TableCell>
+                                <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(newPrice)}</TableCell>
+                                <TableCell className="text-right">
+                                  <span className={cn('font-semibold tabular-nums', rounded ? 'text-muted-foreground' : diff > 0 ? 'text-success-700' : 'text-red-600 dark:text-red-400')}>
+                                    {rounded ? '—' : `${diff > 0 ? '+' : ''}${formatCurrency(diff)}`}
+                                  </span>
+                                </TableCell>
+                              </TableRow>
+                            )
+                          })}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            )}
+
+            <DialogFooter className="mt-2">
+              {schError ? (
+                <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{schError}</span>
+                </div>
+              ) : null}
+              <Button variant="outline" onClick={() => setSchOpen(false)}>
+                Cancel
+              </Button>
+              {schStep > 0 ? (
+                <Button variant="outline" onClick={() => setSchStep((s) => s - 1)}>
+                  Back
+                </Button>
+              ) : null}
+              {schStep < 2 ? (
+                <Button onClick={schStep === 0 ? goNextFromRate : goNextFromWhen}>
+                  {schStep === 0 ? 'Next: when' : 'Next: preview'} <ArrowRight className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button variant="success" onClick={submitSchedule} disabled={schSaving}>
+                  {schSaving ? (
+                    'Saving…'
+                  ) : schEditId ? (
+                    'Save changes'
+                  ) : (
+                    <>
+                      <CalendarClock className="h-4 w-4" /> Schedule change
+                    </>
+                  )}
+                </Button>
+              )}
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -846,6 +1443,110 @@ function ImpactTile({ label, value, icon: Icon, tint }: { label: string; value: 
         <p className="truncate text-[10.5px] uppercase tracking-wide text-muted-foreground">{label}</p>
         <p className="truncate text-[13px] font-semibold tabular-nums text-foreground">{value}</p>
       </div>
+    </div>
+  )
+}
+
+// ── Silver-rate update schedule helpers ─────────────────────────────────────
+// Weekday labels (index = JS day number, 0=Sun) for the Edit-schedule dialog.
+const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+/**
+ * Human summary of the configured run schedule, e.g. `Every day at 09:00 IST`
+ * or `Sat, Sun at 10:30 IST`. Mirrors describeRateSchedule on the backend
+ * (backend/src/lib/rateSchedule.ts) so the card and tests agree.
+ */
+function describeRateSchedule(schedule: { days: number[]; time: string }): string {
+  const set = new Set(schedule.days)
+  const everyDay = set.size === 7
+  const weekdays = set.size === 5 && [1, 2, 3, 4, 5].every((d) => set.has(d))
+  // Display weeks starting Monday so weekend pairs read "Sat, Sun".
+  const sorted = [...set].sort((a, b) => ((a + 6) % 7) - ((b + 6) % 7))
+  const label = everyDay ? 'Every day' : weekdays ? 'Mon–Fri' : sorted.map((d) => DAY_LABELS[d]).join(', ')
+  return `${label} at ${schedule.time} IST`
+}
+
+/** Human countdown for a pending scheduled change (`in 2d 3h`, `due now`). */
+function timeUntil(iso: string): string {
+  const ms = Date.parse(iso) - Date.now()
+  if (Number.isNaN(ms)) return ''
+  if (ms <= 0) return 'due now'
+  const mins = Math.round(ms / 60_000)
+  if (mins < 60) return `in ${mins}m`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 48) return `in ${hrs}h ${mins % 60}m`
+  return `in ${Math.round(hrs / 24)}d`
+}
+
+// ── Schedule-change dialog helpers ────────────────────────────────────────
+
+/** Date for `<input type="date">` in the device zone (IST for the shop). */
+function toDateInputValue(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** Time for `<input type="time">` in the device zone. */
+function toTimeInputValue(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
+ * The next local-time instant at `weekday, hour:minute` that is still ahead
+ * (today counts when the time hasn't passed yet; otherwise next week).
+ */
+function upcomingWeekdayAt(weekday: number, hour: number, minute = 0, from = new Date()): Date {
+  const d = new Date(from)
+  d.setHours(hour, minute, 0, 0)
+  let delta = (weekday - d.getDay() + 7) % 7
+  // Already past (or within a minute) on the matching day → next week.
+  if (delta === 0 && d.getTime() <= from.getTime() + 60_000) delta = 7
+  d.setDate(d.getDate() + delta)
+  return d
+}
+
+/** Label for a preset instant, e.g. "Tomorrow 9:00 AM". */
+function presetLabel(d: Date, prefix: string): string {
+  const h12 = d.getHours() % 12 === 0 ? 12 : d.getHours() % 12
+  const ampm = d.getHours() >= 12 ? 'PM' : 'AM'
+  return `${prefix} ${h12}:${String(d.getMinutes()).padStart(2, '0')} ${ampm}`
+}
+
+const SCHEDULE_STEP_LABELS = ['Set the rate', 'Pick date & time', 'Preview & confirm']
+
+function ScheduleStepper({ step }: { step: number }) {
+  return (
+    <div className="flex items-center gap-2">
+      {SCHEDULE_STEP_LABELS.map((label, i) => {
+        const done = i < step
+        const active = i === step
+        return (
+          <div key={label} className="flex min-w-0 flex-1 items-center gap-2">
+            <div
+              className={cn(
+                'flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold',
+                done && 'border-success bg-success-50 text-success-700',
+                active && 'border-primary bg-primary text-white shadow-sm',
+                !done && !active && 'border-border text-muted-foreground',
+              )}
+            >
+              {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
+            </div>
+            <p
+              className={cn(
+                'min-w-0 truncate text-xs font-semibold',
+                active ? 'text-foreground' : done ? 'text-success-700' : 'text-muted-foreground',
+              )}
+            >
+              {label}
+            </p>
+            {i < SCHEDULE_STEP_LABELS.length - 1 ? (
+              <div className={cn('h-px flex-1', done ? 'bg-success/40' : 'bg-border')} />
+            ) : null}
+          </div>
+        )
+      })}
     </div>
   )
 }

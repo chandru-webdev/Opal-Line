@@ -2,13 +2,14 @@ import { toast, promptDialog } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
-import { AlertTriangle, Download, FileText, MoreHorizontal, Plus, RefreshCcw, Search, UserPlus, Users, Mail, Phone, ShoppingBag, CircleDollarSign } from 'lucide-react'
+import { AlertTriangle, Coins, Download, FileText, MoreHorizontal, Pencil, Plus, RefreshCcw, Search, UserPlus, Users, Mail, Phone, ShoppingBag, CircleDollarSign } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
@@ -124,6 +125,69 @@ export default function CustomersPage() {
       setCustomers((prev) => prev.map((x) => (x.id === c.id ? { ...x, status: next } : x)))
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Update failed')
+    }
+  }
+
+  // Edit a customer's contact details. Name is the join key used across
+  // orders/invoices, so it stays required here.
+  const [editTarget, setEditTarget] = useState<Customer | null>(null)
+  const [editSaving, setEditSaving] = useState(false)
+  const [editForm, setEditForm] = useState({ name: '', email: '', phone: '', city: '', province: '', status: 'active' as 'active' | 'inactive' })
+
+  const openEdit = (c: Customer) => {
+    setEditTarget(c)
+    setEditForm({
+      name: c.name ?? '',
+      email: c.email ?? '',
+      phone: c.phone ?? '',
+      city: c.city ?? '',
+      province: c.province ?? '',
+      status: c.status === 'inactive' ? 'inactive' : 'active',
+    })
+  }
+
+  const submitEdit = async () => {
+    if (!editTarget) return
+    if (!editForm.name.trim()) { toast.error('Name is required'); return }
+    setEditSaving(true)
+    try {
+      const patch = {
+        name: editForm.name.trim(),
+        email: editForm.email.trim(),
+        phone: editForm.phone.trim(),
+        city: editForm.city.trim(),
+        province: editForm.province.trim(),
+        status: editForm.status,
+      }
+      await dbApi.update('customers', editTarget.id, patch)
+      setCustomers((prev) => prev.map((x) => (x.id === editTarget.id ? { ...x, ...patch } : x)))
+      toast.success('Customer updated')
+      setEditTarget(null)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Update failed')
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
+  // Shared by the row menu and the detail dialog: prompt for a delta and
+  // refresh the balance/history shown in the open detail view.
+  const adjustLoyalty = async (c: Customer) => {
+    const raw = await promptDialog({ title: `Adjust points for ${c.name}`, description: 'Use a negative number to deduct points.', defaultValue: '50', inputType: 'number', confirmLabel: 'Apply' })
+    if (raw === null) return
+    const pts = Number(raw)
+    if (!Number.isFinite(pts) || pts === 0) { toast.error('Enter a non-zero number'); return }
+    setAdjustingPoints(true)
+    try {
+      await dbApi.loyaltyAdjust(c.name, Math.round(pts), 'Manual adjustment')
+      const [b, h] = await Promise.all([dbApi.loyaltyBalance(c.name), dbApi.loyaltyHistory(c.name)])
+      setLoyaltyBalance(b.found ? (b.balance ?? 0) : null)
+      setLoyaltyEntries(h.entries ?? [])
+      toast.success(`Loyalty balance updated for ${c.name}`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Adjust failed')
+    } finally {
+      setAdjustingPoints(false)
     }
   }
 
@@ -349,6 +413,12 @@ export default function CustomersPage() {
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuLabel className="text-xs text-muted-foreground">More actions</DropdownMenuLabel>
+                  <DropdownMenuItem onClick={() => openEdit(c)}>
+                    <Pencil className="h-3.5 w-3.5" /> Edit customer
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void adjustLoyalty(c)}>
+                    <Coins className="h-3.5 w-3.5" /> Adjust loyalty points
+                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => toggleStatus(c)}>
                     {c.status === 'inactive' ? 'Activate' : 'Deactivate'}
                   </DropdownMenuItem>
@@ -534,23 +604,7 @@ export default function CustomersPage() {
                     size="sm"
                     className="h-6 px-2 text-[11px]"
                     disabled={adjustingPoints}
-                    onClick={async () => {
-                      const raw = await promptDialog({ title: `Adjust points for ${viewCustomer.name}`, description: 'Use a negative number to deduct points.', defaultValue: '50', inputType: 'number', confirmLabel: 'Apply' })
-                      if (raw === null) return
-                      const pts = Number(raw)
-                      if (!Number.isFinite(pts) || pts === 0) { toast.error('Enter a non-zero number'); return }
-                      setAdjustingPoints(true)
-                      try {
-                        await dbApi.loyaltyAdjust(viewCustomer.name, Math.round(pts), 'Manual adjustment')
-                        const [b, h] = await Promise.all([dbApi.loyaltyBalance(viewCustomer.name), dbApi.loyaltyHistory(viewCustomer.name)])
-                        setLoyaltyBalance(b.found ? (b.balance ?? 0) : null)
-                        setLoyaltyEntries(h.entries ?? [])
-                      } catch (err) {
-                        toast.error(err instanceof Error ? err.message : 'Adjust failed')
-                      } finally {
-                        setAdjustingPoints(false)
-                      }
-                    }}
+                    onClick={() => void adjustLoyalty(viewCustomer)}
                   >
                     Adjust
                   </Button>
@@ -682,6 +736,58 @@ export default function CustomersPage() {
               <Button type="submit" disabled={saving || !addName.trim()}>{saving ? 'Saving...' : 'Save Customer'}</Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open) setEditTarget(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Customer</DialogTitle>
+            <DialogDescription>Update contact details and status.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-cust-name">Name</Label>
+              <Input id="edit-cust-name" value={editForm.name} onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))} placeholder="Full name" required />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="edit-cust-email">Email</Label>
+                <Input id="edit-cust-email" type="email" value={editForm.email} onChange={(e) => setEditForm((f) => ({ ...f, email: e.target.value }))} placeholder="name@example.com" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-cust-phone">Phone</Label>
+                <Input id="edit-cust-phone" value={editForm.phone} onChange={(e) => setEditForm((f) => ({ ...f, phone: e.target.value }))} placeholder="+91..." />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="edit-cust-city">City</Label>
+                <Input id="edit-cust-city" value={editForm.city} onChange={(e) => setEditForm((f) => ({ ...f, city: e.target.value }))} placeholder="City" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-cust-province">State / Province</Label>
+                <Input id="edit-cust-province" value={editForm.province} onChange={(e) => setEditForm((f) => ({ ...f, province: e.target.value }))} placeholder="State" />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>Status</Label>
+              <Select
+                options={[
+                  { value: 'active', label: 'Active' },
+                  { value: 'inactive', label: 'Inactive' },
+                ]}
+                value={editForm.status}
+                onValueChange={(v) => setEditForm((f) => ({ ...f, status: v === 'inactive' ? 'inactive' : 'active' }))}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditTarget(null)} disabled={editSaving}>Cancel</Button>
+            <Button onClick={() => void submitEdit()} disabled={editSaving || !editForm.name.trim()}>
+              {editSaving ? 'Saving...' : 'Save Changes'}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
