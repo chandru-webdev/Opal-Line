@@ -248,7 +248,7 @@ export function validateReferenceLabelPresets(
     const actual = actualPresets.find(
       (candidate): candidate is LabelPreset => isLabelPreset(candidate) && candidate.key === expected.key,
     )
-    if (!actual || !expected.design) return false
+    if (!actual || !actual.design || !expected.design) return false
     return Boolean(
       actual.width === expected.width &&
       actual.height === expected.height &&
