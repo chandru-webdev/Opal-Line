@@ -1,8 +1,9 @@
-import { toast } from '@/components/ui/confirm'
+import { toast, confirmDialog } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
 import {
+  Barcode,
   Copy,
   Download,
   ExternalLink,
@@ -18,6 +19,7 @@ import {
   Search,
   Tags,
   Upload,
+  Wand2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
@@ -116,6 +118,8 @@ export default function ProductsPage() {
   const [reorderQty, setReorderQty] = useState('')
   const [reorderSaving, setReorderSaving] = useState(false)
   const [duplicates, setDuplicates] = useState<Array<{ sku: string; cnt: number; products: string }>>([])
+  const [barcodeBusy, setBarcodeBusy] = useState<string | null>(null)
+  const [missingBarcodes, setMissingBarcodes] = useState(0)
 
   const load = useCallback(() => {
     setLoading(true)
@@ -134,6 +138,10 @@ export default function ProductsPage() {
       .getProductDuplicates()
       .then((r) => setDuplicates(r.data))
       .catch(() => setDuplicates([]))
+    dbApi
+      .getBarcodeSummary()
+      .then((s) => setMissingBarcodes(s.missing))
+      .catch(() => setMissingBarcodes(0))
   }, [])
 
   useEffect(() => {
@@ -185,7 +193,11 @@ export default function ProductsPage() {
   const filtered = useMemo(() => {
     return products.filter((p) => {
       const q = query.trim().toLowerCase()
-      const matchQuery = !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q)
+      const matchQuery =
+        !q ||
+        p.name.toLowerCase().includes(q) ||
+        p.sku.toLowerCase().includes(q) ||
+        (p.barcode ?? '').toLowerCase().includes(q)
       const matchCategory = !category || p.category === category
       const matchPurity = !purity || String(p.purity) === purity
       const matchStock =
@@ -212,7 +224,9 @@ export default function ProductsPage() {
       await dbApi.create('products', {
         name: `${p.name} (Copy)`,
         sku: `${p.sku}-COPY`,
-        barcode: p.barcode ?? '',
+        // Deliberately do NOT copy the barcode — one barcode identifies exactly
+        // one product, so the copy gets its own generated code.
+        barcode: '',
         category: p.category,
         collection: p.collection ?? '',
         purity: p.purity ?? '92.5',
@@ -243,6 +257,50 @@ export default function ProductsPage() {
     }
   }, [load])
 
+  const generateBarcode = useCallback(async (p: Product) => {
+    setBarcodeBusy(p.id)
+    try {
+      const res = await dbApi.generateProductBarcode(p.id)
+      setProducts((prev) => prev.map((x) => (x.id === p.id ? { ...x, barcode: res.barcode } : x)))
+      setMissingBarcodes((n) => Math.max(0, n - 1))
+      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not generate a barcode')
+    } finally {
+      setBarcodeBusy(null)
+    }
+  }, [])
+
+  const generateAllMissing = useCallback(async () => {
+    try {
+      const preview = await dbApi.generateMissingBarcodes({ dryRun: true })
+      if (preview.candidates === 0) {
+        toast.info('Every product already has a barcode')
+        return
+      }
+      const ok = await confirmDialog({
+        title: `Generate ${preview.candidates} barcode${preview.candidates === 1 ? '' : 's'}?`,
+        description: 'Only products without a barcode are updated. Existing barcodes are never changed.',
+        confirmLabel: 'Generate',
+      })
+      if (!ok) return
+      const result = await dbApi.generateMissingBarcodes({})
+      toast.success(`Assigned ${result.assigned} barcode${result.assigned === 1 ? '' : 's'}`)
+      load()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not generate barcodes')
+    }
+  }, [load])
+
+  const printLabelsFor = useCallback(
+    (list: Product[]) => {
+      const withIds = list.filter((p) => p.id)
+      if (withIds.length === 0) return
+      navigate(`/inventory/barcode?ids=${withIds.map((p) => p.id).join(',')}`)
+    },
+    [navigate],
+  )
+
   const columns = useMemo<ColumnDef<Product>[]>(
     () => [
       {
@@ -272,6 +330,41 @@ export default function ProductsPage() {
                 <p className="text-[11px] text-muted-foreground">{row.original.sku}{row.original.huid ? ` · HUID ${row.original.huid}` : ''}</p>
               </div>
             </Link>
+          )
+        },
+      },
+      {
+        id: 'barcode',
+        header: 'Barcode',
+        meta: { headerClassName: 'min-w-[150px]' },
+        cell: ({ row }) => {
+          const code = (row.original.barcode ?? '').trim()
+          if (!code) {
+            return (
+              <span className="flex items-center gap-1.5">
+                <Badge variant="warning" dot>
+                  Missing
+                </Badge>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  disabled={barcodeBusy === row.original.id}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    generateBarcode(row.original)
+                  }}
+                  title="Generate barcode"
+                >
+                  <Wand2 className={cn('h-3.5 w-3.5', barcodeBusy === row.original.id && 'animate-pulse')} />
+                </Button>
+              </span>
+            )
+          }
+          return (
+            <span className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+              <Barcode className="h-3.5 w-3.5 shrink-0" />
+              {code}
+            </span>
           )
         },
       },
@@ -384,10 +477,13 @@ export default function ProductsPage() {
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" asChild>
-                <Link to="/inventory/barcode">
-                  <Tags className="h-3.5 w-3.5" />
-                </Link>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => printLabelsFor([row.original])}
+                title="Print label"
+              >
+                <Tags className="h-3.5 w-3.5" />
               </Button>
               </TooltipTrigger>
               <TooltipContent>Print Label</TooltipContent>
@@ -414,7 +510,7 @@ export default function ProductsPage() {
         ),
       },
     ],
-    [pushProducts, pushing, toggleStatus, duplicateProduct],
+    [pushProducts, pushing, toggleStatus, duplicateProduct, barcodeBusy, generateBarcode, printLabelsFor],
   )
 
   return (
@@ -437,8 +533,13 @@ export default function ProductsPage() {
               <Download className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Download Catalog</span>
             </Button>
             {selectedProducts.length > 0 && (
-              <Button variant="outline" size="sm" onClick={() => backupApi.downloadAllLabels({ ids: selectedProducts.map((p) => p.id) })}>
+              <Button variant="outline" size="sm" onClick={() => printLabelsFor(selectedProducts)}>
                 <Tags className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Print Labels ({selectedProducts.length})</span>
+              </Button>
+            )}
+            {missingBarcodes > 0 && (
+              <Button variant="outline" size="sm" onClick={generateAllMissing}>
+                <Wand2 className="h-3.5 w-3.5" /> <span className="hidden sm:inline">Generate Barcodes ({missingBarcodes})</span>
               </Button>
             )}
             <Button variant="outline" size="sm" onClick={() => exportTable('products.csv', columns, filtered)}>
@@ -536,6 +637,7 @@ export default function ProductsPage() {
               {viewProduct.compareAtPrice ? <DetailRow label="Compare At" value={formatCurrency(viewProduct.compareAtPrice)} /> : null}
               <DetailRow label="GST" value={viewProduct.gst != null ? `${viewProduct.gst}%` : '—'} />
               {viewProduct.hsn ? <DetailRow label="HSN" value={viewProduct.hsn} /> : null}
+              <DetailRow label="Barcode" value={(viewProduct.barcode ?? '').trim() || 'Not assigned'} />
               <DetailRow label="Stock" value={`${viewProduct.stock ?? 0} pcs${(viewProduct.stock ?? 0) <= (viewProduct.reorderLevel ?? 0) ? ' · LOW' : ''}`} />
               <DetailRow label="Reorder Level" value={viewProduct.reorderLevel != null ? `${viewProduct.reorderLevel} pcs` : 'Not set'} />
               {viewProduct.supplier ? <DetailRow label="Supplier" value={viewProduct.supplier} /> : null}
