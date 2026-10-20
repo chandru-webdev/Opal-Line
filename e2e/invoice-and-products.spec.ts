@@ -334,4 +334,133 @@ test.describe('invoice mutations round-trip', () => {
       await apiClient.dispose()
     }
   })
+
+  test('New Invoice opens a dialog on the page (no redirect) and saves a manual invoice', async ({ page }) => {
+    const stamp = Date.now()
+    const customer = `E2E Manual Cust ${stamp}`
+    const itemName = `E2E Manual Ring ${stamp}`
+
+    const apiClient = await api()
+    try {
+      await page.goto('/sales/invoices')
+      await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
+
+      // The requirement: New Invoice must open a dialog IN PLACE. It used to
+      // bounce the user to the sales-order page to raise one from an order.
+      await page.getByRole('button', { name: /New Invoice/ }).click()
+      await expect(page).toHaveURL(/\/sales\/invoices/, { timeout: 5000 })
+
+      const dialog = page.getByRole('dialog')
+      await expect(dialog).toBeVisible({ timeout: 10000 })
+      await expect(dialog.getByText('New Sales Invoice')).toBeVisible()
+
+      // Header — customer is the only required field.
+      await dialog.getByPlaceholder('Walk-in customer').fill(customer)
+
+      // First line, typed by hand (no SKU): stock is left alone without one.
+      const line = dialog.locator('table tbody tr').first()
+      await line.getByPlaceholder('Item name / SKU').fill(itemName)
+      await line.locator('td').nth(2).locator('input').fill('10') // weight (gm)
+      await line.locator('td').nth(3).locator('input').fill('90') // rate (₹/gm)
+
+      await dialog.getByRole('button', { name: /Create invoice/ }).click()
+
+      // The create dialog closes rather than navigating away.
+      await expect(page.getByText('New Sales Invoice')).toHaveCount(0, { timeout: 20000 })
+      await expect(page).toHaveURL(/\/sales\/invoices/)
+
+      // A read-only preview of the new invoice opens on top; dismiss it.
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 })
+
+      // It persisted: the API knows the number minted for this customer…
+      const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()
+      const saved = (list.data as Array<{ id: string; number: string; customer: string; grandTotal: number }>).find(
+        (r) => r.customer === customer,
+      )
+      expect(saved, 'manually created invoice must exist in the API').toBeTruthy()
+      expect(saved!.grandTotal, 'totals are computed from the line').toBeGreaterThan(0)
+
+      // …and the table renders it.
+      await expect(page.locator('table tbody tr', { hasText: saved!.number })).toHaveCount(1, { timeout: 20000 })
+    } finally {
+      // Cleanup must never mask the real assertion: skip quietly if the list
+      // call itself failed (e.g. the session died mid-test).
+      try {
+        const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()
+        const doomed = ((list.data ?? []) as Array<{ id: string; customer: string }>).filter(
+          (r) => r.customer === customer,
+        )
+        for (const r of doomed) await apiClient.del(`/api/v1/db/invoices/${r.id}`)
+      } catch { /* nothing to clean up */ }
+      await apiClient.dispose()
+    }
+  })
+
+  test('Sales Orders offers manual invoicing from the header and the row menu', async ({ page }) => {
+    const stamp = Date.now()
+    const customer = `E2E Order Cust ${stamp}`
+
+    const apiClient = await api()
+    // Fixture: one order, so the row action has a buyer to pre-fill from.
+    const orderResp = await apiClient.post('/api/v1/db/sales-orders', {
+      shopifyId: `#E2E-MANINV-${stamp}`,
+      customer,
+      value: 100,
+      payment: 'pending',
+      status: 'unfulfilled',
+      date: new Date().toISOString(),
+      items: 1,
+      lineItems: [{ title: 'E2E Manual Source', sku: `E2E-MANINV-${stamp}`, quantity: 1, price: 100 }],
+    })
+    expect(orderResp.status(), `create order fixture: ${await orderResp.text()}`).toBe(201)
+    const order = (await orderResp.json()) as { id: string }
+
+    try {
+      await page.goto('/sales/orders')
+      await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
+
+      // Header: opens the same dialog in place and starts blank.
+      await page.getByRole('button', { name: 'New Invoice' }).click()
+      await expect(page).toHaveURL(/\/sales\/orders/, { timeout: 5000 })
+      const dialog = page.getByRole('dialog')
+      await expect(dialog.getByText('New Sales Invoice')).toBeVisible({ timeout: 10000 })
+      await expect(dialog.getByPlaceholder('Walk-in customer')).toHaveValue('')
+      await dialog.getByRole('button', { name: /^Cancel$/ }).click()
+      await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 })
+
+      // Row menu: opens the same dialog with the order's buyer pre-filled.
+      const row = page.locator('table tbody tr', { hasText: customer })
+      await expect(row).toHaveCount(1, { timeout: 20000 })
+      // The trigger is a bare icon button with no accessible name.
+      await row.first().locator('button:has(svg.lucide-more-horizontal)').click()
+      await page.getByRole('menuitem', { name: /New invoice for this customer/ }).click()
+
+      await expect(dialog.getByPlaceholder('Walk-in customer')).toHaveValue(customer, { timeout: 10000 })
+      const line = dialog.locator('table tbody tr').first()
+      await line.getByPlaceholder('Item name / SKU').fill(`E2E Order Ring ${stamp}`)
+      await line.locator('td').nth(2).locator('input').fill('5')
+      await line.locator('td').nth(3).locator('input').fill('90')
+      await dialog.getByRole('button', { name: /Create invoice/ }).click()
+      await expect(page.getByText('New Sales Invoice')).toHaveCount(0, { timeout: 20000 })
+
+      // The invoice landed, billed to the order's customer.
+      const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()
+      const saved = ((list.data ?? []) as Array<{ number: string; customer: string; grandTotal: number }>).find(
+        (r) => r.customer === customer,
+      )
+      expect(saved, 'invoice created from the orders page must exist in the API').toBeTruthy()
+      expect(saved!.grandTotal, 'totals are computed from the line').toBeGreaterThan(0)
+    } finally {
+      try {
+        const list = await (await apiClient.get('/api/v1/db/invoices?limit=200')).json()
+        const doomed = ((list.data ?? []) as Array<{ id: string; customer: string }>).filter(
+          (r) => r.customer === customer,
+        )
+        for (const r of doomed) await apiClient.del(`/api/v1/db/invoices/${r.id}`)
+        await apiClient.del(`/api/v1/db/sales-orders/${order.id}`)
+      } catch { /* nothing to clean up */ }
+      await apiClient.dispose()
+    }
+  })
 })

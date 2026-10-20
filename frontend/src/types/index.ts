@@ -350,6 +350,17 @@ export type SilverRateSubmitResponse =
   | ({ direct: true } & SilverRateUpdateResult)
   | { direct: false; ok: true; request: SilverRateRequestRow; message: string }
 
+/** Live progress of an in-flight silver-rate apply (polled by the wizard). */
+export interface SilverRateProgress {
+  running: boolean
+  phase: 'idle' | 'syncing' | 'repricing' | 'matching' | 'pushing' | 'done'
+  label: string
+  done: number
+  total: number
+  startedAt: string | null
+  error: string | null
+}
+
 export interface SilverRateAutoStatus {
   enabled: boolean
   nextRunAt: string

@@ -1195,7 +1195,7 @@ async function setVariantPrice(variantId: number, price: number) {
   }
 }
 
-export async function applyPriceSync() {
+export async function applyPriceSync(onProgress?: (done: number, total: number) => void) {
   const pending = store.price.filter((p) => p.status === 'update')
   if (!(await acquireSyncLock('price'))) return { ok: false, message: 'A sync is already in progress' }
   if (pending.length === 0) { releaseSyncLock(); return { ok: true, updated: 0, skipped: 0, errors: [] as string[] } }
@@ -1205,7 +1205,7 @@ export async function applyPriceSync() {
   const errors: string[] = []
 
   try {
-    for (const p of pending) {
+    for (const [index, p] of pending.entries()) {
       if (!p.variantId) {
         p.status = 'no-match'
         skipped++
@@ -1215,6 +1215,7 @@ export async function applyPriceSync() {
         await setVariantPrice(p.variantId, p.targetPrice)
         p.status = 'updated'
         updated++
+        onProgress?.(index + 1, pending.length)
         addLog('price', 'success', 1, `Price updated: ${p.sku}`)
         await persistLog({ entity: 'Price', shopifyId: p.sku, direction: 'out', action: 'Price Update', status: 'success' })
       } catch (err) {
@@ -1226,6 +1227,7 @@ export async function applyPriceSync() {
         await persistLog({ entity: 'Price', shopifyId: p.sku, direction: 'out', action: 'Price Update', status: 'failed', error: message, retry: true })
       }
     }
+    onProgress?.(pending.length, pending.length)
     if (updated > 0) store.lastSync.price = new Date().toISOString()
     return { ok: errors.length === 0, updated, skipped, errors }
   } finally {
@@ -2226,16 +2228,58 @@ export async function getLatestSilverRate(): Promise<{ rate: number; purity: num
   }
 }
 
+// ─── Live progress for an in-flight silver-rate apply ──────────────────────
+// The Silver Rate page polls this while its update request is running, so the
+// user sees which phase the repricing is in (and how far along the Shopify
+// push is) instead of a frozen spinner. One apply at a time.
+export interface SilverRateProgress {
+  running: boolean
+  phase: 'idle' | 'syncing' | 'repricing' | 'matching' | 'pushing' | 'done'
+  label: string
+  done: number
+  total: number
+  startedAt: string | null
+  error: string | null
+}
+
+let silverRateProgress: SilverRateProgress = {
+  running: false,
+  phase: 'idle',
+  label: '',
+  done: 0,
+  total: 0,
+  startedAt: null,
+  error: null,
+}
+
+export function getSilverRateProgress(): SilverRateProgress {
+  return { ...silverRateProgress }
+}
+
+function setSilverRateProgress(patch: Partial<SilverRateProgress>): void {
+  silverRateProgress = { ...silverRateProgress, ...patch }
+}
+
 export async function applySilverRate(
   rate: number,
   options?: { syncFirst?: boolean; source?: 'manual' | 'auto' | 'approval'; actorName?: string | null },
 ): Promise<SilverUpdateResult> {
+  setSilverRateProgress({
+    running: true,
+    phase: options?.syncFirst ? 'syncing' : 'repricing',
+    label: options?.syncFirst ? 'Syncing the product catalog from Shopify' : 'Applying the new silver rate',
+    done: 0,
+    total: 0,
+    startedAt: new Date().toISOString(),
+    error: null,
+  })
   const previous = await getLatestSilverRate()
   const previousRate = previous?.rate ?? 92.8
 
   if (options?.syncFirst) {
     const synced = await syncProductsToDb()
     if (!synced.ok) {
+      setSilverRateProgress({ running: false, phase: 'done', label: 'Product sync failed before repricing', error: synced.errors.join('; ') })
       return {
         ok: false,
         rate,
@@ -2251,6 +2295,7 @@ export async function applySilverRate(
   }
 
   if (!db) {
+    setSilverRateProgress({ running: false, phase: 'done', label: 'Database is not configured', error: 'Database is not configured' })
     return { ok: false, rate, previousRate, affected: 0, matched: 0, updated: 0, skipped: 0, errors: [], message: 'Database is not configured' }
   }
 
@@ -2276,6 +2321,8 @@ export async function applySilverRate(
       approvedBy: source === 'approval' ? actorName : null,
     })
   } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to save silver rate'
+    setSilverRateProgress({ running: false, phase: 'done', label: 'Failed to save the new rate', error: message })
     return { ok: false, rate, previousRate, affected: 0, matched: 0, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to save silver rate'] }
   }
 
@@ -2284,6 +2331,7 @@ export async function applySilverRate(
     .from(schema.products)
 
   let recomputed = 0
+  setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
   for (const row of rows) {
     const netWeight = Number(row.netWeight)
     const makingCharge = Number(row.makingCharge)
@@ -2291,6 +2339,7 @@ export async function applySilverRate(
     const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
     await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
     recomputed++
+    setSilverRateProgress({ done: recomputed })
   }
 
   await recordAudit({
@@ -2314,12 +2363,14 @@ export async function applySilverRate(
 
   if (isConfigured()) {
     try {
+      setSilverRateProgress({ phase: 'matching', label: 'Matching local products to the Shopify catalog', done: 0, total: 0 })
       await syncPrices()
       const pending = store.price.filter((p) => p.status === 'update')
       matched = store.price.filter((p) => p.status !== 'no-match').length
       steps.push({ key: 'match', label: 'Match products to Shopify', status: 'done', detail: `${matched} matched, ${store.price.filter((p) => p.status === 'no-match').length} without a Shopify match` })
       if (pending.length > 0) {
-        const result = await applyPriceSync()
+        setSilverRateProgress({ phase: 'pushing', label: 'Pushing the new prices to Shopify', done: 0, total: pending.length })
+        const result = await applyPriceSync((done) => setSilverRateProgress({ done }))
         updated = result.updated ?? 0
         skipped = result.skipped ?? 0
         errors.push(...(result.errors ?? []))
@@ -2346,6 +2397,14 @@ export async function applySilverRate(
 
   // Record the Shopify push outcome on the rate row for the history table.
   const syncStatus = !isConfigured() ? 'skipped' : errors.length === 0 ? 'synced' : 'failed'
+  setSilverRateProgress({
+    running: false,
+    phase: 'done',
+    label: errors.length === 0
+      ? `Rate applied — ${recomputed} repriced, ${updated} pushed to Shopify`
+      : `Finished with ${errors.length} error(s)`,
+    error: errors.length > 0 ? errors[0] ?? null : null,
+  })
   if (db) {
     try {
       const [latestRow] = await db

@@ -12,6 +12,8 @@ import {
   Gem,
   History,
   IndianRupee,
+  Maximize2,
+  Minimize2,
   Pencil,
   RefreshCw,
   ShieldCheck,
@@ -39,7 +41,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
-import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateRequestRow, SilverRateRow } from '@/types'
+import type { PendingRateChange, Product, SilverRate, SilverRateAutoStatus, SilverRateProgress, SilverRateRequestRow, SilverRateRow } from '@/types'
 import { formatCurrency, formatDateTime, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -75,6 +77,9 @@ export default function SilverRatePage() {
   const [newRate, setNewRate] = useState('')
   const [dialogOpen, setDialogOpen] = useState(false)
   const [processing, setProcessing] = useState(false)
+  // Live backend progress of the in-flight apply, plus the minimised-pill view.
+  const [rateProgress, setRateProgress] = useState<SilverRateProgress | null>(null)
+  const [rateMinimized, setRateMinimized] = useState(false)
   const [error, setError] = useState('')
   const [products, setProducts] = useState<Product[]>([])
   const [syncFirst, setSyncFirst] = useState(true)
@@ -167,8 +172,22 @@ export default function SilverRatePage() {
   const openUpdate = () => {
     setNewRate(String(currentRate.rate))
     setStep(1)
+    setRateProgress(null)
+    setRateMinimized(false)
     setDialogOpen(true)
   }
+
+  // Poll the backend's live apply progress while the update request runs.
+  useEffect(() => {
+    if (!processing) return
+    let alive = true
+    const tick = () => {
+      dbApi.getSilverRateProgress().then((p) => { if (alive) setRateProgress(p) }).catch(() => undefined)
+    }
+    tick()
+    const id = setInterval(tick, 900)
+    return () => { alive = false; clearInterval(id) }
+  }, [processing])
 
   const confirmChange = () => {
     setStep(2)
@@ -190,6 +209,8 @@ export default function SilverRatePage() {
       setError(e instanceof Error ? e.message : 'Failed to update silver rate')
     } finally {
       setProcessing(false)
+      // One last fetch so the pill/panel keeps the final phase's label.
+      dbApi.getSilverRateProgress().then(setRateProgress).catch(() => undefined)
     }
   }
 
@@ -1148,7 +1169,16 @@ export default function SilverRatePage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+      <Dialog
+        open={dialogOpen && !rateMinimized}
+        onOpenChange={(open) => {
+          if (open) { setDialogOpen(true); return }
+          // Closing while the update runs minimises it to the floating pill —
+          // the request keeps running, it is not cancelled.
+          if (processing) setRateMinimized(true)
+          else setDialogOpen(false)
+        }}
+      >
         <DialogContent size="3xl">
           <DialogHeader>
             <DialogTitle>Update Silver Rate</DialogTitle>
@@ -1282,6 +1312,33 @@ export default function SilverRatePage() {
                 </div>
               )}
 
+              {processing ? (
+                <div data-testid="rate-progress" className="rounded-lg border border-primary-100 bg-primary-50/40 p-3">
+                  <div className="flex items-center justify-between gap-2 text-xs font-medium text-primary-900">
+                    <span className="flex min-w-0 items-center gap-2">
+                      <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                      <span className="truncate">{rateProgress?.label || 'Applying the new silver rate…'}</span>
+                    </span>
+                    {rateProgress && rateProgress.total > 0 ? (
+                      <span className="shrink-0 tabular-nums text-primary-700">{rateProgress.done}/{rateProgress.total}</span>
+                    ) : null}
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-primary-100">
+                    {rateProgress && rateProgress.total > 0 ? (
+                      <div
+                        className="h-full rounded-full bg-primary-600 transition-all duration-300"
+                        style={{ width: `${Math.min(100, Math.round((rateProgress.done / rateProgress.total) * 100))}%` }}
+                      />
+                    ) : (
+                      <div className="h-full w-1/3 animate-pulse rounded-full bg-primary-600" />
+                    )}
+                  </div>
+                  <p className="mt-1.5 text-[11px] text-primary-700/80">
+                    Phase: {rateProgress?.phase ?? 'working'} — you can minimize this and keep working; the update continues.
+                  </p>
+                </div>
+              ) : null}
+
               <DialogFooter className="mt-2">
                 {error ? (
                   <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
@@ -1298,11 +1355,16 @@ export default function SilverRatePage() {
                   </>
                 ) : (
                   <>
-                    <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
+                    {processing ? (
+                      <Button variant="ghost" size="sm" className="mr-auto" onClick={() => setRateMinimized(true)}>
+                        <Minimize2 className="h-3.5 w-3.5" /> Minimize
+                      </Button>
+                    ) : null}
+                    <Button variant="outline" onClick={() => setStep(1)} disabled={processing}>Back</Button>
                     <Button variant="success" onClick={approve} disabled={processing}>
                       {processing ? (
                         <>
-                          <RefreshCw className="h-4 w-4 animate-spin" /> Updating Shopify...
+                          <RefreshCw className="h-4 w-4 animate-spin" /> {rateProgress?.label ? `${rateProgress.label}…` : 'Updating prices...'}
                         </>
                       ) : (
                         <>
@@ -1383,6 +1445,54 @@ export default function SilverRatePage() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* Minimised live-progress pill — the update keeps running server-side
+          while the wizard is hidden; click the expand icon to bring it back. */}
+      {rateMinimized && dialogOpen ? (
+        <div
+          data-testid="rate-progress-pill"
+          className="fixed bottom-5 right-5 z-[70] w-72 rounded-xl border border-primary-100 bg-card p-3 shadow-lg"
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-foreground">
+              {processing ? (
+                <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin text-primary-700" />
+              ) : (
+                <CheckCircle2 className={cn('h-3.5 w-3.5 shrink-0', result && !result.ok ? 'text-red-600 dark:text-red-400' : 'text-success-600')} />
+              )}
+              <span className="truncate">Silver rate update</span>
+            </div>
+            <button
+              type="button"
+              aria-label="Restore rate update"
+              onClick={() => setRateMinimized(false)}
+              className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <Maximize2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <p className="mt-1.5 truncate text-[11px] text-muted-foreground">
+            {rateProgress?.label || (processing ? 'Working…' : 'Idle')}
+          </p>
+          {rateProgress && rateProgress.total > 0 ? (
+            <>
+              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-primary-100">
+                <div
+                  className="h-full rounded-full bg-primary-600 transition-all duration-300"
+                  style={{ width: `${Math.min(100, Math.round((rateProgress.done / rateProgress.total) * 100))}%` }}
+                />
+              </div>
+              <p className="mt-1 text-right text-[10px] tabular-nums text-muted-foreground">
+                {rateProgress.done}/{rateProgress.total}
+              </p>
+            </>
+          ) : processing ? (
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-primary-100">
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-primary-600" />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   )
 }

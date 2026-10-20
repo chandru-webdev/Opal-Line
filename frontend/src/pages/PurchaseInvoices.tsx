@@ -9,6 +9,7 @@ import {
   Pencil,
   Plus,
   Receipt,
+  RefreshCw,
   Search,
   Trash2,
   Wallet,
@@ -112,6 +113,7 @@ export default function PurchaseInvoicesPage() {
 
   const [editing, setEditing] = useState<PurchaseInvoiceDetail | null>(null)
   const [saving, setSaving] = useState(false)
+  const [recreatingId, setRecreatingId] = useState<string | null>(null)
   const [formError, setFormError] = useState('')
   const [header, setHeader] = useState({ number: '', supplier: '', date: todayIST(), supplierGstin: '', tcsRate: '0' })
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
@@ -345,6 +347,32 @@ export default function PurchaseInvoicesPage() {
       load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Could not delete the invoice')
+    }
+  }
+
+  // Cancel the invoice (reverses its stock) and raise a fresh copy with the
+  // same lines under a new supplier invoice number.
+  const recreateInvoice = async (invoice: PurchaseInvoice) => {
+    if (
+      !(await confirmDialog({
+        title: `Cancel and recreate ${invoice.number}?`,
+        description:
+          'The current invoice is cancelled and its stock is taken back, then a fresh invoice with the same lines is raised under a new number. Record payments against the new invoice.',
+        confirmLabel: 'Cancel & recreate',
+      }))
+    ) {
+      return
+    }
+    setRecreatingId(invoice.id)
+    try {
+      const r = await dbApi.recreatePurchaseInvoice(invoice.id)
+      toast.success(`${r.cancelled} cancelled and recreated as ${r.invoice}`)
+      setViewInvoice(null)
+      load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not recreate the invoice')
+    } finally {
+      setRecreatingId(null)
     }
   }
 
@@ -597,6 +625,20 @@ export default function PurchaseInvoicesPage() {
             {viewInvoice && viewInvoice.status !== 'cancelled' ? (
               <Button variant="outline" onClick={() => cancelInvoice(viewInvoice)}>
                 <Ban className="h-3.5 w-3.5" /> Cancel Invoice
+              </Button>
+            ) : null}
+            {viewInvoice && viewInvoice.status !== 'cancelled' ? (
+              <Button
+                variant="outline"
+                onClick={() => void recreateInvoice(viewInvoice)}
+                disabled={recreatingId === viewInvoice.id}
+              >
+                {recreatingId === viewInvoice.id ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}{' '}
+                Cancel & Recreate
               </Button>
             ) : null}
             {viewInvoice ? (

@@ -804,6 +804,22 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
   }
 })
 
+// Next free sales-invoice number: the settings prefix plus a date stamp and a
+// random run, retried against the unique index (same shape the order-raised
+// invoices in orderEmailIngest.ts mint, kept in sync via the shared settings row).
+async function nextSalesInvoiceNumber(): Promise<string> {
+  const [settingsRow] = await db!.select().from(s.settings).where(eq(s.settings.id, 'app')).limit(1)
+  const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
+  const now = new Date()
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = `${prefix}${stamp}${Math.floor(1000 + Math.random() * 9000)}`
+    const [clash] = await db!.select({ id: s.salesInvoices.id }).from(s.salesInvoices).where(eq(s.salesInvoices.number, candidate)).limit(1)
+    if (!clash) return candidate
+  }
+  return `${prefix}${stamp}${Date.now().toString().slice(-6)}`
+}
+
 dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
@@ -812,7 +828,10 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
-    if (!clean.number) return res.status(400).json({ error: 'Invoice number is required' })
+    // Manual (dialog-raised) invoices carry no number — mint one on the server
+    // using the same settings-driven prefix and stamp as order-raised invoices,
+    // so both flows share one numbering scheme and the client never invents it.
+    if (!clean.number) clean.number = await nextSalesInvoiceNumber()
     // Every dated report (dashboard, GST, HSN, statements, day book) filters on
     // this column — an invoice without one is invisible in all of them.
     if (!clean.date) clean.date = new Date().toISOString()

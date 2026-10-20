@@ -123,7 +123,23 @@ export default function ProductsPage() {
     dbApi
       .getProducts()
       .then((p) => {
-        setProducts(p)
+        // Show newest-added first by default. created_at is a date column
+        // (YYYY-MM-DD) with no time-of-day and product ids are random UUIDs,
+        // so ordering is newest-day-first; products added the same day tie
+        // and fall back to the API's name-ordered sequence (stable, so the
+        // list never reorders on re-render). A timestamped created_at would
+        // let same-day rows be ordered too.
+        const withTime = p.map((product, index) => ({
+          product,
+          index,
+          t: Date.parse(product.createdAt ?? ''),
+        }))
+        withTime.sort((a, b) => {
+          const at = Number.isFinite(a.t) ? a.t : Number.NEGATIVE_INFINITY
+          const bt = Number.isFinite(b.t) ? b.t : Number.NEGATIVE_INFINITY
+          return bt !== at ? bt - at : a.index - b.index
+        })
+        setProducts(withTime.map((x) => x.product))
         setLoading(false)
       })
       .catch((e) => {
