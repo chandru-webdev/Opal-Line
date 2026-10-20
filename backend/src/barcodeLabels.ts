@@ -3,6 +3,7 @@ import PDFDocument from 'pdfkit'
 import { getRawClient } from './db/client'
 import { logger } from './logger'
 
+
 export interface ProductLabel {
   name: string
   sku: string

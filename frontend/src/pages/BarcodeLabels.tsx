@@ -633,4 +633,5 @@ export default function BarcodeLabelsPage() {
       </div>
     </div>
   )
+  
 }
