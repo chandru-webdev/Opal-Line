@@ -190,7 +190,23 @@ export const dbApi = {
       (res) => res.points,
     ),
   getLowStock: (): Promise<LowStockItem[]> => request('/db/dashboard/low-stock'),
-  getRecentActivities: (range?: DashboardRangeInput): Promise<Activity[]> => request(rangePath('/db/dashboard/activities', range)),
+  getRecentActivities: (
+    range?: DashboardRangeInput | string,
+    params?: { limit?: number; cursor?: string | null },
+  ): Promise<{ items: Activity[]; total: number; nextCursor: string | null }> => {
+    const query = new URLSearchParams()
+    if (typeof range === 'string') {
+      query.set('period', range)
+    } else if (range) {
+      if (range.period) query.set('period', range.period)
+      if ('start' in range && (range as any).start) query.set('start', (range as any).start)
+      if ('end' in range && (range as any).end) query.set('end', (range as any).end)
+    }
+    if (typeof params?.limit === 'number') query.set('limit', String(params.limit))
+    if (params?.cursor) query.set('cursor', params.cursor)
+    const qs = query.toString()
+    return request(qs ? `/db/dashboard/activities?${qs}` : '/db/dashboard/activities')
+  },
   getDashboardSecurity: (range?: DashboardRangeInput): Promise<{ failedLogins: number; lockedAccounts: number; recent: Array<{ entity: string | null; details: string | null; timestamp: string | null }> }> =>
     request(rangePath('/db/dashboard/security', range)),
   getNotificationFeed: () =>

@@ -79,8 +79,9 @@ test(
 
       const res = await get('/dashboard/activities?period=today')
       assert.equal(res.status, 200)
-      assert.ok(Array.isArray(res.body), 'returns an array')
-      const titles: string[] = res.body.map((r: { title: string }) => String(r.title))
+      const body = Array.isArray(res.body) ? res.body : res.body?.items
+      assert.ok(Array.isArray(body), 'returns an array')
+      const titles: string[] = body.map((r: { title: string }) => String(r.title))
       const idx = (needle: string) => titles.findIndex((t) => t.includes(needle))
       assert.ok(idx(`${marker}-act`) >= 0, 'the activity_logs row is present')
       assert.ok(idx(`${marker}-aud`) >= 0, 'the audit_logs row is present')
@@ -89,10 +90,10 @@ test(
         idx(`${marker}-act`) < idx(`${marker}-aud`),
         'merged feed is newest-first across both tables',
       )
-      const actRow = res.body[idx(`${marker}-act`)]
+      const actRow = body[idx(`${marker}-act`)]
       assert.equal(actRow.actor, 'System')
       assert.equal(actRow.detail, 'from activity_logs')
-      const audRow = res.body[idx(`${marker}-aud`)]
+      const audRow = body[idx(`${marker}-aud`)]
       assert.equal(audRow.detail, 'from audit_logs')
     } finally {
       const { inArray } = await import('drizzle-orm')

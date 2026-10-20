@@ -82,6 +82,9 @@ const STOCK_LEDGER_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS stock_movements_location_id_idx ON stock_movements (location_id)`,
   `CREATE INDEX IF NOT EXISTS stock_movements_date_idx ON stock_movements (date)`,
   `CREATE INDEX IF NOT EXISTS stock_movements_ref_idx ON stock_movements (ref_type, ref_id)`,
+  // Activity/audit feeds need timestamp ordering across large histories.
+  `CREATE INDEX IF NOT EXISTS activity_logs_timestamp_id_idx ON activity_logs (timestamp DESC, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS audit_logs_timestamp_id_idx ON audit_logs (timestamp DESC, id DESC)`,
   // Receipt variance. These live on stock_transfers, which predates this array,
   // so the columns are added rather than created. ADD COLUMN IF NOT EXISTS is
   // idempotent, which keeps this array safe to run on every boot.
