@@ -75,14 +75,14 @@ backend/            Express + Drizzle + PostgreSQL API
   drizzle/          generated SQL migrations
 frontend/           React 19 + Vite 8 + Tailwind 4 UI
   src/
-    pages/          one file per route (68 pages)
+    pages/          one file per route (63 pages)
     components/ui/  the design-system primitives
     components/     feature components (dialogs, charts, layout, shopify)
     lib/api/        typed API client, one module per backend domain
     auth/           AuthProvider + context
     types/          shared TypeScript types
 electron/           main process, preload bridge, print, log rotation, updater
-e2e/                Playwright specs (52 tests across 9 spec files)
+e2e/                Playwright specs (68 tests across 9 spec files)
 scripts/            build, packaging, maintenance and audit utilities
 docs/               this documentation set
 ```
