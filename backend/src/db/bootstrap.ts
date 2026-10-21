@@ -93,6 +93,36 @@ const STOCK_LEDGER_DDL: string[] = [
   // which is what they already did.
   `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS location_id text`,
   `ALTER TABLE purchase_invoices ADD COLUMN IF NOT EXISTS location_id text`,
+  // Settings → Product codes: configurable SKU/barcode auto-generation
+  // (src/lib/productCodes.ts). NULL means "use the shipped defaults" (SLV +
+  // {PREFIX}-{CATEGORY}-{SEQ} + EAN-13 890…), so installs that never open the
+  // new tab keep generating exactly the codes they always did.
+  `ALTER TABLE settings ADD COLUMN IF NOT EXISTS sku_prefix text`,
+  `ALTER TABLE settings ADD COLUMN IF NOT EXISTS sku_suffix text`,
+  `ALTER TABLE settings ADD COLUMN IF NOT EXISTS sku_format text`,
+  `ALTER TABLE settings ADD COLUMN IF NOT EXISTS sku_seq_length integer`,
+  `ALTER TABLE settings ADD COLUMN IF NOT EXISTS barcode_prefix text`,
+  // Shopify-style options: `options` holds `[{ name, values }]` on the parent
+  // product; each option-value combination is a row in product_variants.
+  `ALTER TABLE products ADD COLUMN IF NOT EXISTS options jsonb`,
+  `CREATE TABLE IF NOT EXISTS product_variants (
+    id text PRIMARY KEY,
+    product_id text NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    title text NOT NULL,
+    option_values jsonb NOT NULL,
+    sku text NOT NULL,
+    barcode text,
+    selling_price numeric,
+    compare_at_price numeric,
+    cost_price numeric,
+    gross_weight numeric,
+    stock integer NOT NULL DEFAULT 0,
+    reorder_level integer,
+    status text,
+    created_at timestamp
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS product_variants_sku_idx ON product_variants (sku)`,
+  `CREATE INDEX IF NOT EXISTS product_variants_product_id_idx ON product_variants (product_id)`,
 ]
 
 async function createSchema(sql: postgres.Sql): Promise<void> {

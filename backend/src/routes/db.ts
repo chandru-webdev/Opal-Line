@@ -10,6 +10,7 @@ import {
   recoveryPasswordSchema,
   normalizeGstin,
   normalizeEmail,
+  saveProductVariantsSchema,
   validateSupplierInput,
 } from '../validation'
 import { clearRecoveryPassword, getRecoveryPasswordSource, isRecoveryRole, RECOVERY_PASSWORD_HASH_KEY, RECOVERY_PASSWORD_KEY, setRecoveryPassword } from '../recoveryPassword'
@@ -58,6 +59,28 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
     }
     clampRule('lockoutThreshold', 1, 50)
     clampRule('lockoutDurationMinutes', 1, 1440)
+    // Settings → Product codes: normalise rather than reject, so a scripted
+    // PUT can never store a format template without {SEQ} (which would mint
+    // identical SKUs forever) or a non-digit barcode prefix. Mirrors
+    // normalizedCodeSettings in src/lib/productCodes.ts.
+    if (out.skuPrefix !== undefined) out.skuPrefix = String(out.skuPrefix ?? '').trim().toUpperCase().slice(0, 12) || null
+    if (out.skuSuffix !== undefined) out.skuSuffix = String(out.skuSuffix ?? '').trim().toUpperCase().slice(0, 12) || null
+    if (out.skuFormat !== undefined) {
+      const fmt = String(out.skuFormat ?? '').trim().slice(0, 80)
+      out.skuFormat = fmt.includes('{SEQ}') ? fmt : null
+    }
+    if (out.skuSeqLength !== undefined && out.skuSeqLength !== null) {
+      const n = Number(out.skuSeqLength)
+      if (!Number.isFinite(n)) throw new Error('skuSeqLength must be a number')
+      out.skuSeqLength = Math.min(8, Math.max(1, Math.round(n)))
+    } else if (out.skuSeqLength === null) {
+      // NULL means "back to the shipped default" — never clamp it to 1.
+      out.skuSeqLength = null
+    }
+    if (out.barcodePrefix !== undefined) {
+      const digits = String(out.barcodePrefix ?? '').replace(/\D/g, '').slice(0, 11)
+      out.barcodePrefix = digits || null
+    }
   }
   // Stock/price floors: the transactional order/invoice paths guard stock with
   // row locks, but direct product writes must never push stock or prices negative.
@@ -3868,6 +3891,146 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
       return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
     }
     res.status(400).json({ error: 'Failed to create product' })
+  }
+})
+
+// ─── Shopify-style product variants ────────────────────────────────────────
+// Option definitions live on the parent (products.options: [{ name, values }]);
+// each option-value combination is a product_variants row with its own SKU,
+// barcode, price and stock. products.stock is kept as the SUM of the variant
+// stocks (via a count_adjust ledger movement, never a silent overwrite), so
+// every existing sale, report and ledger flow keeps working on the parent.
+
+dbRouter.get('/products/:id/variants', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, options: s.products.options })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+    const variants = await db!.select().from(s.productVariants).where(eq(s.productVariants.productId, product.id))
+    res.json({ options: Array.isArray(product.options) ? product.options : [], variants })
+  } catch (err) {
+    logger.error({ err }, 'product variants read failed')
+    res.status(500).json({ error: 'Failed to load variants' })
+  }
+})
+
+// Replace-all save (the dialog owns the whole option/variant set, exactly
+// like Shopify's editor): validate, then swap the variant rows in one
+// transaction and roll the stock difference into the parent ledger.
+dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  const parsed = saveProductVariantsSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors })
+  }
+  const { options, variants } = parsed.data
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+
+    // Identifier uniqueness: within the set, against sibling products, and
+    // against variants of other products (the sku unique index would 500 on
+    // a clash — answer with the conflicting code instead).
+    const seenSku = new Set<string>()
+    const seenBarcode = new Set<string>()
+    for (const v of variants) {
+      const sku = v.sku.trim().toUpperCase()
+      const barcode = (v.barcode ?? '').trim()
+      if (!sku) return res.status(400).json({ error: 'Every variant needs a SKU', field: 'sku' })
+      if (seenSku.has(sku)) return res.status(400).json({ error: `Duplicate variant SKU: ${v.sku}`, field: 'sku' })
+      seenSku.add(sku)
+      if (barcode) {
+        if (seenBarcode.has(barcode)) return res.status(400).json({ error: `Duplicate variant barcode: ${barcode}`, field: 'barcode' })
+        seenBarcode.add(barcode)
+      }
+    }
+    const skuList = variants.map((v) => v.sku.trim())
+    const [skuClash] = await db!
+      .select({ sku: s.products.sku })
+      .from(s.products)
+      .where(and(ne(s.products.id, product.id), inArray(sql`upper(${s.products.sku})`, skuList.map((x) => x.toUpperCase()))))
+      .limit(1)
+    if (skuClash) return res.status(400).json({ error: `SKU ${skuClash.sku} is already used by another product`, field: 'sku' })
+    const barcodes = variants.map((v) => (v.barcode ?? '').trim()).filter(Boolean)
+    if (barcodes.length > 0) {
+      const [barClash] = await db!
+        .select({ sku: s.products.sku })
+        .from(s.products)
+        .where(and(ne(s.products.id, product.id), inArray(s.products.barcode, barcodes)))
+        .limit(1)
+      if (barClash) return res.status(400).json({ error: `Barcode is already used by product ${barClash.sku}`, field: 'barcode' })
+    }
+
+    const newSum = variants.reduce((a, v) => a + Math.max(0, Math.floor(v.stock)), 0)
+    const [oldAgg] = await db!
+      .select({ sum: sql<number>`coalesce(sum(${s.productVariants.stock}), 0)` })
+      .from(s.productVariants)
+      .where(eq(s.productVariants.productId, product.id))
+    const oldSum = Math.floor(Number(oldAgg?.sum ?? 0))
+
+    await db!.transaction(async (tx) => {
+      await tx.delete(s.productVariants).where(eq(s.productVariants.productId, product.id))
+      if (variants.length > 0) {
+        await tx.insert(s.productVariants).values(
+          variants.map((v) => ({
+            id: v.id?.trim() || randomUUID(),
+            productId: product.id,
+            title: v.title.trim(),
+            optionValues: v.optionValues,
+            sku: v.sku.trim(),
+            barcode: (v.barcode ?? '').trim() || null,
+            sellingPrice: v.sellingPrice ?? null,
+            compareAtPrice: v.compareAtPrice ?? null,
+            costPrice: v.costPrice ?? null,
+            grossWeight: v.grossWeight ?? null,
+            stock: Math.max(0, Math.floor(v.stock)),
+            reorderLevel: v.reorderLevel ?? null,
+            status: v.status ?? 'active',
+            createdAt: new Date().toISOString(),
+          })),
+        )
+      }
+      await tx
+        .update(s.products)
+        .set({ options })
+        .where(eq(s.products.id, product.id))
+      // Roll the variant-stock difference into the parent's ledger as a
+      // count correction — visible in stock history, never a silent overwrite.
+      const delta = newSum - oldSum
+      const sku = String(product.sku ?? '').trim()
+      if (delta !== 0 && sku) {
+        await applyStockMovement({
+          sku,
+          qty: delta,
+          type: 'count_adjust',
+          locationId: await ensureDefaultLocation(),
+          refType: 'product_edit',
+          note: `variant stock ${oldSum} → ${newSum} (${delta > 0 ? '+' : ''}${delta})`,
+          createdBy: actorFromRequest(req).userId ?? 'system',
+          tx,
+        })
+      }
+    })
+
+    recordCrud('products', 'Updated', req, { ...product, name: `variants of ${product.sku}` })
+    const saved = await db!.select().from(s.productVariants).where(eq(s.productVariants.productId, product.id))
+    const [parent] = await db!
+      .select({ stock: s.products.stock, options: s.products.options })
+      .from(s.products)
+      .where(eq(s.products.id, product.id))
+      .limit(1)
+    res.json({ options: parent?.options ?? options, variants: saved, stock: parent?.stock ?? newSum })
+  } catch (err) {
+    logger.error({ err }, 'product variants save failed')
+    res.status(400).json({ error: 'Failed to save variants' })
   }
 })
 

@@ -33,6 +33,8 @@ import type {
   Payment,
   PaymentStatusSegment,
   Product,
+  ProductOption,
+  ProductVariant,
   PurchaseInvoice,
   PurchaseInvoiceDetail,
   PurchaseInvoiceInput,
@@ -416,6 +418,30 @@ export const dbApi = {
     request<{ ok: boolean; changed: boolean; stock: number; previous: number; locationId: string }>(
       `/db/products/${encodeURIComponent(productId)}/stock`,
       { method: 'PATCH', body: JSON.stringify(locationId ? { stock, locationId } : { stock }) },
+    ),
+  /**
+   * Shopify-style variants: the option definitions on the parent plus one row
+   * per option-value combination. Saving is replace-all (the product dialog
+   * owns the whole set) and the backend rolls the stock difference into the
+   * parent's ledger as a count correction.
+   */
+  getProductVariants: (productId: string) =>
+    request<{ options: ProductOption[]; variants: ProductVariant[] }>(
+      `/db/products/${encodeURIComponent(productId)}/variants`,
+    ),
+  saveProductVariants: (
+    productId: string,
+    body: {
+      options: ProductOption[]
+      variants: Array<
+        Pick<ProductVariant, 'title' | 'optionValues' | 'sku' | 'stock'> &
+          Partial<Pick<ProductVariant, 'id' | 'barcode' | 'sellingPrice' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
+      >
+    },
+  ) =>
+    request<{ options: ProductOption[]; variants: ProductVariant[]; stock: number }>(
+      `/db/products/${encodeURIComponent(productId)}/variants`,
+      { method: 'PUT', body: JSON.stringify(body) },
     ),
   createInvoiceForOrder: (orderId: string) =>
     request<{ created: boolean; invoiceNumber: string | null }>(`/db/sales-orders/${encodeURIComponent(orderId)}/create-invoice`, {

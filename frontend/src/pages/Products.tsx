@@ -285,7 +285,18 @@ export default function ProductsPage() {
               )}
               <div className="min-w-0">
                 <p className="truncate font-medium text-foreground group-hover:text-primary-700">{row.original.name}</p>
-                <p className="text-[11px] text-muted-foreground">{row.original.sku}{row.original.huid ? ` · HUID ${row.original.huid}` : ''}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {row.original.sku}
+                  {(() => {
+                    // Shopify-style options: show the combination count (what
+                    // the stock actually splits into), not the option count.
+                    const opts = Array.isArray(row.original.options) ? row.original.options : []
+                    if (opts.length === 0) return ''
+                    const combos = opts.reduce((a, o) => a * Math.max(1, o.values?.length ?? 0), 1)
+                    return combos > 0 ? ` · ${combos} variant${combos === 1 ? '' : 's'}` : ''
+                  })()}
+                  {row.original.huid ? ` · HUID ${row.original.huid}` : ''}
+                </p>
               </div>
             </Link>
           )

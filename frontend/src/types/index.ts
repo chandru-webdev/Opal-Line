@@ -35,6 +35,17 @@ export interface AppSettings {
   loginLockoutEnabled?: boolean
   lockoutThreshold?: number
   lockoutDurationMinutes?: number
+  /**
+   * Settings → Product codes: auto-generation rules consumed by
+   * src/lib/productCodes.ts. Undefined/empty means the shipped house style
+   * (prefix SLV, template {PREFIX}-{CATEGORY}-{SEQ}, 5-digit sequence,
+   * EAN-13 barcode prefix 890).
+   */
+  skuPrefix?: string | null
+  skuSuffix?: string | null
+  skuFormat?: string | null
+  skuSeqLength?: number | null
+  barcodePrefix?: string | null
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }
@@ -514,7 +525,38 @@ export interface Product {
   tags?: string | null
   trackInventory?: boolean
   chargeOnTax?: boolean
+  /**
+   * Shopify-style option definitions: [{ name: 'Size', values: ['Small', 'Large'] }].
+   * Each option-value combination is a ProductVariant row; null/empty = simple product.
+   */
+  options?: ProductOption[] | null
   createdAt: string
+}
+
+/** One option definition on a product (Shopify's product options, max 3). */
+export interface ProductOption {
+  name: string
+  values: string[]
+}
+
+/** One option-value combination of a product, with its own codes and stock. */
+export interface ProductVariant {
+  id: string
+  productId: string
+  /** "Small / Red" — the option values joined in option-definition order. */
+  title: string
+  /** Aligned with Product.options: ['Small', 'Red']. */
+  optionValues: string[]
+  sku: string
+  barcode?: string | null
+  sellingPrice?: number | null
+  compareAtPrice?: number | null
+  costPrice?: number | null
+  grossWeight?: number | null
+  stock: number
+  reorderLevel?: number | null
+  status?: string | null
+  createdAt?: string | null
 }
 
 export interface Invoice {
