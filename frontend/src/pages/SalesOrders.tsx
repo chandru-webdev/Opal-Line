@@ -1009,7 +1009,7 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        size="3xl"
+        size="lg"
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
         description={
           editing
@@ -1336,7 +1336,7 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={viewOrder !== null}
         onOpenChange={(open) => { if (!open) setViewOrder(null) }}
-        size="2xl"
+        size="xl"
         className="print-dialog"
         footerClassName="no-print"
         title={<>Order {viewOrder?.shopifyId ?? ''}</>}

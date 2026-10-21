@@ -390,7 +390,7 @@ export default function SalesInvoicesPage() {
       <AppDialog
         open={viewInvoice !== null}
         onOpenChange={(open) => { if (!open) setViewInvoice(null) }}
-        size="2xl"
+        size="xl"
         className="print-dialog"
         footerClassName="no-print"
         title={viewInvoice?.number}

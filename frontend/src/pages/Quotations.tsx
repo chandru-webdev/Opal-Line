@@ -733,7 +733,7 @@ export default function QuotationsPage() {
       <AppDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        size="2xl"
+        size="lg"
         title={editingId ? 'Edit Quotation' : 'New Quotation'}
         description={editingId ? 'Update the estimate. Totals recompute automatically.' : 'Create a pre-sale estimate. Nothing is billed until you convert it.'}
         footer={
@@ -836,7 +836,7 @@ export default function QuotationsPage() {
       <AppDialog
         open={viewQuote !== null}
         onOpenChange={(open) => { if (!open) setViewQuote(null) }}
-        size="2xl"
+        size="xl"
         title={<>Quotation {viewQuote?.number}</>}
         description={viewQuote ? formatDate(viewQuote.date) : ''}
         footer={

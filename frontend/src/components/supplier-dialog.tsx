@@ -94,7 +94,7 @@ export function SupplierDialog({
     <AppDialog
       open={open}
       onOpenChange={onOpenChange}
-      size="2xl"
+      size="sm"
       title={title}
       description={description}
       footer={

@@ -632,7 +632,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     <AppDialog
       open={open}
       onOpenChange={onOpenChange}
-      size="2xl"
+      size="lg"
       title={mode === 'edit' ? 'Edit Product' : 'Add Product'}
       description={
         mode === 'edit'
