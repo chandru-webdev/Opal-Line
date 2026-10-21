@@ -1,0 +1,196 @@
+﻿                  max={999}
+                  value={copies}
+                  onChange={(e) => setCopies(Math.min(999, Math.max(1, Number(e.target.value) || 1)))}
+                  className="mt-1"
+                />
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Show Price</span>
+                  <Switch checked={showPrice} onCheckedChange={setShowPrice} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Show Weight</span>
+                  <Switch checked={showWeight} onCheckedChange={setShowWeight} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">Show Brand</span>
+                  <Switch checked={showBrand} onCheckedChange={setShowBrand} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1 text-sm">
+                    <QrCode className="h-3.5 w-3.5" /> Show QR symbol
+                  </span>
+                  <Switch checked={showQR} onCheckedChange={setShowQR} />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-foreground">ZPL code format</label>
+                <Select
+                  options={[
+                    { value: 'qr', label: 'QR code' },
+                    { value: 'code128', label: 'Linear (Code 128)' },
+                  ]}
+                  value={format}
+                  onValueChange={(v) => setFormat(v as 'qr' | 'code128')}
+                  className="mt-1"
+                />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  PDF labels always use the QR symbol. This option only changes the ZPL export.
+                </p>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Live preview ΓÇö drawn at the label's real aspect ratio. */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Preview</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {currentPreset?.design ? (
+                <div className="flex justify-center">
+                  <LabelDesignPreview
+                    design={currentPreset.design}
+                    showQR={showQR}
+                    qrSrc={qrSrc}
+                    text={{
+                      brand: showBrand && previewBrand ? previewBrand : undefined,
+                      name: sample?.name ?? 'Product name',
+                      rate: showPrice
+                        ? `Rate: ${(sample?.sellingPrice ?? 0).toFixed(2)}/-`
+                        : undefined,
+                      code: qrPayload
+                        ? `${currentPreset.height <= 12 ? '' : 'Code: '}${currentPreset.codeLength ? qrPayload.slice(0, currentPreset.codeLength) : qrPayload}`
+                        : undefined,
+                      attr1: sample?.category || undefined,
+                      attr2: sample?.collection || (showWeight && sample?.netWeight ? `${sample.netWeight}g` : undefined),
+                    }}
+                  />
+                </div>
+              ) : currentPreset ? (
+                <div
+                  className="flex w-full flex-col justify-between overflow-hidden rounded-md border border-border bg-white p-1.5 text-[8px] leading-tight text-gray-900"
+                  style={{ aspectRatio: `${currentPreset.width} / ${currentPreset.height}` }}
+                >
+                  <div className="min-w-0">
+                    {showBrand && previewBrand ? <p className="truncate font-semibold">{previewBrand}</p> : null}
+                    <p className="truncate font-medium">{sample?.name ?? 'Product name'}</p>
+                    {currentPreset.height > 12 && sample?.category ? (
+                      <p className="truncate text-gray-400">{sample.category}</p>
+                    ) : null}
+                  </div>
+                  <div className="flex items-end justify-between gap-2">
+                    <div className="min-w-0">
+                      {showPrice ? (
+                        <p className="truncate font-semibold">
+                          Rate: {(sample?.sellingPrice ?? 0).toFixed(2)}/-
+                        </p>
+                      ) : null}
+                      {qrPayload ? (
+                        <p className="truncate text-gray-400">
+                          {currentPreset.height <= 12 ? '' : 'Code: '}
+                          {currentPreset.codeLength ? qrPayload.slice(0, currentPreset.codeLength) : qrPayload}
+                        </p>
+                      ) : null}
+                    </div>
+                    {showQR && qrSrc ? (
+                      <img
+                        src={qrSrc}
+                        alt="Product QR code"
+                        className="h-auto w-[38%] shrink-0 object-contain"
+                      />
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <p className="text-center text-sm text-red-700" role="alert">
+                  The selected template is unavailable. Select a listed template before printing.
+                </p>
+              )}
+              <p className="mt-2 text-center text-xs text-muted-foreground">
+                {printCount} label{printCount === 1 ? '' : 's'} will be printed
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-4">
+              <div className="text-center text-sm text-muted-foreground">
+                <p className="font-medium text-foreground">{products.length} products</p>
+                <p>{selected.size > 0 ? `${selected.size} selected` : 'All products'}</p>
+              </div>
+              <Button variant="outline" size="sm" className="mt-3 w-full" onClick={selectAll}>
+                {selected.size === products.length && products.length > 0 ? 'Deselect All' : 'Select All'}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Product list */}
+        <div className="md:col-span-2">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-sm">Products</CardTitle>
+            </CardHeader>
+            <CardContent className="max-h-[560px] overflow-y-auto p-0">
+              <div className="divide-y divide-border">
+                {products.map((product) => {
+                  const missing = !product.barcode || !String(product.barcode).trim()
+                  return (
+                    <div
+                      key={product.id}
+                      className={`flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50 ${
+                        selected.has(product.id) ? 'bg-primary-50 dark:bg-primary-500/20' : ''
+                      }`}
+                      onClick={() => toggleSelect(product.id)}
+                    >
+                      <div
+                        className={`flex h-5 w-5 items-center justify-center rounded border ${
+                          selected.has(product.id) ? 'border-primary-600 bg-primary-600 text-white' : 'border-gray-300'
+                        }`}
+                      >
+                        {selected.has(product.id) && <Check className="h-3 w-3" />}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
+                        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                          <span className="font-mono">{product.sku}</span>
+                          {missing ? (
+                            <Badge variant="warning" className="text-[10px]">
+                              No barcode
+                            </Badge>
+                          ) : (
+                            <span className="flex items-center gap-1">
+                              <Barcode className="h-3 w-3" /> <span className="font-mono">{product.barcode}</span>
+                            </span>
+                          )}
+                          {duplicates.has(product.sku.toLowerCase()) && (
+                            <Badge variant="warning" className="text-[10px]">
+                              Duplicate SKU
+                            </Badge>
+                          )}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-sm font-semibold text-primary-700">
+                          Γé╣{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                        </p>
+                        {product.netWeight ? <p className="text-xs text-muted-foreground">{product.netWeight}g</p> : null}
+                      </div>
+                      <Badge variant="muted" className="text-[10px]">
+                        {product.category}
+                      </Badge>
+                    </div>
+                  )
+                })}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  )
+}

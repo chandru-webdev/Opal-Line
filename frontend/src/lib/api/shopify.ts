@@ -39,7 +39,7 @@ export const shopifyApi = {
     status?: string
     date?: string
     note?: string
-    items: Array<{ title: string; sku?: string; quantity: number; price: number }>
+    items: Array<{ title: string; sku?: string; quantity: number; price: number; variantId?: string }>
     billingAddress?: {
       name?: string
       phone?: string
@@ -75,7 +75,7 @@ export const shopifyApi = {
     status?: string
     date?: string
     note?: string
-    items?: Array<{ title: string; sku?: string; quantity: number; price: number }>
+    items?: Array<{ title: string; sku?: string; quantity: number; price: number; variantId?: string }>
     billingAddress?: {
       name?: string
       phone?: string

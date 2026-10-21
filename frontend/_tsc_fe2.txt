@@ -1,0 +1,27 @@
+﻿src/pages/BarcodeLabels.tsx(6,3): error TS6133: 'Settings' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(20,3): error TS6133: 'FileCode2' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(21,3): error TS6133: 'Wand2' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(31,17): error TS6133: 'confirmDialog' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(71,10): error TS6133: 'useLabelQr' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(125,10): error TS6133: 'LabelDesignPreview' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(282,21): error TS6133: 'setLoadError' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(286,10): error TS6133: 'presets' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(287,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(288,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(289,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(290,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(291,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(292,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(293,9): error TS6198: All destructured elements are unused.
+src/pages/BarcodeLabels.tsx(294,10): error TS2451: Cannot redeclare block-scoped variable 'generating'.
+src/pages/BarcodeLabels.tsx(294,22): error TS2451: Cannot redeclare block-scoped variable 'setGenerating'.
+src/pages/BarcodeLabels.tsx(296,10): error TS6133: 'missingCount' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(297,10): error TS6133: 'presetError' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(298,10): error TS6133: 'productError' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(308,10): error TS2451: Cannot redeclare block-scoped variable 'generating'.
+src/pages/BarcodeLabels.tsx(308,22): error TS2451: Cannot redeclare block-scoped variable 'setGenerating'.
+src/pages/BarcodeLabels.tsx(317,40): error TS2339: Property 'get' does not exist on type '[URLSearchParams, SetURLSearchParams]'.
+src/pages/BarcodeLabels.tsx(317,74): error TS7006: Parameter 'x' implicitly has an 'any' type.
+src/pages/BarcodeLabels.tsx(320,48): error TS7006: Parameter 'id' implicitly has an 'any' type.
+src/pages/BarcodeLabels.tsx(461,9): error TS6133: 'selectAll' is declared but its value is never read.
+src/pages/BarcodeLabels.tsx(485,22): error TS2339: Property 'showBrand' does not exist on type 'LabelConfig'.

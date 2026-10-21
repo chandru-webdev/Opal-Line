@@ -509,7 +509,30 @@ export interface Product {
   tags?: string | null
   trackInventory?: boolean
   chargeOnTax?: boolean
+  /**
+   * Variants of this product, when the product-variant feature has expanded
+   * the product. Absent or empty means the flat single-SKU product that the
+   * rest of the ERP still assumes; consumers must treat that as "no variants".
+   */
+  variants?: ProductVariant[] | null
   createdAt: string
+}
+
+/**
+ * One variant of a product. Populated by the product-variant feature; invoice
+ * and order flows only need the trade facts — which SKU to bill, at what
+ * price, with how much stock, and which Shopify variant to sync to.
+ */
+export interface ProductVariant {
+  id: string
+  /** Option summary (e.g. "16in / Gold"); falls back to the SKU when absent. */
+  name?: string | null
+  sku: string
+  sellingPrice?: number | null
+  stock?: number | null
+  barcode?: string | null
+  /** Shopify ProductVariant id (numeric or gid:// form) for order sync. */
+  shopifyVariantId?: string | number | null
 }
 
 export interface Invoice {

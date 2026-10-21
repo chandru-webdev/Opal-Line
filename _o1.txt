@@ -1,0 +1,61 @@
+﻿import { useState, useEffect, useMemo, useRef, useCallback, type ReactNode } from 'react'
+import {
+  Printer,
+  Tag,
+  QrCode,
+  Barcode,
+  Search,
+  FileDown,
+  Eye,
+  Settings2,
+  SlidersHorizontal,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  AlertTriangle,
+  Check,
+} from 'lucide-react'
+import { PageHeader } from '@/components/ui/page-header'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Select } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
+import { Skeleton } from '@/components/ui/skeleton'
+import { toast } from '@/components/ui/confirm'
+import { dbApi, backupApi } from '@/lib/api'
+import {
+  buildLabelSheet,
+  computeGrid,
+  configFromPreset,
+  expandLabels,
+  LABEL_PRESETS,
+  MM_TO_PX,
+  PAGE_SIZES,
+  clamp,
+  type LabelConfig,
+  type LabelProduct,
+} from '@/lib/labelSheet'
+import {
+  choosePrintMode,
+  exportHtmlPdf,
+  openHtmlPreview,
+  printHtmlToPrinter,
+} from '@/lib/printTemplate'
+import type { Product } from '@/types'
+
+const CONFIG_STORAGE_KEY = 'opal-line.barcodeLabelConfig'
+
+function loadConfig(): LabelConfig {
+  try {
+    const raw = localStorage.getItem(CONFIG_STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LabelConfig>
+      if (parsed && typeof parsed === 'object' && typeof parsed.widthMm === 'number') {
+        return { ...configFromPreset(parsed.presetKey ?? 'zlabel-50x30'), ...parsed }
+      }
+    }
+  } catch {
+    // fall through to defaults
+  }

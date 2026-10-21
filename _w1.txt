@@ -1,0 +1,270 @@
+﻿import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import QRCode from 'qrcode'
+import {
+  Printer,
+  Settings,
+  Tag,
+  QrCode,
+  Barcode,
+  Search,
+  FileDown,
+  Eye,
+  Settings2,
+  SlidersHorizontal,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  AlertTriangle,
+  Check,
+  FileCode2,
+  Wand2,
+} from 'lucide-react'
+import { PageHeader } from '@/components/ui/page-header'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Select } from '@/components/ui/select'
+import { Input } from '@/components/ui/input'
+import { Skeleton } from '@/components/ui/skeleton'
+import { toast, confirmDialog } from '@/components/ui/confirm'
+import { dbApi, backupApi } from '@/lib/api'
+import {
+  buildLabelSheet,
+  computeGrid,
+  configFromPreset,
+  expandLabels,
+  LABEL_PRESETS,
+  MM_TO_PX,
+  PAGE_SIZES,
+  clamp,
+  type LabelConfig,
+  type LabelProduct,
+} from '@/lib/labelSheet'
+import {
+  FALLBACK_LABEL_PRESETS,
+  validateReferenceLabelPresets,
+  type LabelPreset,
+  type LabelPresetDesign,
+} from '@/lib/labelPresets'
+import {
+  choosePrintMode,
+  exportHtmlPdf,
+  openHtmlPreview,
+  printHtmlToPrinter,
+} from '@/lib/printTemplate'
+import type { Product } from '@/types'
+
+const CONFIG_STORAGE_KEY = 'opal-line.barcodeLabelConfig'
+
+type LabelDesign = LabelPresetDesign
+
+const DEFAULT_PRESET = 'label-50x40'
+
+// Mirrors the renderers in `backend/src/barcodeLabels.ts`.
+const ZPL_EM_RATIO = 0.925
+const ZPL_CAP_RATIO = 718 / 925
+const PREVIEW_WIDTH_PX = 264
+const QR_QUIET_MODULES = 3
+
+function useLabelQr(value: string, enabled: boolean, sizePx: number): string {
+  const [result, setResult] = useState<{ value: string; sizePx: number; src: string }>({
+    value: '',
+    sizePx: 0,
+    src: '',
+  })
+  useEffect(() => {
+    let active = true
+    if (!enabled || !value || sizePx <= 0) return () => { active = false }
+
+    try {
+      const qr = QRCode.create(value, { errorCorrectionLevel: 'L' })
+      const moduleSizePx = Math.max(1, Math.round(sizePx / qr.modules.size))
+      QRCode.toDataURL(value, {
+        errorCorrectionLevel: 'L',
+        margin: 0,
+        width: moduleSizePx * qr.modules.size,
+        color: { dark: '#000000', light: '#ffffff' },
+      }).then((dataUrl) => {
+        if (active) setResult({ value, sizePx, src: dataUrl })
+      }).catch((error: unknown) => {
+        if (!active) return
+        toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
+      })
+    } catch (error) {
+      if (!active) return
+      toast.error(error instanceof Error ? `Could not create preview QR: ${error.message}` : 'Could not create preview QR')
+    }
+    return () => { active = false }
+  }, [enabled, sizePx, value])
+  return enabled && result.value === value && result.sizePx === sizePx ? result.src : ''
+}
+
+function fieldMaxWidthMm(design: LabelDesign, field: LabelDesign['fields'][number], showQR: boolean): number {
+  const moduleMm = design.qr.size / design.qr.modules
+  const quietMm = moduleMm * QR_QUIET_MODULES
+  let maxWidth = showQR ? field.maxWidth : design.width - field.x
+
+  const sibling = design.fields.find((candidate) => candidate.kind === 'attr2')
+  if (field.kind === 'attr1' && sibling && sibling.x > field.x) {
+    maxWidth = Math.min(maxWidth, sibling.x - field.x - quietMm)
+  }
+  if (!showQR || field.x >= design.qr.x) return Math.max(0, maxWidth)
+
+  const qrTop = design.qr.bottom - (design.qr.modules + QR_QUIET_MODULES) * moduleMm
+  const boxTop = qrTop - quietMm
+  const capTop = field.baseline - field.capHeight * ZPL_CAP_RATIO
+  const overlap = Math.min(field.baseline, design.qr.bottom) - Math.max(capTop, boxTop)
+  if (overlap > field.capHeight * ZPL_CAP_RATIO * 0.25) {
+    maxWidth = Math.min(maxWidth, design.qr.x - quietMm - field.x)
+  }
+  return Math.max(0, maxWidth)
+}
+
+function LabelDesignPreview({
+  design,
+  text,
+  showQR,
+  qrSrc,
+}: {
+  design: LabelDesign
+  text: Record<string, string | undefined>
+  showQR: boolean
+  qrSrc: string
+}) {
+  const scale = PREVIEW_WIDTH_PX / design.width
+  return (
+    <div
+      className="relative overflow-hidden rounded-md bg-white text-gray-900 ring-1 ring-border"
+      style={{ width: PREVIEW_WIDTH_PX, height: design.height * scale }}
+    >
+      {design.fields.map((field) => {
+        const value = text[field.kind]
+        if (!value) return null
+        const fontSizeMm = field.capHeight / ZPL_EM_RATIO
+        const condense = field.refWidth / fontSizeMm
+        return (
+          <span
+            key={field.kind}
+            className="absolute whitespace-nowrap font-bold"
+            style={{
+              left: field.x * scale,
+              top: (field.baseline - field.capHeight * ZPL_CAP_RATIO) * scale,
+              fontSize: fontSizeMm * scale,
+              lineHeight: 1,
+              width: (fieldMaxWidthMm(design, field, showQR) * scale) / condense,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              display: 'block',
+              transform: `scaleX(${condense})`,
+              transformOrigin: 'left top',
+              fontFamily: 'Arial, Helvetica, sans-serif',
+              textTransform: field.kind === 'name' || field.kind === 'brand' ? 'uppercase' : undefined,
+            }}
+          >
+            {value}
+          </span>
+        )
+      })}
+      {showQR && qrSrc ? (
+        <img
+          src={qrSrc}
+          alt="Product QR code"
+          className="absolute [image-rendering:pixelated]"
+          style={{
+            left: design.qr.x * scale,
+            top:
+              (design.qr.bottom -
+                ((design.qr.modules + QR_QUIET_MODULES) * design.qr.size) / design.qr.modules) *
+              scale,
+            width: design.qr.size * scale,
+            height: design.qr.size * scale,
+          }}
+        />
+      ) : null}
+    </div>
+  )
+}
+
+function loadConfig(): LabelConfig {
+  try {
+    const raw = localStorage.getItem(CONFIG_STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LabelConfig>
+      if (parsed && typeof parsed === 'object' && typeof parsed.widthMm === 'number') {
+        return { ...configFromPreset(parsed.presetKey ?? 'zlabel-50x30'), ...parsed }
+      }
+    }
+  } catch {
+    // fall through to defaults
+  }
+  return configFromPreset('zlabel-50x30')
+}
+
+function toLabelProduct(p: Product): LabelProduct {
+  return {
+    id: p.id,
+    name: p.name,
+    sku: p.sku,
+    barcode: p.barcode || undefined,
+    price: p.sellingPrice ?? 0,
+    weight: p.netWeight || undefined,
+    category: p.category,
+    huid: p.huid || undefined,
+  }
+}
+
+interface NumberFieldProps {
+  label: string
+  value: number
+  min: number
+  max: number
+  step?: number
+  suffix?: string
+  onChange: (value: number) => void
+}
+
+function NumberField({ label, value, min, max, step = 0.5, suffix = 'mm', onChange }: NumberFieldProps) {
+  return (
+    <div>
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <div className="relative mt-1">
+        <Input
+          type="number"
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          className="h-8 pr-8 text-sm"
+          onChange={(e) => {
+            const v = parseFloat(e.target.value)
+            if (!Number.isNaN(v)) onChange(v)
+          }}
+          onBlur={(e) => {
+            const v = parseFloat(e.target.value)
+            onChange(Number.isNaN(v) ? min : clamp(v, min, max))
+          }}
+        />
+        <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-muted-foreground">
+          {suffix}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function ToggleRow({
+  label,
+  icon,
+  checked,
+  onCheckedChange,
+}: {
+  label: string
+  icon?: ReactNode
+  checked: boolean
+  onCheckedChange: (v: boolean) => void
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="flex items-center gap-2 text-sm text-foreground">

@@ -1,0 +1,124 @@
+﻿                <span>
+                  <span className="font-medium text-foreground">{labelProducts.length}</span> product
+                  {labelProducts.length === 1 ? '' : 's'} ├ù {cfg.copies} cop
+                  {cfg.copies === 1 ? 'y' : 'ies'} ={' '}
+                  <span className="font-medium text-foreground">{expandedCount}</span> labels
+                </span>
+                <span>
+                  <span className="font-medium text-foreground">{sheetCount}</span> page
+                  {sheetCount === 1 ? '' : 's'} ({grid.columns} ├ù {grid.rows} grid)
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* ΓöÇΓöÇ Products ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+        <div className="lg:col-span-4">
+          <Card className="h-full">
+            <CardHeader className="space-y-3">
+              <div className="flex items-center justify-between">
+                <CardTitle className="text-sm">Products</CardTitle>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {selected.size > 0 ? `${selected.size} selected` : `${filtered.length} shown`}
+                  </span>
+                  <Button variant="outline" size="sm" className="h-7 text-xs" onClick={selectAllFiltered}>
+                    {filtered.length > 0 && filtered.every((p) => selected.has(p.id))
+                      ? 'Deselect all'
+                      : 'Select shown'}
+                  </Button>
+                </div>
+              </div>
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search name, SKU or barcodeΓÇª"
+                  className="h-8 pl-8 text-sm"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Select
+                  options={[
+                    { value: 'all', label: 'All categories' },
+                    ...categories.map((c) => ({ value: c, label: c })),
+                  ]}
+                  value={category}
+                  onValueChange={setCategory}
+                  className="h-8 text-sm"
+                />
+                <Select
+                  options={[
+                    { value: 'all', label: 'Any stock' },
+                    { value: 'in', label: 'In stock' },
+                    { value: 'low', label: 'Low stock' },
+                    { value: 'out', label: 'Out of stock' },
+                  ]}
+                  value={stockFilter}
+                  onValueChange={setStockFilter}
+                  className="h-8 text-sm"
+                />
+              </div>
+            </CardHeader>
+            <CardContent className="max-h-[560px] space-y-0 overflow-y-auto p-0">
+              {filtered.length === 0 ? (
+                <div className="px-4 py-10 text-center text-sm text-muted-foreground">No products found.</div>
+              ) : (
+                <div className="divide-y divide-border">
+                  {filtered.map((product) => {
+                    const isSelected = selected.has(product.id)
+                    return (
+                      <div
+                        key={product.id}
+                        className={`flex cursor-pointer items-center gap-3 px-4 py-2.5 transition-colors hover:bg-muted/50 ${
+                          isSelected ? 'bg-primary-50 dark:bg-primary-500/20' : ''
+                        }`}
+                        onClick={() => toggleSelect(product.id)}
+                      >
+                        <div
+                          className="flex shrink-0 items-center justify-center rounded border"
+                          style={{
+                            width: 18,
+                            height: 18,
+                            borderColor: isSelected ? 'var(--primary)' : undefined,
+                            background: isSelected ? 'var(--primary)' : undefined,
+                            color: isSelected ? '#fff' : undefined,
+                          }}
+                        >
+                          {isSelected && <Check className="h-3 w-3" />}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
+                          <p className="truncate text-xs text-muted-foreground">
+                            {product.sku}
+                            {product.barcode && <span className="ml-2 font-mono">Γöé {product.barcode}</span>}
+                            {product.sku && duplicates.has(product.sku.toLowerCase()) && (
+                              <Badge variant="warning" className="ml-1.5 text-[10px]">
+                                Dup SKU
+                              </Badge>
+                            )}
+                          </p>
+                        </div>
+                        <div className="shrink-0 text-right">
+                          <p className="text-sm font-semibold text-primary-700">
+                            Γé╣{(product.sellingPrice ?? 0).toLocaleString('en-IN')}
+                          </p>
+                          <p className="text-[11px] text-muted-foreground">
+                            {product.netWeight ? `${product.netWeight}g` : ''}
+                            {product.stock !== undefined ? ` ┬╖ ${product.stock} pcs` : ''}
+                          </p>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  )
+}
