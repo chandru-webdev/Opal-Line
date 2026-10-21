@@ -26,6 +26,8 @@ export interface ProductDialogProps {
   products?: Product[]
   /** Opens the duplicate panel's "Edit existing product" target. */
   onEditProduct?: (product: Product) => void
+  /** Add-mode seed: pre-fills the form from this product (Duplicate action). */
+  duplicateOf?: Product | null
 }
 
 interface ProductForm {
@@ -219,8 +221,10 @@ function SectionTitle({ title, hint }: { title: string; hint?: string }) {
   )
 }
 
-export function ProductDialog({ open, onOpenChange, mode, product, onSaved, products, onEditProduct }: ProductDialogProps) {
+export function ProductDialog({ open, onOpenChange, mode, product, onSaved, products, onEditProduct, duplicateOf }: ProductDialogProps) {
   const [form, setForm] = useState<ProductForm>(EMPTY_FORM)
+  // Snapshot of the form as it opened, for the unsaved-changes close guard.
+  const [baseline, setBaseline] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [uploading, setUploading] = useState(false)
@@ -272,24 +276,36 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     if (!open) return
     const initial = mode === 'edit' && product
       ? fromProduct(product)
-      : {
-          ...EMPTY_FORM,
-          // New products get unique identifiers up front (house style
-          // SLV-RNG-00001, scan-ready EAN-13); saving re-checks and the
-          // duplicate panel offers fresh codes if anything still collides.
-          sku: generateSku(productsRef.current, EMPTY_FORM.category),
-          barcode: generateBarcode(productsRef.current),
-        }
+      : mode === 'add' && duplicateOf
+        ? {
+            ...fromProduct(duplicateOf),
+            // Duplicate keeps the descriptive fields but clears the unique
+            // ones: a fresh SKU and barcode are generated like any new
+            // product, and the copy is not pushed to Shopify until asked.
+            name: `${duplicateOf.name} (Copy)`,
+            sku: generateSku(productsRef.current, duplicateOf.category ?? EMPTY_FORM.category),
+            barcode: generateBarcode(productsRef.current),
+            pushToShopify: false,
+          }
+        : {
+            ...EMPTY_FORM,
+            // New products get unique identifiers up front (house style
+            // SLV-RNG-00001, scan-ready EAN-13); saving re-checks and the
+            // duplicate panel offers fresh codes if anything still collides.
+            sku: generateSku(productsRef.current, EMPTY_FORM.category),
+            barcode: generateBarcode(productsRef.current),
+          }
     const p = computePrice(initial)
     if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setForm(initial)
+      setBaseline(JSON.stringify(initial))
       setSupplierId(product?.supplierId ?? '')
       setError('')
       setDuplicate(null)
     })
-  }, [open, mode, product])
+  }, [open, mode, product, duplicateOf])
 
   // Edit mode: the product already exists, so the server can assign a real,
   // globally-unique barcode immediately. Add mode pre-fills a locally generated
@@ -633,7 +649,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       open={open}
       onOpenChange={onOpenChange}
       size="lg"
-      title={mode === 'edit' ? 'Edit Product' : 'Add Product'}
+      isDirty={JSON.stringify(form) !== baseline}
+      title={mode === 'edit' ? 'Edit Product' : duplicateOf ? 'Duplicate Product' : 'Add Product'}
       description={
         mode === 'edit'
           ? 'Update the product in the billing software. Shopify options are only used when "Push to Shopify" is on.'
