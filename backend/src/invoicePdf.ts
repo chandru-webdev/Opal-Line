@@ -33,6 +33,8 @@ export interface InvoiceData {
   cgst: number
   sgst: number
   totalGst: number
+  /** GST rate (%, e.g. 3) the totalGst was computed from — drives the printed CGST/SGST rate labels. */
+  gstRate?: number
   grandTotal: number
   amountInWords: string
   businessName: string
@@ -156,9 +158,10 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
     const subtotal = Number(inv.subtotal || 0)
     const discount = Number(inv.discount || 0)
     // sales_invoices carries `gst` (the rate, e.g. 3) and `gst_amount` (the
-    // money). Use the amount; only compute it when a legacy row lacks one.
+    // money). Use the stored amount; the legacy fallback recomputes it the
+    // same way the invoice was raised — GST on the subtotal, pre-discount.
     const gstRate = Number(inv.gst || settings?.gst_rate || 3)
-    const totalGst = Number(inv.gst_amount || inv.total_gst || (subtotal - discount) * gstRate / 100)
+    const totalGst = Number(inv.gst_amount || inv.total_gst || subtotal * gstRate / 100)
     const cgst = Math.round((totalGst / 2) * 100) / 100
     const sgst = Math.round((totalGst / 2) * 100) / 100
     const grandTotal = Number(inv.grand_total || subtotal - discount + totalGst)
@@ -185,7 +188,7 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
       customerState: inv.customer_state || 'Maharashtra',
       customerStateCode: inv.customer_state_code || '27',
       items: itemData,
-      subtotal, discount, cgst, sgst, totalGst, grandTotal,
+      subtotal, discount, cgst, sgst, totalGst, gstRate, grandTotal,
       amountInWords: numberToIndianWords(hasTds ? adjustedTotal : grandTotal),
       businessName: settings?.business_name || 'Opal Line Jewels LLP',
       businessAddress: settings?.address || 'Shop 4, Nariman Point, Mumbai - 400021',
@@ -391,10 +394,15 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
     const valX = totalsX + totalsW - 10
     let ty = totalsY + 8
 
-    const gstRateHalf = data.subtotal > 0 ? ((data.totalGst / (data.subtotal - data.discount)) * 100 / 2).toFixed(1) : '1.5'
+    // GST is charged on the subtotal (the items-table total), so the printed
+    // Taxable Value IS the subtotal and the CGST/SGST rate labels are half the
+    // stored GST rate — the same business values the invoice screen shows.
+    // The discount is listed separately (exactly once) above the persisted
+    // grand total, so the printed rows add up to the printed grand total.
+    const gstRateHalf = String(Math.round((Number(data.gstRate) || 0) / 2 * 100) / 100)
 
     doc.fontSize(8).font('Helvetica').fillColor(COLORS.text)
-    doc.text('Taxable Value', labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.subtotal - data.discount), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
+    doc.text('Taxable Value', labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.subtotal), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
     doc.text(`CGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.cgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
     doc.text(`SGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.sgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
 
@@ -513,8 +521,11 @@ export async function emailInvoicePDF(invoiceId: string, recipientEmail: string)
   const client = getRawClient()
   if (!client) return false
 
-  const [inv] = await client.unsafe(`SELECT invoice_number FROM sales_invoices WHERE id = $1`, [invoiceId]) as any[]
-  const invNumber = inv?.invoice_number || invoiceId
+  // sales_invoices stores the document number in `number` — there is no
+  // invoice_number column — so the emailed subject/filename must read it from
+  // there, otherwise the query fails and the email never sends.
+  const [inv] = await client.unsafe(`SELECT number FROM sales_invoices WHERE id = $1`, [invoiceId]) as any[]
+  const invNumber = inv?.number || invoiceId
 
   return sendEmail({
     to: recipientEmail,

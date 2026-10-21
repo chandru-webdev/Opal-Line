@@ -1,4 +1,5 @@
 import { escapeHtml, numberToIndianWords } from '@/lib/utils'
+import type { Invoice } from '@/types'
 
 /**
  * Shared print-template builder — one source of truth for printable documents.
@@ -269,6 +270,60 @@ export interface PrintDoc {
   items?: Array<Record<string, unknown>>
 }
 
+/**
+ * Map a PERSISTED invoice onto the print document — the only path from an
+ * invoice to paper. The invoice screen and the printed page render the same
+ * saved values (subtotal, gst rate, gst amount, discount, grand total and the
+ * per-item snapshots); printing never recalculates business amounts.
+ *
+ * `business` lets the caller override with live Settings values (business
+ * name/GSTIN/address/phone/email), mirroring what the invoice detail screen
+ * does; `imagesBySku` supplies optional product thumbnails.
+ */
+export function invoicePrintDoc(
+  invoice: Invoice,
+  opts: { imagesBySku?: ReadonlyMap<string, string>; business?: Partial<PrintDoc> } = {},
+): PrintDoc {
+  const doc: PrintDoc = {
+    number: invoice.number,
+    shopifyOrder: invoice.shopifyOrder,
+    customer: invoice.customer,
+    customerEmail: invoice.customerEmail,
+    customerPhone: invoice.customerPhone ?? null,
+    customerAddress: invoice.customerAddress ?? null,
+    customerCity: invoice.customerCity ?? null,
+    customerState: invoice.customerState ?? null,
+    customerPincode: invoice.customerPincode ?? null,
+    businessName: invoice.businessName,
+    businessGstin: invoice.businessGstin ?? null,
+    businessAddress: invoice.businessAddress ?? null,
+    businessPhone: invoice.businessPhone ?? null,
+    businessEmail: invoice.businessEmail ?? null,
+    gst: invoice.gst,
+    gstAmount: invoice.gstAmount,
+    discount: invoice.discount,
+    subtotal: invoice.subtotal,
+    grandTotal: invoice.grandTotal,
+    paymentMethod: invoice.paymentMethod,
+    paymentStatus: invoice.paymentStatus,
+    date: invoice.date,
+    items: invoice.items.map((i) => ({
+      product: i.product,
+      sku: i.sku,
+      hsn: i.hsn,
+      qty: i.qty,
+      weight: i.weight,
+      silverRate: i.silverRate,
+      makingCharge: i.makingCharge,
+      tax: i.tax,
+      amount: i.amount,
+      image: opts.imagesBySku?.get(i.sku),
+    })),
+  }
+  if (opts.business) Object.assign(doc, opts.business)
+  return doc
+}
+
 /** Open one or more built documents in print windows (batch = one window per
  *  doc). The print chooser is shown ONCE for the whole batch, and a Cancel
  *  aborts every document — asking per-document would spam a dialog per order. */
@@ -427,7 +482,11 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
   const c = config
   const items = doc.items ?? []
   const gstRate = Number(doc.gst) || 0
-  const taxable = Math.max(0, Number(doc.subtotal) - Number(doc.discount))
+  // GST is charged on the subtotal (the sum of the printed line amounts), so
+  // the printed "Taxable Value" IS the subtotal — the discount gets its own
+  // row further down and must not be subtracted twice. With this base the
+  // printed rows add up to the persisted grand total (subtotal + GST − discount).
+  const taxable = Math.max(0, Number(doc.subtotal) || 0)
   const totalTax = Number(doc.gstAmount) || 0
   const halfTax = Math.round((totalTax / 2) * 100) / 100
   const hsnCodes = [...new Set(items.map((i) => String(i.hsn ?? '')).filter(Boolean))]
@@ -487,6 +546,12 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     `<th>Product</th><th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '')
 
+  // 0 in the rate/making/tax snapshot columns means "unknown" (order-raised
+  // items carry no rate or making snapshot) — dash it exactly like the
+  // invoice screen does, instead of printing a misleading ₹0.00 / 0%.
+  // `tax` holds a MONEY amount (the per-line GST), never a percentage.
+  const money = (v: unknown) => (Number(v) > 0 ? `₹${fmt(Number(v))}` : '—')
+
   const itemRows = items
     .map((i, idx) => {
       const imgSrc = typeof i.image === 'string' && i.image ? i.image : ''
@@ -499,8 +564,8 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
           ${c.showHsn ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
           ${c.showWeight ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
-          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.silverRate) || 0)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.makingCharge) || 0)}</td>` : ''}
-          ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.tax) || 0}%</td>` : ''}
+          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.makingCharge)}</td>` : ''}
+          ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(Number(i.amount) || 0)}</td>
         </tr>`
     })

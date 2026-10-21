@@ -20,7 +20,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { PrintTemplatePicker } from '@/components/print-template-picker'
-import { printDocument, mergePrintConfig, type PrintDoc } from '@/lib/printTemplate'
+import { printDocument, mergePrintConfig, invoicePrintDoc } from '@/lib/printTemplate'
 import { printTemplatesApi } from '@/lib/api'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -56,15 +56,27 @@ export default function InvoiceDetailPage() {
   useEffect(() => {
     // Defer out of the effect body: setLoading fires synchronously
     // (react/set-state-in-effect).
+    let cancelled = false
     queueMicrotask(() => {
+      if (cancelled) return
       setLoading(true)
+      // Drop per-invoice carry-over (IRN card, UPI QR, return dialog) so
+      // nothing from the previously viewed invoice can leak into this one.
+      setEinvoice(null)
+      setUpiQr(null)
+      setReturnOpen(false)
+      setReturnQty({})
       dbApi.getInvoiceById(id ?? '').then((inv) => {
+        // A slower response for a previously opened invoice must never
+        // overwrite the record currently on screen.
+        if (cancelled) return
         setInvoice(inv ?? null)
         setLoading(false)
-      }).catch(() => setLoading(false))
-      dbApi.getSettings().then((s) => setSettings(s ?? null)).catch(() => {})
+      }).catch(() => { if (!cancelled) setLoading(false) })
+      dbApi.getSettings().then((s) => { if (!cancelled) setSettings(s ?? null) }).catch(() => {})
       dbApi.getProducts()
         .then((ps) => {
+          if (cancelled) return
           const m = new Map<string, string>()
           for (const p of ps) {
             const src = p.image?.trim()
@@ -73,8 +85,9 @@ export default function InvoiceDetailPage() {
           productImageBySku.current = m
         })
         .catch(() => {})
-      printTemplatesApi.getDefault('invoice').then((r) => setPrintConfig(r.config)).catch(() => {})
+      printTemplatesApi.getDefault('invoice').then((r) => { if (!cancelled) setPrintConfig(r.config) }).catch(() => {})
     })
+    return () => { cancelled = true }
   }, [id])
 
   // Fetch the UPI QR once the invoice total is known; silently absent when
@@ -108,57 +121,35 @@ export default function InvoiceDetailPage() {
     return <div className="px-6 py-6 text-sm text-muted-foreground">Invoice not found.</div>
   }
 
-  const printInvoice = (configOverride?: unknown) => {
-    // Settings (GSTIN/address/phone) win over values stamped on the invoice row.
-    const business = {
-      businessName: settings?.businessName || invoice.businessName,
-      businessGstin: settings?.gstin || invoice.businessGstin || null,
-      businessAddress: settings?.address || invoice.businessAddress || null,
-      businessPhone: settings?.phone || invoice.businessPhone || null,
-      businessEmail: settings?.email || invoice.businessEmail || null,
-    }
-    const doc: PrintDoc = {
-      number: invoice.number,
-      shopifyOrder: invoice.shopifyOrder,
-      customer: invoice.customer,
-      customerEmail: invoice.customerEmail,
-      customerPhone: invoice.customerPhone ?? null,
-      customerAddress: invoice.customerAddress ?? null,
-      customerCity: invoice.customerCity ?? null,
-      customerState: invoice.customerState ?? null,
-      customerPincode: invoice.customerPincode ?? null,
-      ...business,
-      gst: invoice.gst,
-      gstAmount: invoice.gstAmount,
-      discount: invoice.discount,
-      subtotal: invoice.subtotal,
-      grandTotal: invoice.grandTotal,
-      paymentMethod: invoice.paymentMethod,
-      paymentStatus: invoice.paymentStatus,
-      date: invoice.date,
-      items: invoice.items.map((i) => ({
-        product: i.product,
-        sku: i.sku,
-        hsn: i.hsn,
-        qty: i.qty,
-        weight: i.weight,
-        silverRate: i.silverRate,
-        makingCharge: i.makingCharge,
-        tax: i.tax,
-        amount: i.amount,
-        image: productImageBySku.current.get(i.sku),
-      })),
-    }
+  const printInvoice = (arg?: unknown) => {
+    // Support both: printInvoice({ mode: 'pdf' }) from buttons
+    // and printInvoice(config, name) from PrintTemplatePicker
+    const options = (typeof arg === 'object' && arg !== null && ('mode' in arg || 'configOverride' in arg))
+      ? (arg as { configOverride?: unknown; mode?: 'silent' | 'dialog' | 'pdf' })
+      : { configOverride: arg }
+    // The print doc is a straight mapping of the PERSISTED invoice (Settings
+    // GSTIN/address/phone win over values stamped on the row) — same saved
+    // values the screen shows, no recalculation.
+    const doc = invoicePrintDoc(invoice, {
+      imagesBySku: productImageBySku.current,
+      business: {
+        businessName: settings?.businessName || invoice.businessName,
+        businessGstin: settings?.gstin || invoice.businessGstin || null,
+        businessAddress: settings?.address || invoice.businessAddress || null,
+        businessPhone: settings?.phone || invoice.businessPhone || null,
+        businessEmail: settings?.email || invoice.businessEmail || null,
+      },
+    })
     // An explicit config comes from the saved-template picker; otherwise the
     // saved default (or stock layout) applies.
-    const merged = mergePrintConfig(configOverride ?? printConfig)
+    const merged = mergePrintConfig(options.configOverride ?? printConfig)
     // Prefer a manually-uploaded QR design; otherwise use the auto UPI QR.
     const withQr = merged.qrDataUrl ? merged : { ...merged, showQr: upiQr !== null, qrDataUrl: upiQr, qrCaption: 'Scan to pay via UPI' }
     printDocument(doc, withQr, {
       docType: 'invoice',
       tagline: '92.5 Sterling Silver Jewellery',
       showImages: true,
-    })
+    }, options.mode)
   }
 
   const emailInvoice = async () => {
@@ -267,7 +258,7 @@ export default function InvoiceDetailPage() {
           <>
             <PrintTemplatePicker docType="invoice" onSelect={(config) => printInvoice(config)} />
             <Button variant="outline" size="sm" onClick={() => printInvoice()}><Printer className="h-3.5 w-3.5" /> Print</Button>
-            <Button variant="outline" size="sm" onClick={printInvoice}><Download className="h-3.5 w-3.5" /> Save as PDF</Button>
+            <Button variant="outline" size="sm" onClick={() => printInvoice({ mode: 'pdf' })}><Download className="h-3.5 w-3.5" /> Save as PDF</Button>
             <Button variant="outline" size="sm" onClick={emailInvoice} disabled={emailSending}><Mail className="h-3.5 w-3.5" /> {emailSending ? 'Sending…' : 'Email'}</Button>
             {invoice.customerPhone ? (
               <Button variant="outline" size="sm" onClick={sendWhatsAppInvoice} disabled={waSending}><MessageCircle className="h-3.5 w-3.5" /> {waSending ? 'Sending…' : 'Send WhatsApp'}</Button>

@@ -29,8 +29,9 @@ import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
 import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
 import { upsertEnvVar } from '../lib/envfile'
 import { logger } from '../logger'
+import { invoiceTotals } from '../invoiceTotals'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
-import { pushInventoryToShopify } from '../shopify'
+import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
 
@@ -965,7 +966,8 @@ dbRouter.post('/einvoice/:invoiceId/cancel', requirePermission('sales', 'edit'),
 })
 
 export function round2(value: number): number {
-  return Math.round(value * 100) / 100
+  // Add Number.EPSILON to handle floating-point precision issues (e.g., 1.005 * 100 = 100.4999...)
+  return Math.round((value + Number.EPSILON) * 100) / 100
 }
 
 /**
@@ -998,7 +1000,7 @@ async function applyStockDelta(tx: any, sku: string, delta: number): Promise<voi
   })
 }
 
-export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknown>> {
+export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number): Array<Record<string, unknown>> {
   if (!Array.isArray(raw)) return []
   return raw
     .map((it) => {
@@ -1010,15 +1012,20 @@ export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknow
       row.sku = String(item.sku ?? '').trim()
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
       row.weight = num(item.weight, 0)
-      row.silverRate = num(item.silverRate, 0)
+      // Use provided silverRate, or fall back to the defaultSilverRate from Silver Rate Management
+      const providedSilverRate = num(item.silverRate, 0)
+      const effectiveSilverRate = providedSilverRate > 0 ? providedSilverRate : (defaultSilverRate ?? 0)
+      row.silverRate = effectiveSilverRate
       row.makingCharge = num(item.makingCharge, 0)
       row.tax = num(item.tax, 0)
       const weight = num(item.weight, 0)
-      const silverRate = num(item.silverRate, 0)
-      const makingCharge = num(item.makingCharge, 0)
-      if (weight > 0 && silverRate > 0) {
-        const silverValue = round2(weight * silverRate)
-        row.amount = round2(silverValue + makingCharge)
+      const makingChargePerGram = num(item.makingCharge, 0)
+      if (weight > 0 && effectiveSilverRate > 0) {
+        // Correct formula: amount = (silverRate + makingChargePerGram) × weight
+        // This matches computeSellingPrice: (rate + makingCharge) × netWeight × 1.03 (without GST)
+        const silverValue = round2(weight * effectiveSilverRate)
+        const makingValue = round2(weight * makingChargePerGram)
+        row.amount = round2(silverValue + makingValue)
       } else {
         row.amount = num(item.amount, 0)
       }
@@ -1090,7 +1097,15 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
   if (!requireDb(res)) return
   try {
     const body = req.body ?? {}
-    const items = normalizeInvoiceItems(body.items)
+
+    // Fetch the authoritative silver rate from Silver Rate Management for new pricing.
+    const latestRate = await getLatestSilverRate()
+    if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+      return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before creating invoices.' })
+    }
+    const silverRate = latestRate.rate
+
+    const items = normalizeInvoiceItems(body.items, silverRate)
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
@@ -1103,10 +1118,13 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const gst = num(body.gst, 3)
     const subtotal = hasItems ? round2(items.reduce((a, it) => a + num(it.amount, 0), 0)) : num(clean.subtotal, 0)
     const discount = num(body.discount, 0)
-    const gstAmount = hasItems ? round2(subtotal * gst / 100) : num(clean.gstAmount, round2(subtotal * gst / 100))
-    const grandTotal = hasItems ? round2(subtotal + gstAmount - discount) : num(clean.grandTotal, round2(subtotal + gstAmount - discount))
+    // Canonical totals: GST on the subtotal, discount off the grand total.
+    const totals = invoiceTotals(subtotal, gst, discount)
+    const gstAmount = hasItems ? totals.gstAmount : num(clean.gstAmount, totals.gstAmount)
+    const grandTotal = hasItems ? totals.grandTotal : num(clean.grandTotal, totals.grandTotal)
     const silverValue = hasItems ? round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0)) : num(clean.silverValue, 0)
-    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0)) : num(clean.makingCharge, 0)
+    // makingCharge in items is per-gram; header total must multiply by weight
+    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0)) : num(clean.makingCharge, 0)
 
     const id = randomUUID()
     const row = await db!.transaction(async (tx) => {
@@ -1146,7 +1164,8 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
       })
       .catch(() => undefined)
     res.status(201).json(stripHash(row))
-  } catch {
+  } catch (err) {
+    logger.error({ err }, 'invoice creation failed')
     res.status(400).json({ error: 'Failed to create invoice' })
   }
 })
@@ -1159,10 +1178,21 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     delete clean.id
     delete clean.items
 
+    // Fetch the authoritative silver rate for any new/replaced items.
+    // If items are provided without explicit silverRate, use the current managed rate.
+    let silverRate: number | undefined
+    if (body.items && Array.isArray(body.items) && body.items.length > 0) {
+      const latestRate = await getLatestSilverRate()
+      if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+        return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before updating invoice items.' })
+      }
+      silverRate = latestRate.rate
+    }
+
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
-      const items = normalizeInvoiceItems(body.items)
+      const items = normalizeInvoiceItems(body.items, silverRate)
       if (items.length > 0) {
         // First, restore old stock
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
@@ -1179,10 +1209,10 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         const gst = num(body.gst, num(existing.gst, 3))
         const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
         const discount = num(body.discount, num(existing.discount, 0))
-        const gstAmount = round2(subtotal * gst / 100)
-        const grandTotal = round2(subtotal + gstAmount - discount)
+        const { gstAmount, grandTotal } = invoiceTotals(subtotal, gst, discount)
         const silverValue = round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0))
-        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0))
+        // makingCharge in items is per-gram; header total must multiply by weight
+        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0))
         clean.subtotal = subtotal
         clean.gst = gst
         clean.gstAmount = gstAmount
@@ -1197,9 +1227,9 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         const subtotal = num(existing.subtotal, 0)
         const gst = num(clean.gst ?? existing.gst, 3)
         const discount = num(clean.discount ?? existing.discount, 0)
-        const gstAmount = round2(subtotal * gst / 100)
+        const { gstAmount, grandTotal } = invoiceTotals(subtotal, gst, discount)
         clean.gstAmount = gstAmount
-        clean.grandTotal = round2(subtotal + gstAmount - discount)
+        clean.grandTotal = grandTotal
       }
       if (Object.keys(clean).length === 0) return existing
       const [updated] = await tx.update(s.salesInvoices).set(clean).where(eq(s.salesInvoices.id, routeParam(req.params.id))).returning()
