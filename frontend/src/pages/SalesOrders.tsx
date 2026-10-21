@@ -1048,7 +1048,7 @@ export default function SalesOrdersPage() {
           created ? (
             <Button onClick={() => setDialogOpen(false)}>Done</Button>
           ) : (
-            <>
+            <DialogFooter>
               <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>Cancel</Button>
               <Button onClick={createOrder} disabled={saving}>
                 {saving ? (
@@ -1067,7 +1067,7 @@ export default function SalesOrdersPage() {
                   'Create Order'
                 )}
               </Button>
-            </>
+            </DialogFooter>
           )
         }
       >
