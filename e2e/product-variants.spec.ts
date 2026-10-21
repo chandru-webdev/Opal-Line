@@ -85,10 +85,11 @@ test.describe('product codes & variants', () => {
     await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-GEN-\d{4}$/)
     await expect(dialog.getByLabel('Product barcode')).toHaveValue(/^\d{13}$/)
 
-    // Price fields (add mode starts them empty); filled before adding options
-    // so every variant inherits the product price.
+    // Pricing inputs drive the auto price: (105 + 20) × 10g × 1.03 = 1287.5,
+    // which locks the selling price field.
     await dialog.getByLabel('Silver rate').fill('105')
-    await dialog.getByLabel('Selling price').fill('500')
+    await dialog.getByLabel('Net weight').fill('10')
+    await expect(dialog.getByLabel('Selling price')).toHaveValue('1287.5')
 
     // ── 3. Shopify-style options → variants ──────────────────────────────
     await dialog.getByRole('button', { name: 'Add option' }).click()
@@ -105,6 +106,14 @@ test.describe('product codes & variants', () => {
     await expect(dialog.getByLabel(`SKU for S`)).toHaveValue(new RegExp(`^${parentSku}-S$`))
     await expect(dialog.getByLabel(`SKU for M`)).toHaveValue(new RegExp(`^${parentSku}-M$`))
     await expect(dialog.getByLabel(`Barcode for S`)).toHaveValue(/^\d{13}$/)
+
+    // Variants inherit the auto-calculated price...
+    await expect(dialog.getByLabel('Price for S')).toHaveValue('1287.5')
+    await expect(dialog.getByLabel('Price for M')).toHaveValue('1287.5')
+    // ...and follow it when the pricing inputs recompute ((105+30)×10×1.03).
+    await dialog.getByLabel('Making charge').fill('30')
+    await expect(dialog.getByLabel('Price for S')).toHaveValue('1390.5')
+    await expect(dialog.getByLabel('Price for M')).toHaveValue('1390.5')
 
     await dialog.getByLabel('Stock for S').fill('3')
     await dialog.getByLabel('Stock for M').fill('5')

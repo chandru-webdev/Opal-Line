@@ -287,6 +287,34 @@ async function paginate<T>(resource: string, initialQuery = '', maxPages = CONST
 
 export function normalizeProduct(raw: any): SyncProduct {
   const variant = raw.variants?.[0] ?? {}
+  // Shopify-style options + every variant (not just the first): the pull
+  // writes these into products.options / product_variants so a multi-variant
+  // listing round-trips instead of collapsing onto its default variant.
+  const options: Array<{ name: string; values: string[] }> = Array.isArray(raw.options)
+    ? raw.options
+        .map((o: any) => ({
+          name: String(o?.name ?? '').trim(),
+          values: Array.isArray(o?.values)
+            ? o.values.map((v: any) => String(typeof v === 'object' ? (v?.value ?? '') : v).trim()).filter(Boolean)
+            : [],
+        }))
+        .filter((o: { name: string; values: string[] }) => o.name !== '' && o.values.length > 0)
+    : []
+  const variants: NonNullable<SyncProduct['variants']> = Array.isArray(raw.variants)
+    ? raw.variants.slice(0, 200).map((v: any) => ({
+        id: Number(v?.id ?? 0),
+        title: String(v?.title ?? ''),
+        option1: v?.option1 ?? null,
+        option2: v?.option2 ?? null,
+        option3: v?.option3 ?? null,
+        sku: String(v?.sku ?? ''),
+        barcode: v?.barcode ?? null,
+        price: String(v?.price ?? '0'),
+        compareAtPrice: v?.compare_at_price ?? null,
+        inventoryQuantity: Number(v?.inventory_quantity ?? 0),
+        inventoryItemId: Number(v?.inventory_item_id ?? 0),
+      }))
+    : []
   const rawTags = typeof raw.tags === 'string' ? raw.tags : Array.isArray(raw.tags) ? raw.tags.join(',') : ''
   const tagList = rawTags.split(',').map((t: string) => t.trim()).filter(Boolean)
   const collectionTag = tagList.find((t: string) => t.startsWith('opal-collection:'))
@@ -314,9 +342,13 @@ export function normalizeProduct(raw: any): SyncProduct {
     images: Array.isArray(raw.images)
       ? raw.images.map((img: { src?: string }) => String(img?.src ?? '')).filter(Boolean)
       : [],
-    inventoryQuantity: variant.inventory_quantity ?? 0,
+    // The parent's stock is the ROLLUP of its variants (same model as the
+    // local tables); a simple product keeps the single variant's count.
+    inventoryQuantity: variants.length > 1 ? variants.reduce((a, v) => a + v.inventoryQuantity, 0) : (variant.inventory_quantity ?? 0),
     inventoryItemId: variant.inventory_item_id ?? 0,
     variantId: variant.id ?? 0,
+    options,
+    variants,
     createdAt: raw.created_at ?? '',
     updatedAt: raw.updated_at ?? '',
   }
@@ -834,6 +866,15 @@ export interface CatalogPatch {
 export interface CatalogApplyIo {
   insert(values: CatalogInsertValues): Promise<CatalogRow | undefined>
   update(existing: CatalogRow, patch: CatalogPatch): Promise<void>
+  /**
+   * Replace the product's option definitions + variant rows from the live
+   * listing (Shopify-style sync). Omitted by fakes that don't care.
+   */
+  saveVariants?(
+    productId: string,
+    options: SyncProduct['options'],
+    variants: SyncProduct['variants'],
+  ): Promise<void>
 }
 
 /**
@@ -858,6 +899,14 @@ export async function applyLiveCatalog(
     const key = String(r.sku ?? '').trim().toLowerCase()
     if (key) bySku.set(key, r)
   }
+  // A pushed multi-variant product carries a VARIANT's SKU on Shopify, not
+  // the local parent's — match on shopifyId first so a re-pull updates the
+  // same row instead of inserting a duplicate under the variant SKU.
+  const byShopifyId = new Map<string, CatalogRow>()
+  for (const r of rows) {
+    const key = String(r.shopifyId ?? '').trim()
+    if (key && !key.startsWith('#')) byShopifyId.set(key, r)
+  }
 
   let created = 0
   let updated = 0
@@ -868,7 +917,14 @@ export async function applyLiveCatalog(
     const price = Number(p.price ?? 0) || 0
     const compareAt = p.compareAtPrice != null ? Number(p.compareAtPrice) : null
     const effectiveCompareAt = compareAt != null && compareAt > 0 ? compareAt : null
-    const existing = bySku.get(skuKey)
+    const existing = byShopifyId.get(String(p.id)) ?? bySku.get(skuKey)
+    // Options + variants only land when the listing actually has them — a
+    // simple single-variant product never wipes local variants that simply
+    // haven't been pushed yet.
+    const hasLiveVariants = (p.options?.length ?? 0) > 0 && (p.variants?.length ?? 0) > 0
+    const saveVariants = async (productId: string) => {
+      if (hasLiveVariants && io.saveVariants) await io.saveVariants(productId, p.options, p.variants)
+    }
     if (existing) {
       const hasWeight = existing.netWeight != null && Number(existing.netWeight) > 0
       const pricing = hasWeight ? null : backComputePricing(price, pricingRate)
@@ -898,6 +954,7 @@ export async function applyLiveCatalog(
         chargeOnTax: existing.chargeOnTax,
       }
       await io.update(existing, patch)
+      await saveVariants(existing.id)
       updated++
     } else {
       const pricing = backComputePricing(price, pricingRate)
@@ -937,7 +994,10 @@ export async function applyLiveCatalog(
       }
       const inserted = await io.insert(values)
       created++
-      if (inserted) bySku.set(skuKey, inserted)
+      if (inserted) {
+        bySku.set(skuKey, inserted)
+        await saveVariants(inserted.id)
+      }
     }
   }
   return { created, updated }
@@ -965,6 +1025,10 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
 
     const live = store.products
     const liveSkus = new Set(live.map((p) => (String(p.sku ?? '').trim() || `SHOP-${p.id}`).toLowerCase()).filter(Boolean))
+    // Variant products carry a variant's SKU on Shopify, so a local parent's
+    // SKU is no longer in liveSkus — also index by Shopify id or the
+    // reconciliation below would delete every multi-variant product.
+    const liveShopifyIds = new Set(live.map((p) => String(p.id)).filter(Boolean))
 
     const rows = await db.select().from(schema.products)
 
@@ -996,6 +1060,45 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
           await database.update(schema.products).set(patch).where(eq(schema.products.id, existing.id))
         }
       },
+      // Replace-all: the listing owns the option/variant set, exactly like
+      // the push. Parent stock above already carries the summed count.
+      saveVariants: async (productId, options, variants) => {
+        const liveVariants = variants ?? []
+        await database.delete(schema.productVariants).where(eq(schema.productVariants.productId, productId))
+        if (liveVariants.length === 0) {
+          await database.update(schema.products).set({ options: null }).where(eq(schema.products.id, productId))
+          return
+        }
+        const seenSku = new Set<string>()
+        await database.insert(schema.productVariants).values(
+          liveVariants.map((v) => {
+            const title = String(v.title ?? '').trim() || [v.option1, v.option2, v.option3].filter(Boolean).join(' / ')
+            let sku = String(v.sku ?? '').trim() || `SHOP-V${v.id}`
+            // The variant sku index is unique — a store with duplicate SKUs
+            // must not abort the whole pull, so clashes get a numeric tail.
+            while (seenSku.has(sku.toLowerCase())) sku = `${sku}-2`
+            seenSku.add(sku.toLowerCase())
+            return {
+              id: randomUUID(),
+              productId,
+              title,
+              optionValues: [v.option1, v.option2, v.option3]
+                .filter((x): x is string => Boolean(x) && String(x).trim() !== ''),
+              sku,
+              barcode: v.barcode ?? null,
+              sellingPrice: Number(v.price) || null,
+              compareAtPrice: v.compareAtPrice != null && Number(v.compareAtPrice) > 0 ? Number(v.compareAtPrice) : null,
+              costPrice: null,
+              grossWeight: null,
+              stock: Math.max(0, Math.floor(Number(v.inventoryQuantity) || 0)),
+              reorderLevel: null,
+              status: 'active',
+              createdAt: new Date().toISOString(),
+            }
+          }),
+        )
+        await database.update(schema.products).set({ options: options ?? null }).where(eq(schema.products.id, productId))
+      },
     })
     created = applied.created
     updated = applied.updated
@@ -1003,6 +1106,7 @@ export async function syncProductsToDb(): Promise<ProductsDbSyncResult> {
     for (const r of rows) {
       const key = String(r.sku ?? '').trim().toLowerCase()
       if (liveSkus.has(key)) continue
+      if (liveShopifyIds.has(String(r.shopifyId ?? '').trim())) continue
       const shopifyId = String(r.shopifyId ?? '').trim()
       const shopifyStatus = String(r.shopifyStatus ?? '').trim().toLowerCase()
       const genuinelyLinked = shopifyId !== '' && !shopifyId.startsWith('#')
@@ -1271,12 +1375,11 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
   }
   const compareAt = Number(row.compareAtPrice)
 
-  let variantId: number
+  let listingVariants: Array<{ id?: number; sku?: string | null }>
   try {
     const res = await shopifyRequest<any>(`products/${shopifyProductId}`)
-    const variant = res.json?.product?.variants?.[0]
-    variantId = Number(variant?.id ?? 0)
-    if (!variantId) {
+    listingVariants = res.json?.product?.variants ?? []
+    if (listingVariants.length === 0) {
       return { ok: false, updated: 0, skipped: 0, errors: [`No Shopify variant found for ${row.sku}`] }
     }
   } catch (err) {
@@ -1285,22 +1388,70 @@ export async function pushProductPriceToShopify(localProductId: string): Promise
     return { ok: false, updated: 0, skipped: 0, errors: [message] }
   }
 
-  const body: Record<string, unknown> = { id: variantId, price: price.toFixed(2) }
-  if (Number.isFinite(compareAt) && compareAt > 0) body.compare_at_price = compareAt.toFixed(2)
+  const putVariantPrice = async (variantId: number, amount: number, cmp: number): Promise<string | null> => {
+    const body: Record<string, unknown> = { id: variantId, price: amount.toFixed(2) }
+    if (Number.isFinite(cmp) && cmp > 0) body.compare_at_price = cmp.toFixed(2)
+    const url = new URL(apiPath(config.apiVersion, `variants/${variantId}`))
+    const put = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'X-Shopify-Access-Token': config.accessToken,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ variant: body }),
+    })
+    if (!put.ok) {
+      const text = await put.text().catch(() => '')
+      return `Shopify API error ${put.status}: ${text.slice(0, 200)}`
+    }
+    return null
+  }
 
-  const url = new URL(apiPath(config.apiVersion, `variants/${variantId}`))
-  const put = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      'X-Shopify-Access-Token': config.accessToken,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({ variant: body }),
-  })
-  if (!put.ok) {
-    const text = await put.text().catch(() => '')
-    const message = `Shopify API error ${put.status}: ${text.slice(0, 200)}`
+  // Shopify-style product: push every local variant's price to its listing
+  // variant (matched back by SKU). Simple products keep the single-variant
+  // path below.
+  const localVariants = await db.select().from(schema.productVariants).where(eq(schema.productVariants.productId, row.id))
+  if (localVariants.length > 0) {
+    const shopifyIdBySku = new Map<string, number>()
+    for (const v of listingVariants) {
+      const key = String(v.sku ?? '').trim().toLowerCase()
+      if (key && v.id) shopifyIdBySku.set(key, Number(v.id))
+    }
+    let pushed = 0
+    const variantErrors: string[] = []
+    for (const v of localVariants) {
+      const vPrice = Number(v.sellingPrice)
+      const target = shopifyIdBySku.get(String(v.sku ?? '').trim().toLowerCase())
+      if (!target || !Number.isFinite(vPrice) || vPrice <= 0) continue
+      const putError = await putVariantPrice(target, vPrice, Number(v.compareAtPrice))
+      if (putError) {
+        variantErrors.push(`${v.sku}: ${putError}`)
+      } else {
+        pushed++
+      }
+    }
+    if (pushed > 0) {
+      store.lastSync.price = new Date().toISOString()
+      addLog('price', 'success', pushed, `Variant prices updated: ${row.sku} (${pushed})`)
+      await persistLog({ entity: 'Price', shopifyId: row.sku, direction: 'out', action: 'Price Update', status: 'success' })
+    }
+    if (variantErrors.length > 0) {
+      const message = variantErrors.join('; ')
+      addLog('price', 'failed', 1, message)
+      store.lastError = message
+      await persistLog({ entity: 'Price', shopifyId: row.sku, direction: 'out', action: 'Price Update', status: 'failed', error: message, retry: true })
+    }
+    if (pushed === 0 && variantErrors.length === 0) {
+      return { ok: false, updated: 0, skipped: 0, errors: [`No Shopify variant matched a local variant of ${row.sku}`] }
+    }
+    return { ok: variantErrors.length === 0, updated: pushed, skipped: 0, errors: variantErrors }
+  }
+
+  const variantId = Number(listingVariants[0]?.id ?? 0)
+  const putError = await putVariantPrice(variantId, price, compareAt)
+  if (putError) {
+    const message = putError
     addLog('price', 'failed', 1, message)
     store.lastError = message
     await persistLog({ entity: 'Price', shopifyId: row.sku, direction: 'out', action: 'Price Update', status: 'failed', error: message, retry: true })
@@ -1350,6 +1501,22 @@ interface LocalProductForPush {
   shopifyId: string | null
   shopifyStatus: string | null
   status: string | null
+  /** Shopify-style option definitions (products.options). */
+  options?: Array<{ name: string; values: string[] }> | null
+  /** The variant rows for this product (product_variants), when attached. */
+  variants?: LocalVariantForPush[] | null
+}
+
+/** One local variant as it travels to Shopify. */
+export interface LocalVariantForPush {
+  id: string
+  title: string
+  optionValues: string[]
+  sku: string
+  barcode: string | null
+  sellingPrice: number | null
+  compareAtPrice: number | null
+  stock: number | null
 }
 
 function buildShopifyTags(local: LocalProductForPush): string {
@@ -1407,7 +1574,13 @@ export async function buildShopifyImages(local: LocalProductForPush): Promise<Ar
   return images
 }
 
-async function createShopifyProduct(local: LocalProductForPush): Promise<{ productId: number; variantId: number; inventoryItemId: number | null }> {
+async function createShopifyProduct(local: LocalProductForPush): Promise<{
+  productId: number
+  variantId: number
+  inventoryItemId: number | null
+  /** Every created variant (id + inventory item + sku) for per-variant stock. */
+  variants: Array<{ id: number; inventoryItemId: number | null; sku: string }>
+}> {
   if (!isConfigured()) {
     throw new ShopifyError('Shopify is not configured. Set SHOPIFY_STORE_URL and SHOPIFY_ACCESS_TOKEN in server/.env', 503)
   }
@@ -1425,6 +1598,27 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{ produ
 
   const tags = buildShopifyTags(local)
 
+  // Shopify-style products carry their options and one variant per option-value
+  // combination; simple products keep the single default variant above.
+  const hasVariants = (local.options?.length ?? 0) > 0 && (local.variants?.length ?? 0) > 0
+  const variantPayloads: Array<Record<string, string | number | boolean>> = hasVariants
+    ? (local.variants ?? []).map((v) => {
+        const entry: Record<string, string | number | boolean> = {}
+        const vPrice = Number(v.sellingPrice)
+        if (Number.isFinite(vPrice) && vPrice > 0) entry.price = vPrice.toFixed(2)
+        else if (price > 0) entry.price = price.toFixed(2)
+        if (Number(v.compareAtPrice) > 0) entry.compare_at_price = Number(v.compareAtPrice).toFixed(2)
+        if (v.sku) entry.sku = v.sku
+        if (v.barcode) entry.barcode = v.barcode
+        if (trackInventory) entry.inventory_management = 'shopify'
+        entry.taxable = chargeOnTax
+        entry.option1 = String(v.optionValues[0] ?? '')
+        entry.option2 = String(v.optionValues[1] ?? '')
+        entry.option3 = String(v.optionValues[2] ?? '')
+        return entry
+      })
+    : [variant]
+
   const body: Record<string, unknown> = {
     product: {
       title: local.name,
@@ -1433,8 +1627,14 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{ produ
       product_type: collectionSegments(local.collection)[0] || local.productType || local.category || '',
       tags,
       status: 'active',
-      variants: [variant],
+      variants: variantPayloads,
     },
+  }
+  if (hasVariants) {
+    ;(body.product as Record<string, unknown>).options = (local.options ?? []).map((o) => ({
+      name: o.name,
+      values: o.values,
+    }))
   }
   const images = await buildShopifyImages(local)
   if (images.length > 0) {
@@ -1455,7 +1655,7 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{ produ
     const text = await res.text().catch(() => '')
     throw new ShopifyError(`Shopify API error ${res.status}: ${text.slice(0, 200)}`, res.status)
   }
-  const json = (await res.json()) as { product?: { id?: number; variants?: Array<{ id?: number; inventory_item_id?: number }> } }
+  const json = (await res.json()) as { product?: { id?: number; variants?: Array<{ id?: number; sku?: string | null; inventory_item_id?: number }> } }
   const productId = Number(json.product?.id ?? 0)
   // The listing exists now — make storefront collection membership match the
   // local collection. Best-effort; never fails the product create.
@@ -1463,20 +1663,28 @@ async function createShopifyProduct(local: LocalProductForPush): Promise<{ produ
   if (!productId) {
     throw new ShopifyError('Shopify returned an unexpected response while creating the product.', 502)
   }
+  const createdVariants = (json.product?.variants ?? []).map((v) => ({
+    id: Number(v?.id ?? 0),
+    inventoryItemId: v?.inventory_item_id != null ? Number(v.inventory_item_id) : null,
+    sku: String(v?.sku ?? ''),
+  }))
   return {
     productId,
-    variantId: Number(json.product?.variants?.[0]?.id ?? 0),
-    inventoryItemId: Number(json.product?.variants?.[0]?.inventory_item_id ?? 0),
+    variantId: createdVariants[0]?.id ?? 0,
+    inventoryItemId: createdVariants[0]?.inventoryItemId ?? null,
+    variants: createdVariants,
   }
 }
 
 /**
  * Push content (title, vendor, tags) and local images to an already-listed
- * Shopify product — the "push from local path" flow for edits. Variants are
- * intentionally untouched: prices and inventory travel through their own
- * dedicated sync paths. Images already present on the listing (matched by
- * their stable alt marker / URL path) are filtered out so re-pushes never
- * duplicate the gallery.
+ * Shopify product — the "push from local path" flow for edits. For
+ * Shopify-style products the option/variant set is synced here too (matched
+ * back by SKU; new combinations created, removed ones deleted). Simple
+ * products leave their single variant alone: prices and inventory travel
+ * through their own dedicated sync paths. Images already present on the
+ * listing (matched by their stable alt marker / URL path) are filtered out
+ * so re-pushes never duplicate the gallery.
  */
 async function updateShopifyProductContent(local: LocalProductForPush): Promise<void> {
   if (!isConfigured()) {
@@ -1487,18 +1695,20 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
 
   const url = new URL(apiPath(config.apiVersion, `products/${id}`))
 
-  // Learn which images the listing already has (best-effort).
+  // Learn which images / variants the listing already has (best-effort).
   const existingAlt = new Set<string>()
   const existingSrcPaths = new Set<string>()
   let listingBefore: Array<{ id?: number; alt?: string | null; src?: string }> = []
   let previousCollection: string | null = null
+  let listingVariants: Array<{ id?: number; sku?: string | null }> = []
   try {
     const get = await fetch(url, {
       headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
     })
     if (get.ok) {
-      const json = (await get.json()) as { product?: { images?: Array<{ id?: number; alt?: string | null; src?: string }> } }
+      const json = (await get.json()) as { product?: { images?: Array<{ id?: number; alt?: string | null; src?: string }>; variants?: Array<{ id?: number; sku?: string | null }> } }
       listingBefore = json.product?.images ?? []
+      listingVariants = json.product?.variants ?? []
       // Remember the collection the app pushed last time so a collection
       // change can drop exactly the membership it created earlier.
       previousCollection = collectionFromTags((json as { product?: { tags?: unknown } }).product?.tags)
@@ -1546,6 +1756,70 @@ async function updateShopifyProductContent(local: LocalProductForPush): Promise<
   // The content update landed — now make storefront collection membership
   // match the local collection (best-effort; never fails the content push).
   await pushCollectionMembership(local, id, previousCollection)
+
+  // Shopify-style products: sync the option/variant set. Local variants are
+  // matched back to listing variants by SKU (case-insensitive); matches
+  // update in place, new combinations are created, and listing variants no
+  // longer present locally are deleted afterwards.
+  const localVariants = local.variants ?? []
+  if ((local.options?.length ?? 0) > 0 && localVariants.length > 0) {
+    const shopifyBySku = new Map<string, number>()
+    for (const v of listingVariants) {
+      const key = String(v.sku ?? '').trim().toLowerCase()
+      if (key && v.id) shopifyBySku.set(key, Number(v.id))
+    }
+    const keptSkus = new Set<string>()
+    const variantPayloads = localVariants.map((v) => {
+      const entry: Record<string, unknown> = {
+        option1: String(v.optionValues[0] ?? ''),
+        option2: String(v.optionValues[1] ?? ''),
+        option3: String(v.optionValues[2] ?? ''),
+        sku: v.sku,
+        taxable: local.chargeOnTax !== false,
+      }
+      const vPrice = Number(v.sellingPrice)
+      if (Number.isFinite(vPrice) && vPrice > 0) entry.price = vPrice.toFixed(2)
+      if (Number(v.compareAtPrice) > 0) entry.compare_at_price = Number(v.compareAtPrice).toFixed(2)
+      if (v.barcode) entry.barcode = v.barcode
+      if (local.trackInventory !== false) entry.inventory_management = 'shopify'
+      const matchedId = shopifyBySku.get(v.sku.trim().toLowerCase())
+      if (matchedId) {
+        entry.id = matchedId
+        keptSkus.add(String(matchedId))
+      }
+      return entry
+    })
+    const variantRes = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'X-Shopify-Access-Token': config.accessToken,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        product: {
+          id,
+          options: (local.options ?? []).map((o) => ({ name: o.name, values: o.values })),
+          variants: variantPayloads,
+        },
+      }),
+    })
+    if (!variantRes.ok) {
+      const text = await variantRes.text().catch(() => '')
+      throw new ShopifyError(`Shopify API error ${variantRes.status} while syncing variants: ${text.slice(0, 200)}`, variantRes.status)
+    }
+    // Delete listing variants that no longer exist locally (best-effort;
+    // Shopify requires at least one variant, which the PUT above guarantees).
+    for (const v of listingVariants) {
+      if (!v.id || keptSkus.has(String(v.id))) continue
+      try {
+        await fetch(new URL(apiPath(config.apiVersion, `variants/${v.id}`)), {
+          method: 'DELETE',
+          headers: { 'X-Shopify-Access-Token': config.accessToken, Accept: 'application/json' },
+        })
+      } catch { /* best-effort: a stale variant can be removed next push */ }
+    }
+  }
 
   const justAddedPathnames = new Set<string>()
   for (const img of newImages) {
@@ -1838,7 +2112,33 @@ export async function pushProductsToShopify(ids?: string[]): Promise<ShopifyPush
     rows = selected.map((r) => ({
       ...r,
       images: Array.isArray(r.images) ? (r.images as string[]).filter((x): x is string => typeof x === 'string') : null,
+      options: Array.isArray(r.options) ? (r.options as Array<{ name: string; values: string[] }>) : null,
+      variants: null,
     }))
+    // Variant rows ride along so the create sends the full option/variant set
+    // (one query for the whole batch — pushes are ≤200 products).
+    if (rows.length > 0) {
+      const variantRows = await db
+        .select()
+        .from(schema.productVariants)
+        .where(inArray(schema.productVariants.productId, rows.map((r) => r.id)))
+      const byProduct = new Map<string, LocalVariantForPush[]>()
+      for (const v of variantRows) {
+        const list = byProduct.get(v.productId) ?? []
+        list.push({
+          id: v.id,
+          title: v.title,
+          optionValues: Array.isArray(v.optionValues) ? (v.optionValues as string[]) : [],
+          sku: v.sku,
+          barcode: v.barcode,
+          sellingPrice: v.sellingPrice,
+          compareAtPrice: v.compareAtPrice,
+          stock: v.stock,
+        })
+        byProduct.set(v.productId, list)
+      }
+      for (const r of rows) r.variants = byProduct.get(r.id) ?? null
+    }
   } catch (err) {
     releaseSyncLock()
     return { ok: false, created: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Failed to read products'] }
@@ -1882,7 +2182,7 @@ export async function pushProductsToShopify(ids?: string[]): Promise<ShopifyPush
         continue
       }
       try {
-        const { productId, variantId, inventoryItemId } = await createShopifyProduct(row)
+        const { productId, variantId, inventoryItemId, variants: createdVariants } = await createShopifyProduct(row)
         await db.update(schema.products).set({ shopifyId: String(productId), shopifyStatus: 'synced' }).where(eq(schema.products.id, row.id))
         // Newly created listing already carries the local images — point the
         // local row at Shopify's hosted copies right away.
@@ -1890,11 +2190,22 @@ export async function pushProductsToShopify(ids?: string[]): Promise<ShopifyPush
         created++
         addLog('products', 'success', 1, `Created on Shopify: ${row.sku}`)
         await persistLog({ entity: 'Product', shopifyId: String(productId), direction: 'out', action: 'Create', status: 'success' })
-        if (row.trackInventory !== false && inventoryItemId) {
+        if (row.trackInventory !== false) {
           try {
             if (locations.length === 0) locations = await fetchLocations()
             const locationId = locations[0]?.id
-            if (locationId) {
+            const localVariants = row.variants ?? []
+            if (locationId && localVariants.length > 0) {
+              // Variant product: each variant gets ITS stock on its own
+              // inventory item, matched back by SKU.
+              const stockBySku = new Map(localVariants.map((v) => [v.sku.trim().toLowerCase(), Math.max(0, Math.floor(Number(v.stock) || 0))]))
+              for (const cv of createdVariants) {
+                if (!cv.inventoryItemId) continue
+                const qty = stockBySku.get(cv.sku.trim().toLowerCase()) ?? 0
+                await setInventoryItemTracked(cv.inventoryItemId)
+                await setInventoryLevel(cv.inventoryItemId, locationId, qty)
+              }
+            } else if (locationId && inventoryItemId) {
               await setInventoryItemTracked(inventoryItemId)
               await setInventoryLevel(inventoryItemId, locationId, Number(row.stock ?? 0))
             }
@@ -2007,6 +2318,29 @@ export async function pushInventoryToShopify(ids?: string[]): Promise<ShopifyInv
     bySkuCompact.set(normalizeKey(key), p)
   }
 
+  // Live VARIANTS indexed by SKU: a variant product carries the variant's SKU
+  // on Shopify, so the parent loop below skips it — its stock travels per
+  // variant here instead.
+  const liveVariantBySku = new Map<string, number>()
+  for (const p of store.products) {
+    for (const v of p.variants ?? []) {
+      const key = String(v.sku ?? '').trim().toLowerCase()
+      if (key && v.inventoryItemId) liveVariantBySku.set(key, v.inventoryItemId)
+    }
+  }
+  let variantRows: Array<{ sku: string; stock: number | null }> = []
+  try {
+    variantRows = ids && ids.length > 0
+      ? await db.select({ sku: schema.productVariants.sku, stock: schema.productVariants.stock })
+          .from(schema.productVariants)
+          .where(inArray(schema.productVariants.productId, ids))
+      : await db.select({ sku: schema.productVariants.sku, stock: schema.productVariants.stock })
+          .from(schema.productVariants)
+  } catch {
+    // No variants table rows (older install mid-upgrade) — parent push only.
+    variantRows = []
+  }
+
   let locations: { id: number; name: string }[]
   try {
     locations = await fetchLocations()
@@ -2048,6 +2382,29 @@ export async function pushInventoryToShopify(ids?: string[]): Promise<ShopifyInv
         errors.push(`${shop.sku}: ${message}`)
         addLog('inventory', 'failed', 1, message)
         await persistLog({ entity: 'Inventory', shopifyId: shop.sku, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
+      }
+    }
+    // Per-variant stock: each local variant's count lands on its own Shopify
+    // inventory item (matched back by SKU). Parent rows above already covered
+    // simple products.
+    for (const v of variantRows) {
+      const key = String(v.sku ?? '').trim().toLowerCase()
+      const inventoryItemId = key ? liveVariantBySku.get(key) : undefined
+      if (!inventoryItemId) {
+        skipped++
+        continue
+      }
+      try {
+        await setInventoryItemTracked(inventoryItemId)
+        await setInventoryLevel(inventoryItemId, locationId, Math.max(0, Math.floor(Number(v.stock) || 0)))
+        updated++
+        addLog('inventory', 'success', 1, `Stock set: ${v.sku} = ${Math.max(0, Math.floor(Number(v.stock) || 0))}`)
+        await persistLog({ entity: 'Inventory', shopifyId: v.sku, direction: 'out', action: 'Stock Update', status: 'success' })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error'
+        errors.push(`${v.sku}: ${message}`)
+        addLog('inventory', 'failed', 1, message)
+        await persistLog({ entity: 'Inventory', shopifyId: v.sku, direction: 'out', action: 'Stock Update', status: 'failed', error: message, retry: true })
       }
     }
     if (updated > 0) {

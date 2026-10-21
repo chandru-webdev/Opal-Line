@@ -475,12 +475,18 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }, [open, mode, product])
 
   const setPricing = (key: 'silverRate' | 'makingCharge' | 'netWeight' | 'gst', value: string) => {
-    setForm((f) => {
-      const next = { ...f, [key]: value }
-      const p = computePrice(next)
-      if (Number.isFinite(p)) next.sellingPrice = String(Math.round(p * 100) / 100)
-      return next
-    })
+    const next = { ...form, [key]: value }
+    const p = computePrice(next)
+    if (Number.isFinite(p)) {
+      const rounded = String(Math.round(p * 100) / 100)
+      next.sellingPrice = rounded
+      // The auto-calculated price flows through to every variant that still
+      // carries it; variant prices the user edited individually stay put.
+      if (variants.length > 0 && form.sellingPrice !== rounded) {
+        setVariants((vs) => vs.map((v) => (v.price === form.sellingPrice ? { ...v, price: rounded } : v)))
+      }
+    }
+    setForm(next)
   }
 
   const categorySelectOptions = useMemo(() => {
@@ -1065,8 +1071,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                   </table>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  SKUs and barcodes are minted per variant using the Product codes settings; price defaults to the
-                  product price and is editable per row. The product's stock is the sum of its variants.
+                  SKUs and barcodes are minted per variant using the Product codes settings. Price follows the
+                  product's auto-calculated price until you override it per row. The product's stock is the sum of
+                  its variants.
                 </p>
               </div>
             ) : null}
@@ -1079,13 +1086,13 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 <Input type="number" step="0.01" value={form.stoneWeight} onChange={(e) => set('stoneWeight', e.target.value)} />
               </Field>
               <Field label="Net weight (g)">
-                <Input type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
+                <Input aria-label="Net weight" type="number" step="0.01" value={form.netWeight} onChange={(e) => setPricing('netWeight', e.target.value)} />
               </Field>
               <Field label="Silver rate (₹/g) *">
                 <Input aria-label="Silver rate" type="number" step="0.01" value={form.silverRate} onChange={(e) => setPricing('silverRate', e.target.value)} />
               </Field>
               <Field label="Making charge (₹/g)">
-                <Input type="number" step="0.01" value={form.makingCharge} onChange={(e) => setPricing('makingCharge', e.target.value)} />
+                <Input aria-label="Making charge" type="number" step="0.01" value={form.makingCharge} onChange={(e) => setPricing('makingCharge', e.target.value)} />
               </Field>
               <Field label="GST %">
                 <Input type="number" step="0.1" value={form.gst} onChange={(e) => setPricing('gst', e.target.value)} />
