@@ -68,12 +68,12 @@ export default function SalesInvoicesPage() {
     date: '', dueDate: '', paymentMethod: '', paymentStatus: 'pending', status: 'issued',
     discount: '0', gst: '3',
   })
+  // Snapshot of the edit form as it opened, for the unsaved-changes close guard.
+  const [editBaseline, setEditBaseline] = useState('')
 
   const openEdit = (inv: Invoice) => {
     const toDateInput = (v?: string | null) => (v ? new Date(v).toISOString().slice(0, 10) : '')
-    setEditTarget(inv)
-    setEditError('')
-    setEditForm({
+    const next = {
       customer: inv.customer ?? '',
       customerEmail: inv.customerEmail ?? '',
       customerPhone: inv.customerPhone ?? '',
@@ -89,7 +89,11 @@ export default function SalesInvoicesPage() {
       status: inv.status,
       discount: String(inv.discount ?? 0),
       gst: String(inv.gst ?? 3),
-    })
+    }
+    setEditTarget(inv)
+    setEditError('')
+    setEditForm(next)
+    setEditBaseline(JSON.stringify(next))
     setViewInvoice(null)
   }
 
@@ -264,13 +268,11 @@ export default function SalesInvoicesPage() {
             <TooltipProvider delayDuration={200}>
             <Tooltip>
               <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-sm" asChild>
-                <Link to={`/sales/invoices/${row.original.id}`}>
+              <Button variant="ghost" size="icon-sm" onClick={() => setViewInvoice(row.original)}>
                   <Eye className="h-3.5 w-3.5" />
-                </Link>
-              </Button>
+                </Button>
               </TooltipTrigger>
-              <TooltipContent>View / Print / PDF</TooltipContent>
+              <TooltipContent>View</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -475,6 +477,7 @@ export default function SalesInvoicesPage() {
         open={editTarget !== null}
         onOpenChange={(open) => { if (!open) setEditTarget(null) }}
         size="lg"
+        isDirty={editTarget !== null && JSON.stringify(editForm) !== editBaseline}
         title={`Edit ${editTarget?.number ?? ''}`}
         description="Update invoice header details. Totals recalculate when discount or GST changes."
         footer={
