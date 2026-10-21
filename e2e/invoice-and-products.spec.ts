@@ -71,7 +71,15 @@ test.describe('sales invoice cancel & reissue', () => {
     await page.goto('/sales/invoices')
     await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
 
-    const rows = page.locator('table tbody tr')
+    // Wait for the table body to settle, then count only rows that carry the
+    // action: DataTable renders a loading row and — on an empty database — a
+    // one-cell placeholder row, so a bare row count is never 0 and this guard
+    // used to hang waiting for a button the placeholder never renders. The
+    // union below matches both post-load states (real rows, empty message),
+    // never the loading row, so it cannot skip while data is still in flight.
+    const rows = page.locator('table tbody tr', { has: page.getByRole('button', { name: /More actions for/i }) })
+    const emptyState = page.getByText('No invoices match your filters')
+    await expect(rows.or(emptyState).first()).toBeVisible({ timeout: 20000 })
     if ((await rows.count()) === 0) {
       test.skip(true, 'no sales invoices in this database (fresh install)')
       return
@@ -102,7 +110,16 @@ test.describe('purchase invoice cancel & recreate', () => {
     await page.goto('/purchase/invoices')
     await expect(page.getByRole('heading', { level: 1 }).first()).toBeVisible({ timeout: 20000 })
 
-    const rows = page.locator('table tbody tr')
+    // Settle the body before deciding: an empty DataTable renders a one-cell
+    // placeholder row ("No purchase invoices found"), so the bare row count
+    // this guard used to do was 1 — never 0 — the skip never fired and the
+    // test hung on an Eye button the placeholder doesn't have. That is how it
+    // failed against the installed desktop app, whose database has no purchase
+    // invoices. Count rows carrying the Eye action, and wait for either
+    // post-load state so a slow fetch is never mistaken for an empty table.
+    const rows = page.locator('table tbody tr', { has: page.locator('button:has(svg.lucide-eye)') })
+    const emptyState = page.getByText('No purchase invoices found')
+    await expect(rows.or(emptyState).first()).toBeVisible({ timeout: 20000 })
     if ((await rows.count()) === 0) {
       test.skip(true, 'no purchase invoices in this database (fresh install)')
       return
