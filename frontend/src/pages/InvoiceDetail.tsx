@@ -319,9 +319,9 @@ export default function InvoiceDetailPage() {
                       </TableCell>
                       <TableCell className="text-right tabular-nums">{item.qty}</TableCell>
                       <TableCell className="text-right tabular-nums text-muted-foreground">{item.weight.toFixed(2)} gm</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">₹{item.silverRate.toFixed(2)}/g</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">₹{item.makingCharge}/g</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.tax}%</TableCell>
+                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.silverRate > 0 ? `₹${item.silverRate.toFixed(2)}/g` : '—'}</TableCell>
+                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.makingCharge > 0 ? formatCurrency(item.makingCharge) : '—'}</TableCell>
+                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.tax > 0 ? formatCurrency(item.tax) : '—'}</TableCell>
                       <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(item.amount)}</TableCell>
                     </TableRow>
                   ))}
@@ -381,8 +381,8 @@ export default function InvoiceDetailPage() {
                 <CardTitle className="text-sm">Amount Summary</CardTitle>
               </CardHeader>
               <CardContent className="space-y-2">
-                <SummaryRow label="Silver Value" value={formatCurrency(invoice.silverValue)} />
-                <SummaryRow label="Making Charge" value={formatCurrency(invoice.makingCharge)} />
+                <SummaryRow label="Silver Value" value={invoice.silverValue > 0 ? formatCurrency(invoice.silverValue) : '—'} />
+                <SummaryRow label="Making Charge" value={invoice.makingCharge > 0 ? formatCurrency(invoice.makingCharge) : '—'} />
                 <SummaryRow label="Subtotal" value={formatCurrency(invoice.subtotal)} />
                 <SummaryRow label={`GST @ ${invoice.gst}%`} value={formatCurrency(invoice.gstAmount)} />
                 <SummaryRow label="Discount" value={`- ${formatCurrency(invoice.discount)}`} />
