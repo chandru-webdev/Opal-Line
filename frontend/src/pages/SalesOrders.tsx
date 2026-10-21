@@ -220,6 +220,8 @@ export default function SalesOrdersPage() {
   const [formError, setFormError] = useState('')
   const [created, setCreated] = useState<CreateResult | null>(null)
   const [editing, setEditing] = useState<SalesOrder | null>(null)
+  // Order-form snapshot as of dialog open, for the unsaved-changes close guard.
+  const [formBaseline, setFormBaseline] = useState('')
 
   const [customerSel, setCustomerSel] = useState('')
   const [customerName, setCustomerName] = useState('')
@@ -734,6 +736,31 @@ export default function SalesOrdersPage() {
     [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
   )
 
+  const snapshotForm = () =>
+    JSON.stringify({
+      customerSel,
+      customerName,
+      customerEmail,
+      customerPhone,
+      billingAddr,
+      shippingAddr,
+      sameAsBilling,
+      orderDate,
+      payment,
+      fulfillment,
+      orderStatus,
+      note,
+      syncToShopify,
+      lineItems,
+    })
+
+  // Capture the freshly reset form each time the dialog opens (create, edit
+  // and duplicate all set the fields right before setDialogOpen(true)).
+  useEffect(() => {
+    if (dialogOpen) setFormBaseline(snapshotForm())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen])
+
   const openDialog = () => {
     setEditing(null)
     setFormError('')
@@ -1010,6 +1037,7 @@ export default function SalesOrdersPage() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         size="lg"
+        isDirty={dialogOpen && snapshotForm() !== formBaseline}
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
         description={
           editing
