@@ -1,0 +1,140 @@
+﻿  return configFromPreset('zlabel-50x30')
+}
+
+function toLabelProduct(p: Product): LabelProduct {
+  return {
+    id: p.id,
+    name: p.name,
+    sku: p.sku,
+    barcode: p.barcode || undefined,
+    price: p.sellingPrice ?? 0,
+    weight: p.netWeight || undefined,
+    category: p.category,
+    huid: p.huid || undefined,
+  }
+}
+
+interface NumberFieldProps {
+  label: string
+  value: number
+  min: number
+  max: number
+  step?: number
+  suffix?: string
+  onChange: (value: number) => void
+}
+
+function NumberField({ label, value, min, max, step = 0.5, suffix = 'mm', onChange }: NumberFieldProps) {
+  return (
+    <div>
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <div className="relative mt-1">
+        <Input
+          type="number"
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          className="h-8 pr-8 text-sm"
+          onChange={(e) => {
+            const v = parseFloat(e.target.value)
+            if (!Number.isNaN(v)) onChange(v)
+          }}
+          onBlur={(e) => {
+            const v = parseFloat(e.target.value)
+            onChange(Number.isNaN(v) ? min : clamp(v, min, max))
+          }}
+        />
+        <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-muted-foreground">
+          {suffix}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function ToggleRow({
+  label,
+  icon,
+  checked,
+  onCheckedChange,
+}: {
+  label: string
+  icon?: ReactNode
+  checked: boolean
+  onCheckedChange: (v: boolean) => void
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="flex items-center gap-2 text-sm text-foreground">
+        {icon}
+        {label}
+      </span>
+      <Switch checked={checked} onCheckedChange={onCheckedChange} />
+    </div>
+  )
+}
+
+export default function BarcodeLabelsPage() {
+  const [products, setProducts] = useState<Product[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [duplicates, setDuplicates] = useState<Set<string>>(new Set())
+  const [cfg, setCfg] = useState<LabelConfig>(loadConfig)
+
+  const [search, setSearch] = useState('')
+  const [category, setCategory] = useState('all')
+  const [stockFilter, setStockFilter] = useState('all')
+
+  const [zoom, setZoom] = useState(1)
+  const [fitScale, setFitScale] = useState(1)
+  const previewRef = useRef<HTMLDivElement>(null)
+  const [generating, setGenerating] = useState(false)
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      dbApi
+        .getProducts()
+        .then((data) => {
+          setProducts(data)
+          setLoading(false)
+        })
+        .catch((err) => {
+          setLoadError(err instanceof Error ? err.message : 'Failed to load products')
+          setLoading(false)
+        })
+      dbApi
+        .getProductDuplicates()
+        .then((r) => setDuplicates(new Set(r.data.map((d) => d.sku.toLowerCase()))))
+        .catch(() => undefined)
+    })
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(cfg))
+  }, [cfg])
+
+  const patch = useCallback((partial: Partial<LabelConfig>) => {
+    setCfg((prev) => ({ ...prev, ...partial }))
+  }, [])
+
+  const patchSize = useCallback((partial: Partial<LabelConfig>) => {
+    setCfg((prev) => ({ ...prev, ...partial, presetKey: 'custom' }))
+  }, [])
+
+  const applyPreset = useCallback((key: string) => {
+    if (key === 'custom') {
+      setCfg((prev) => ({ ...prev, presetKey: 'custom' }))
+      return
+    }
+    const next = configFromPreset(key)
+    setCfg((prev) => ({
+      ...prev,
+      presetKey: next.presetKey,
+      widthMm: next.widthMm,
+      heightMm: next.heightMm,
+      marginMm: next.marginMm,
+      gapMm: next.gapMm,
+    }))
+  }, [])

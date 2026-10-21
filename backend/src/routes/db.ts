@@ -14,7 +14,7 @@ import {
   normalizeScanCode,
   scanCodeError,
 } from '../barcode'
-import { DEFAULT_LOCATION_ID, applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
@@ -982,12 +982,10 @@ export function round2(value: number): number {
 async function applyStockDelta(tx: any, sku: string, delta: number): Promise<void> {
   if (!sku || !delta) return
   if (delta < 0) {
-    const [row] = await tx.select({ stock: s.products.stock }).from(s.products).where(eq(s.products.sku, sku)).limit(1).for('update')
-    if (!row) return
-    const current = Number(row.stock ?? 0)
-    if (current + delta < 0) {
-      throw new Error(`Insufficient stock for SKU ${sku}: available ${current}, requested ${Math.abs(delta)}`)
-    }
+    // Centralised guard: one code path owns the "would this go negative?"
+    // decision, so manual create/update and the duplicate/convert relays all
+    // surface the same structured error the UI highlights.
+    await assertStockAvailable(tx, [{ sku, qty: Math.abs(delta) }])
   }
   await applyStockMovement({
     sku,
@@ -996,6 +994,24 @@ async function applyStockDelta(tx: any, sku: string, delta: number): Promise<voi
     refType: 'invoice',
     tx,
   })
+}
+
+/**
+ * Turns an InsufficientStockError into the API's 409 response.
+ *
+ * Returns true when it handled the error, so callers can `catch` and fall
+ * through to their generic 400/500 only for anything else. The payload carries
+ * the per-product detail the client uses to highlight the offending lines.
+ */
+function respondInsufficientStock(res: Response, err: unknown): boolean {
+  if (!(err instanceof InsufficientStockError)) return false
+  res.status(409).json({
+    error: 'Insufficient Stock',
+    code: 'INSUFFICIENT_STOCK',
+    message: err.message,
+    products: err.products,
+  })
+  return true
 }
 
 export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknown>> {
@@ -1110,6 +1126,13 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
 
     const id = randomUUID()
     const row = await db!.transaction(async (tx) => {
+      // Validate the WHOLE basket before writing anything, so two lines of the
+      // same SKU are checked against their combined demand and a shortfall
+      // aborts the transaction without saving the invoice or deducting stock.
+      await assertStockAvailable(
+        tx,
+        items.map((it) => ({ sku: String(it.sku ?? ''), qty: num(it.qty, 0), name: String(it.product ?? '') })),
+      )
       const [invoice] = await tx
         .insert(s.salesInvoices)
         .values({
@@ -1146,7 +1169,8 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
       })
       .catch(() => undefined)
     res.status(201).json(stripHash(row))
-  } catch {
+  } catch (err) {
+    if (respondInsufficientStock(res, err)) return
     res.status(400).json({ error: 'Failed to create invoice' })
   }
 })
@@ -1169,6 +1193,14 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         for (const oi of oldItems) {
           await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0))
         }
+        // Old stock is back, so the new basket is validated against the
+        // restored headroom — as a whole, so duplicate lines cannot oversell.
+        // A shortfall aborts the transaction and the restore rolls back too,
+        // leaving the invoice and its stock exactly as they were.
+        await assertStockAvailable(
+          tx,
+          items.map((it) => ({ sku: String(it.sku ?? ''), qty: num(it.qty, 0), name: String(it.product ?? '') })),
+        )
         // Delete old items
         await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
         // Insert new items and deduct stock
@@ -1226,7 +1258,8 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     }
 
     res.json(stripHash(row))
-  } catch {
+  } catch (err) {
+    if (respondInsufficientStock(res, err)) return
     res.status(400).json({ error: 'Failed to update invoice' })
   }
 })

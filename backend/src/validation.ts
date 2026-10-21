@@ -75,6 +75,10 @@ export const createOrderSchema = z.object({
     sku: z.string().max(100).optional(),
     quantity: z.number().int().min(1),
     price: z.number().min(0),
+    // Shopify ProductVariant id (numeric or gid:// form) when the line was
+    // billed against a specific variant. Optional so flat products and every
+    // existing client keep working unchanged.
+    variantId: z.union([z.string().max(120), z.number()]).optional(),
   })).min(1, 'At least one item is required'),
   billingAddress: z.object({
     name: z.string().max(255).optional(),

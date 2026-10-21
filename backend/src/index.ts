@@ -2042,8 +2042,11 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
     })
 
     res.json({ order: updated, shopifySync })
-  } catch {
-    res.status(400).json({ error: 'Failed to update order' })
+  } catch (err) {
+    // Keep the transaction's own message (e.g. the per-SKU insufficient-stock
+    // detail) so the modal can show it under the offending line.
+    const msg = err instanceof Error ? err.message : 'Failed to update order'
+    res.status(400).json({ error: msg })
   }
 })
 

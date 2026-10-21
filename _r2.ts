@@ -1,0 +1,4480 @@
+﻿import { randomUUID } from 'node:crypto'
+import { Router, type Request, type Response, json as expressJson } from 'express'
+import argon2 from 'argon2'
+import { desc, eq, ilike, inArray, ne, or, sql, and, gte, lte } from 'drizzle-orm'
+import { db, schema, checkDbHealth } from '../db/client'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
+import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
+import {
+  validate,
+  recoveryPasswordSchema,
+  normalizeGstin,
+  normalizeEmail,
+  validateSupplierInput,
+} from '../validation'
+import { clearRecoveryPassword, getRecoveryPasswordSource, isRecoveryRole, RECOVERY_PASSWORD_HASH_KEY, RECOVERY_PASSWORD_KEY, setRecoveryPassword } from '../recoveryPassword'
+import { actorFromRequest,  recordActivity } from '../activity'
+import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
+import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
+import { upsertEnvVar } from '../lib/envfile'
+import { logger } from '../logger'
+import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
+import { pushInventoryToShopify } from '../shopify'
+import { escapeHtml } from '../htmlEscape'
+import { routeParam } from '../lib/routeParams'
+
+export const dbRouter = Router()
+
+function requireDb(res: Response) {
+  if (!db) {
+    res.status(503).json({ error: 'Service temporarily unavailable' })
+    return false
+  }
+  return true
+}
+
+const COLUMNS_KEY = Symbol.for('drizzle:Columns')
+
+function columnsOf(table: any): string[] {
+  const cols = table?.[COLUMNS_KEY] ?? table
+  return Object.keys(cols)
+}
+
+function sanitize(body: Record<string, unknown>, table: any): Record<string, unknown> {
+  const allowed = new Set(columnsOf(table))
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(body ?? {})) {
+    if (allowed.has(key)) out[key] = value
+  }
+  // Login-lockout rules (Settings ΓåÆ Security): clamp rather than reject, so a
+  // stale UI or scripted PUT can never store threshold 0 (protection off) or
+  // a week-long lock. Mirrors normalizeLockoutPolicy in src/lockout.ts.
+  if (table === s.settings) {
+    const clampRule = (key: 'lockoutThreshold' | 'lockoutDurationMinutes', min: number, max: number) => {
+      if (out[key] === undefined) return
+      const n = Number(out[key])
+      if (!Number.isFinite(n)) throw new Error(`${key} must be a number`)
+      out[key] = Math.min(max, Math.max(min, Math.round(n)))
+    }
+    clampRule('lockoutThreshold', 1, 50)
+    clampRule('lockoutDurationMinutes', 1, 1440)
+  }
+  // Stock/price floors: the transactional order/invoice paths guard stock with
+  // row locks, but direct product writes must never push stock or prices negative.
+  if (table === s.products) {
+    if (out.stock !== undefined) {
+      const n = Number(out.stock)
+      if (!Number.isFinite(n) || n < 0) throw new Error('Stock cannot be negative')
+      out.stock = Math.floor(n)
+    }
+    if (out.reorderLevel !== undefined) {
+      const n = Number(out.reorderLevel)
+      if (!Number.isFinite(n) || n < 0) throw new Error('Reorder level cannot be negative')
+      out.reorderLevel = Math.floor(n)
+    }
+    for (const priceField of ['sellingPrice', 'compareAtPrice', 'costPrice', 'silverRate', 'makingCharge'] as const) {
+      if (out[priceField] !== undefined) {
+        const n = Number(out[priceField])
+        if (!Number.isFinite(n) || n < 0) throw new Error(`${priceField} cannot be negative`)
+        out[priceField] = n
+      }
+    }
+  }
+  return out
+}
+
+function stripHash<T extends Record<string, unknown>>(row: T): T {
+  if (row && 'passwordHash' in row) {
+    const { passwordHash, resetToken, resetTokenExpiry, emailVerificationToken, emailVerificationExpiry, ...rest } = row
+    void passwordHash; void resetToken; void resetTokenExpiry; void emailVerificationToken; void emailVerificationExpiry
+    return rest as T
+  }
+  return row
+}
+
+const PASSWORD_RULES: Array<[RegExp, string]> = [
+  [/[A-Z]/, 'Password must contain at least one uppercase letter'],
+  [/[a-z]/, 'Password must contain at least one lowercase letter'],
+  [/[0-9]/, 'Password must contain at least one number'],
+  [/[^A-Za-z0-9]/, 'Password must contain at least one special character'],
+]
+
+export function assertStrongPassword(pwd: string): void {
+  if (pwd.length < 8) throw new Error('Password must be at least 8 characters')
+  if (pwd.length > 255) throw new Error('Password must not exceed 255 characters')
+  for (const [pattern, message] of PASSWORD_RULES) {
+    if (!pattern.test(pwd)) throw new Error(message)
+  }
+}
+
+async function prepareUserBody(body: Record<string, unknown>, isUpdate = false): Promise<Record<string, unknown>> {
+  const cleaned = sanitize(body, schema.users)
+  delete cleaned.passwordHash
+  const raw = body ?? {}
+  const password = raw.password
+  if (password != null && password !== '') {
+    const pwd = String(password)
+    assertStrongPassword(pwd)
+    cleaned.passwordHash = await argon2.hash(pwd, { type: argon2.argon2id })
+    // An admin setting a password has chosen it for the user, so the forced
+    // rotation requirement is satisfied ΓÇö otherwise requireAuth would keep
+    // locking that account out of the API with no way to recover.
+    cleaned.requirePasswordChange = false
+  }
+  if (isUpdate && password == null) delete cleaned.passwordHash
+  delete cleaned.password
+  return cleaned
+}
+
+/**
+ * Module access is the super admin's call. The generic user create/update
+ * routes must not smuggle it past the dedicated RBAC endpoints: writing the
+ * `permissions` column (grant or reset), assigning the Super Admin role, or
+ * assigning any role that carries module permissions all require a Super
+ * Admin requester. Plain roles with no modules stay assignable to any
+ * system-module editor.
+ */
+async function assertNoPrivilegeEscalation(
+  req: Request,
+  body: Record<string, unknown>,
+): Promise<string | null> {
+  const touchesPermissions = 'permissions' in body
+  const targetRole = typeof body.role === 'string' ? body.role : null
+  const privileged =
+    touchesPermissions ||
+    (targetRole !== null && (targetRole === 'Super Admin' || (await roleGrantsAnyModule(targetRole))))
+  if (!privileged) return null
+  if (await isSuperAdminUser(req.userId ?? '')) return null
+  return 'Only a super admin can grant module access or assign privileged roles'
+}
+
+/**
+ * Validation and normalisation shared by the supplier create/update routes.
+ *
+ * Name is required (on create, and on update when it is being changed); email
+ * and GSTIN are optional but must be well-formed, and a GSTIN or name may not
+ * be reused by another supplier. Throws with a user-facing message, which the
+ * generic handlers surface for the supplier resource.
+ */
+async function prepareSupplierBody(
+  body: Record<string, unknown>,
+  opts: { isUpdate?: boolean; id?: string } = {},
+): Promise<Record<string, unknown>> {
+  const cleaned = sanitize(body, schema.suppliers)
+  const text = (value: unknown): string | null => {
+    const s = String(value ?? '').trim()
+    return s === '' ? null : s
+  }
+  for (const key of ['name', 'contact', 'phone', 'alternatePhone', 'city', 'address'] as const) {
+    if (key in cleaned) cleaned[key] = text(cleaned[key])
+  }
+  if ('email' in cleaned) cleaned.email = normalizeEmail(cleaned.email) || null
+  if ('gstin' in cleaned) cleaned.gstin = normalizeGstin(cleaned.gstin) || null
+
+  const nameProvided = Object.prototype.hasOwnProperty.call(body ?? {}, 'name')
+  const invalid = validateSupplierInput(
+    { name: cleaned.name, email: cleaned.email, gstin: cleaned.gstin },
+    { requireName: !opts.isUpdate || nameProvided },
+  )
+  if (invalid) throw new Error(invalid)
+
+  if (db) {
+    if (cleaned.name) {
+      const [clash] = await db
+        .select({ id: schema.suppliers.id })
+        .from(schema.suppliers)
+        .where(eq(schema.suppliers.name, String(cleaned.name)))
+        .limit(1)
+      if (clash && clash.id !== opts.id) throw new Error('A supplier with that name already exists')
+    }
+    if (cleaned.gstin) {
+      const [clash] = await db
+        .select({ id: schema.suppliers.id })
+        .from(schema.suppliers)
+        .where(eq(schema.suppliers.gstin, String(cleaned.gstin)))
+        .limit(1)
+      if (clash && clash.id !== opts.id) throw new Error('A supplier with that GSTIN already exists')
+    }
+  }
+  return cleaned
+}
+
+export function num(value: unknown, fallback: number) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function maskBankAccount(row: Record<string, unknown>): Record<string, unknown> {
+  if (!row || row.account_number_encrypted == null) return row
+  try {
+    const full = decrypt(String(row.account_number_encrypted))
+    row.accountNumber = full
+  } catch {
+    row.accountNumber = ''
+  }
+  delete row.account_number_encrypted
+  return row
+}
+
+function orderedColumn(orderCol: any): any {
+  if (!orderCol) return undefined
+  if (orderCol.direction) return orderCol
+  const colName = String(orderCol.name ?? '')
+  return /(date|time|timestamp|created|updated|_at)$/i.test(colName) ? desc(orderCol) : orderCol
+}
+
+async function paginate(table: any, query: any, orderCol: any, req: Request) {
+  const page = Math.max(1, num(req.query.page, 1))
+  const pageSize = Math.min(200, Math.max(1, num(req.query.limit, 50)))
+  const offset = (page - 1) * pageSize
+  const [rows, countResult] = await Promise.all([
+    db!.select().from(table).orderBy(orderedColumn(orderCol)).limit(pageSize).offset(offset),
+    db!.select({ count: sql<number>`count(*) over ()` }).from(table).limit(1),
+  ])
+  const count = countResult[0]?.count ?? 0
+  return { page, pageSize, total: Number(count), data: rows }
+}
+
+const listOf = (table: any, orderCol?: any) =>
+    async (req: Request, res: Response) => {
+    if (!requireDb(res)) return
+    try {
+      const result = await paginate(table, req.query, orderCol ?? table.id, req)
+      result.data = result.data.map(stripHash)
+      res.json(result)
+    } catch (err) {
+      logger.error({ err }, 'listOf query failed')
+      res.status(500).json({ error: 'Internal server error' })
+    }
+  }
+
+const oneOf = (table: any, idCol: any) =>
+    async (req: Request, res: Response) => {
+    if (!requireDb(res)) return
+    try {
+      const rows = await db!.select().from(table).where(eq(idCol, routeParam(req.params.id))).limit(1)
+      if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+      res.json(stripHash(rows[0]))
+    } catch (err) {
+      logger.error({ err }, 'oneOf query failed')
+      res.status(500).json({ error: 'Internal server error' })
+    }
+  }
+
+const s = schema
+
+dbRouter.get('/products', listOf(s.products, s.products.name))
+
+// Barcode / QR Code labels (must be before /products/:id to avoid param capture)
+dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), (_req, res) => {
+  const { LABEL_PRESETS } = require('../barcodeLabels')
+  res.json(Object.entries(LABEL_PRESETS).map(([key, val]) => ({ key, ...(val as any) })))
+})
+
+// Parses optional custom label geometry from query/body. Values are clamped to
+// sane physical ranges so a bad request can never produce a broken PDF.
+function labelSizeOverride(src: Record<string, unknown>): Partial<{
+  width: number
+  height: number
+  columns: number
+  rows: number
+  margin: number
+  gap: number
+}> {
+  const num = (v: unknown, min: number, max: number): number | undefined => {
+    const n = Number(v)
+    if (!Number.isFinite(n)) return undefined
+    return Math.min(Math.max(n, min), max)
+  }
+  const out: ReturnType<typeof labelSizeOverride> = {}
+  const width = num(src.w ?? src.width, 10, 150)
+  const height = num(src.h ?? src.height, 5, 150)
+  const columns = num(src.cols ?? src.columns, 1, 12)
+  const rows = num(src.rows, 1, 60)
+  const margin = num(src.margin, 0, 40)
+  const gap = num(src.gap, 0, 20)
+  if (width !== undefined) out.width = width
+  if (height !== undefined) out.height = height
+  if (columns !== undefined) out.columns = Math.floor(columns)
+  if (rows !== undefined) out.rows = Math.floor(rows)
+  if (margin !== undefined) out.margin = margin
+  if (gap !== undefined) out.gap = gap
+  return out
+}
+
+dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
+  try {
+    const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
+    const preset = String(req.query.preset || 'zlabel-50x30')
+    const showPrice = req.query.price !== 'false'
+    const showWeight = req.query.weight !== 'false'
+    const showQR = req.query.qr !== 'false'
+    // Optional `ids` query (comma-separated product IDs) ΓåÆ labels for selected products only
+    const idsParam = String(req.query.ids ?? '').split(',').map((x) => x.trim()).filter(Boolean)
+    const products = idsParam.length > 0 ? await fetchProductLabels(idsParam) : await fetchAllProductLabels()
+    if (products.length === 0) return res.status(404).json({ error: 'No products found' })
+    const opts = { ...LABEL_PRESETS[preset], ...labelSizeOverride(req.query as Record<string, unknown>) }
+    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
+    res.send(pdf)
+  } catch {
+    res.status(500).json({ error: 'Label generation failed' })
+  }
+})
+
+dbRouter.post('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
+  try {
+    const { fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
+    const ids: string[] = req.body?.productIds ?? []
+    const preset = String(req.body?.preset || 'zlabel-50x30')
+    const showPrice = req.body?.showPrice !== false
+    const showWeight = req.body?.showWeight !== false
+    const showQR = req.body?.showQR !== false
+    if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
+    const products = await fetchProductLabels(ids)
+    if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
+    const opts = {
+      ...LABEL_PRESETS[preset],
+      ...labelSizeOverride((req.body ?? {}) as Record<string, unknown>),
+    }
+    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
+    res.send(pdf)
+  } catch {
+    res.status(500).json({ error: 'Label generation failed' })
+  }
+})
+
+// Scan-based stock count: look up a product by barcode or exact SKU (for scanner guns)
+dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const code = String(req.query.code ?? '').trim()
+    if (!code) return res.status(400).json({ error: 'code is required' })
+    const [row] = await db!
+      .select({
+        id: s.products.id,
+        name: s.products.name,
+        sku: s.products.sku,
+        barcode: s.products.barcode,
+        stock: s.products.stock,
+        category: s.products.category,
+      })
+      .from(s.products)
+      .where(or(eq(s.products.barcode, code), eq(s.products.sku, code)))
+      .limit(1)
+    if (!row) return res.status(404).json({ error: 'No product with that barcode/SKU' })
+    res.json({ data: row })
+  } catch (err) {
+    logger.error({ err }, 'product scan lookup failed')
+    res.status(500).json({ error: 'Scan lookup failed' })
+  }
+})
+
+// Bulk stock-count: apply counted quantities for many products at once.
+// body: { counts: [{ id, counted }], mode: 'set' | 'adjust', locationId?: string,
+//         pushToShopify?: boolean }
+dbRouter.post('/inventory/stock-count', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const counts = Array.isArray(req.body?.counts) ? req.body.counts : []
+    const mode = req.body?.mode === 'adjust' ? 'adjust' : 'set'
+    const pushToShopify = req.body?.pushToShopify === true
+    if (counts.length === 0) return res.status(400).json({ error: 'counts array is required' })
+
+    // A count is always taken at ONE location. Counting a branch must adjust
+    // that branch's balance, so the target has to be read from stock_levels at
+    // that location ΓÇö never from products.stock, which is the cross-location
+    // rollup and would make counting one shop silently correct another.
+    const locationRaw = String(req.body?.locationId ?? '').trim()
+    const locationId = locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()
+    if (!locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
+
+    const { rows, errors } = buildStockCountRows(counts)
+    let applied = 0
+    for (const c of rows) {
+      try {
+        const [product] = await db!
+          .select({ id: s.products.id, sku: s.products.sku })
+          .from(s.products)
+          .where(eq(s.products.id, c.id))
+          .limit(1)
+        if (!product) {
+          errors.push(`${c.id}: product not found`)
+          continue
+        }
+        const [level] = await db!
+          .select({ qty: s.stockLevels.qty })
+          .from(s.stockLevels)
+          .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, locationId)))
+          .limit(1)
+        const current = stockAtLocation(level?.qty)
+        const delta = stockCountDelta(current, c.counted, mode)
+        if (delta === 0) {
+          applied++
+          continue
+        }
+        // A count is a correction, not a silent overwrite: record the delta as
+        // a count_adjust movement so the ledger explains the new balance.
+        await applyStockMovement({
+          sku: String(product.sku ?? ''),
+          qty: delta,
+          type: 'count_adjust',
+          locationId,
+          refType: 'stock_count',
+          note: mode === 'set' ? `counted ${c.counted} at ${locationId} (was ${current})` : `counted adjustment ${delta > 0 ? '+' : ''}${delta} at ${locationId}`,
+          createdBy: actorFromRequest(req).userId ?? 'system',
+        })
+        applied++
+      } catch (err) {
+        errors.push(`${c.id}: ${err instanceof Error ? err.message : 'update failed'}`)
+      }
+    }
+    // Optional round-trip: push the (already-applied) local stock to Shopify so
+    // the store matches the physical count. Best-effort ΓÇö local apply stands.
+    let shopifyPush: Awaited<ReturnType<typeof pushInventoryToShopify>> | null = null
+    if (pushToShopify && applied > 0) {
+      try {
+        shopifyPush = await pushInventoryToShopify(rows.map((c) => c.id))
+      } catch (err) {
+        shopifyPush = { ok: false, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Shopify push failed'] }
+      }
+    }
+    recordCrud('products', 'Updated', req, { stockCount: true, applied, mode, shopifyPush: shopifyPush ? shopifyPush.updated : undefined })
+    res.json({ ok: errors.length === 0, applied, mode, errors, shopifyPush })
+  } catch (err) {
+    logger.error({ err }, 'stock count apply failed')
+    res.status(500).json({ error: 'Stock count failed' })
+  }
+})
+
+// Product catalog PDF + duplicate SKU detection (before /products/:id to avoid param capture)
+dbRouter.get('/products/catalog-pdf', requirePermission('inventory', 'view'), async (_req, res) => {
+  try {
+    const { generateCatalogPDF } = await import('../catalogPdf')
+    const pdf = await generateCatalogPDF()
+    if (!pdf) return res.status(500).json({ error: 'Catalog generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="product-catalog-${new Date().toISOString().slice(0, 10)}.pdf"`)
+    res.send(pdf)
+  } catch (err) {
+    logger.error({ err }, 'catalog PDF failed')
+    res.status(500).json({ error: 'Catalog generation failed' })
+  }
+})
+
+// Duplicate SKU detection
+dbRouter.get('/products/duplicates', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.execute<Record<string, unknown>>(sql`
+      SELECT lower(sku) AS sku, count(*)::int AS cnt,
+             string_agg(name || ' (' || id || ')', ' | ') AS products
+      FROM products
+      GROUP BY lower(sku)
+      HAVING count(*) > 1
+      ORDER BY cnt DESC
+    `)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'duplicate check failed')
+    res.status(500).json({ error: 'Duplicate check failed' })
+  }
+})
+
+// Duplicate customer-email detection (non-destructive advisory for the UI).
+// Two legitimate Shopify identities can share an inbox ΓÇö the banner warns,
+// it never merges.
+dbRouter.get('/customers/duplicate-emails', requirePermission('sales', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.execute<Record<string, unknown>>(sql`
+      SELECT lower(email) AS email, count(*)::int AS cnt,
+             string_agg(name || ' (' || id || ')', ' | ') AS customers
+      FROM customers
+      WHERE email IS NOT NULL AND email <> ''
+      GROUP BY lower(email)
+      HAVING count(*) > 1
+      ORDER BY cnt DESC
+    `)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'duplicate email check failed')
+    res.status(500).json({ error: 'Duplicate email check failed' })
+  }
+})
+
+dbRouter.get('/products/:id', oneOf(s.products, s.products.id))
+
+dbRouter.get('/customers', listOf(s.customers, s.customers.name))
+dbRouter.get('/customers/:id', oneOf(s.customers, s.customers.id))
+
+dbRouter.get('/suppliers', listOf(s.suppliers, s.suppliers.name))
+dbRouter.get('/suppliers/unmatched-products', requirePermission('purchase', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { unmatchedSupplierNames } = await import('../supplierLinking')
+    const { getRawClient } = await import('../db/client')
+    const client = getRawClient()
+    if (!client) return res.status(503).json({ error: 'Database not configured' })
+    const names = await unmatchedSupplierNames(client)
+    res.json({ data: names })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Failed to fetch unmatched supplier names'
+    res.status(500).json({ error: msg })
+  }
+})
+dbRouter.post('/products/link-suppliers', requirePermission('purchase', 'edit'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { linkProductsToSuppliers } = await import('../supplierLinking')
+    const { getRawClient } = await import('../db/client')
+    const client = getRawClient()
+    if (!client) return res.status(503).json({ error: 'Database not configured' })
+    const result = await linkProductsToSuppliers(client)
+    res.json(result)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Failed to link suppliers'
+    res.status(500).json({ error: msg })
+  }
+})
+dbRouter.get('/suppliers/:id', oneOf(s.suppliers, s.suppliers.id))
+
+dbRouter.get('/invoices', listOf(s.salesInvoices, s.salesInvoices.date))
+dbRouter.get('/invoices/with-items', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const limit = Math.min(200, Math.max(1, num(req.query.limit, 100)))
+    const invoices = await db!.select().from(s.salesInvoices).orderBy(desc(s.salesInvoices.date)).limit(limit)
+    const ids = invoices.map((i) => i.id)
+    const items = ids.length > 0 ? await db!.select().from(s.salesInvoiceItems).where(inArray(s.salesInvoiceItems.invoiceId, ids)) : []
+    const byInvoice = new Map<string, typeof items>()
+    for (const it of items) {
+      const key = String(it.invoiceId ?? '')
+      const arr = byInvoice.get(key) ?? []
+      arr.push(it)
+      byInvoice.set(key, arr)
+    }
+  res.json({ page: 1, pageSize: limit, total: invoices.length, data: invoices.map((i) => ({ ...i, items: byInvoice.get(i.id) ?? [] })) })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+dbRouter.get('/invoices/:id', oneOf(s.salesInvoices, s.salesInvoices.id))
+
+dbRouter.get('/invoices/:id/items', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
+  res.json(rows)
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Order PII repair ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Dev stores get customer PII redacted over the REST API, so imported orders
+// can end up with customer "Guest" and no addresses. The customers table may
+// still hold the identity (matched by email or phone from earlier syncs, the
+// Flow webhook or CSV imports). This repairs those order rows LOCALLY ΓÇö
+// nothing is pushed to Shopify and orders with real names are never touched.
+//
+// body: { orderIds?: string[] } ΓÇö omit to scan every order.
+// Returns { matched, repaired: [{ shopifyId, from, to }], unmatched: [...] }.
+dbRouter.post('/orders/repair-pii', requirePermission('shopify', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const orderIds = Array.isArray(req.body?.orderIds)
+      ? req.body.orderIds.map((x: unknown) => String(x)).filter(Boolean).slice(0, 500)
+      : null
+    const rows = orderIds && orderIds.length > 0
+      ? await db!.select().from(s.salesOrders).where(inArray(s.salesOrders.id, orderIds))
+      : await db!.select().from(s.salesOrders)
+
+    const customers = await db!.select().from(s.customers)
+    const byEmail = new Map<string, typeof customers[number]>()
+    const byPhoneDigits = new Map<string, typeof customers[number]>()
+    for (const c of customers) {
+      // Guest-checkout customer rows (no real name) must never "repair" an
+      // order's name ΓÇö that would just write Guest back over Guest.
+      if (!c.name || !c.name.trim() || c.name.trim().toLowerCase() === 'guest') continue
+      if (c.email) byEmail.set(c.email.trim().toLowerCase(), c)
+      const digits = (c.phone ?? '').replace(/\D/g, '')
+      if (digits.length >= 6) byPhoneDigits.set(digits, c)
+    }
+    const isMissingName = (name: string | null | undefined) => !name || !name.trim() || name.trim().toLowerCase() === 'guest'
+
+    let matched = 0
+    const repaired: Array<{ shopifyId: string; from: string; to: string }> = []
+    const unmatched: string[] = []
+    for (const o of rows) {
+      if (!isMissingName(o.customer)) continue
+      const email = (o.customerEmail ?? '').trim().toLowerCase()
+      const phoneDigits = (o.customerPhone ?? '').replace(/\D/g, '')
+      const addr = (o.billingAddress ?? o.shippingAddress) as Record<string, unknown> | null
+      const addrName = typeof addr?.name === 'string' ? addr.name.trim() : ''
+      const addrPhone = typeof addr?.phone === 'string' ? addr.phone.replace(/\D/g, '') : ''
+
+      // Identity match order: order email ΓåÆ order phone ΓåÆ address phone ΓåÆ
+      // address block itself (only as a last resort).
+      const byEmailHit = email ? byEmail.get(email) : undefined
+      const byOrderPhoneHit = phoneDigits.length >= 6 ? byPhoneDigits.get(phoneDigits) : undefined
+      const byAddrPhoneHit = addrPhone.length >= 6 ? byPhoneDigits.get(addrPhone) : undefined
+      const hit = byEmailHit ?? byOrderPhoneHit ?? byAddrPhoneHit
+
+      if (hit) {
+        matched++
+        const from = o.customer ?? ''
+        const set: Record<string, unknown> = { customer: hit.name }
+        if (hit.email && !o.customerEmail) set.customerEmail = hit.email
+        if (hit.phone && !o.customerPhone) set.customerPhone = hit.phone
+        if (!o.billingAddress && (hit.city || hit.province)) {
+          set.billingAddress = { name: hit.name, city: hit.city ?? '', province: hit.province ?? '', phone: hit.phone ?? '' }
+        }
+        await db!.update(s.salesOrders).set(set).where(eq(s.salesOrders.id, o.id))
+        repaired.push({ shopifyId: o.shopifyId ?? o.id, from, to: hit.name })
+      } else if (addrName && addrName.toLowerCase() !== 'guest') {
+        matched++
+        const from = o.customer ?? ''
+        const set: Record<string, unknown> = { customer: addrName }
+        if (addr?.phone && !o.customerPhone) set.customerPhone = String(addr.phone)
+        await db!.update(s.salesOrders).set(set).where(eq(s.salesOrders.id, o.id))
+        repaired.push({ shopifyId: o.shopifyId ?? o.id, from, to: addrName })
+      } else {
+        unmatched.push(o.shopifyId ?? o.id)
+      }
+    }
+    recordCrud('sales_orders', 'Updated', req, { piiRepair: true, repaired: repaired.length })
+    res.json({ ok: true, matched, repaired, unmatched })
+  } catch (err) {
+    logger.error({ err }, 'order PII repair failed')
+    res.status(500).json({ error: 'Order PII repair failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ E-invoicing (GST IRN) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Mode is a setting: off | manual | automatic. In `automatic` mode a newly
+// issued invoice is pushed to the gateway without anyone clicking anything.
+dbRouter.get('/einvoice/:invoiceId', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const { resolveEInvoiceMode, isRealGatewayConfigured, resolveProvider } = await import('../einvoice')
+    const mode = await resolveEInvoiceMode()
+    const [invoice] = await db!.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.invoiceId))).limit(1)
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
+    res.json({
+      mode,
+      provider: resolveProvider().name,
+      gatewayConfigured: isRealGatewayConfigured(),
+      status: invoice.irn ? 'generated' : mode === 'off' ? 'disabled' : 'pending',
+      irn: invoice.irn ?? null,
+      irnDate: invoice.irnDate ?? null,
+      qrCode: invoice.qrCode ?? null,
+    })
+  } catch (err) {
+    logger.error({ err }, 'einvoice status failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+dbRouter.post('/einvoice/:invoiceId/generate', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    if (!requireDb(res)) return
+    const { generateEInvoiceForInvoice, resolveEInvoiceMode } = await import('../einvoice')
+    const mode = await resolveEInvoiceMode()
+    if (mode === 'off') return res.status(400).json({ error: 'E-invoicing is switched off in Settings ΓåÆ Tax & Compliance' })
+
+    const [existing] = await db!.select({ irn: s.salesInvoices.irn }).from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.invoiceId))).limit(1)
+    if (!existing) return res.status(404).json({ error: 'Invoice not found' })
+    if (existing.irn) return res.status(409).json({ error: 'This invoice already has an IRN', irn: existing.irn })
+
+    const result = await generateEInvoiceForInvoice(routeParam(req.params.invoiceId))
+    if (!result.ok) return res.status(502).json({ error: result.error })
+    recordCrud('invoices', 'E-invoice generated', req, { invoiceId: routeParam(req.params.invoiceId), irn: result.irn, provider: result.provider })
+    res.json({ ok: true, irn: result.irn, irnDate: result.irnDate, qrCode: result.qrCode, provider: result.provider })
+  } catch (err) {
+    logger.error({ err }, 'einvoice generate failed')
+    res.status(500).json({ error: 'Failed to generate IRN' })
+  }
+})
+
+dbRouter.post('/einvoice/:invoiceId/cancel', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    if (!requireDb(res)) return
+    const { cancelEInvoiceForInvoice } = await import('../einvoice')
+    const reason = typeof req.body?.reason === 'string' && req.body.reason.trim() ? req.body.reason.trim().slice(0, 100) : 'Cancelled by seller'
+    const result = await cancelEInvoiceForInvoice(routeParam(req.params.invoiceId), reason)
+    if (!result.ok) return res.status(400).json({ error: result.error })
+    recordCrud('invoices', 'E-invoice cancelled', req, { invoiceId: routeParam(req.params.invoiceId), reason })
+    res.json({ ok: true, cancelDate: result.cancelDate })
+  } catch (err) {
+    logger.error({ err }, 'einvoice cancel failed')
+    res.status(500).json({ error: 'Failed to cancel IRN' })
+  }
+})
+
+export function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+/**
+ * Apply an invoice's stock delta THROUGH THE LEDGER (stock_levels +
+ * stock_movements + the products.stock rollup), all inside the caller's
+ * transaction.
+ *
+ * The old implementation was `UPDATE products SET stock = stock + delta`,
+ * which left the availability balances and the audit trail untouched ΓÇö a
+ * manual invoice never reduced what the app treats as shoppable stock, and
+ * the rollup silently drifted from the ledger. The historical oversell guard
+ * (row lock + insufficient-stock error) is preserved.
+ */
+async function applyStockDelta(tx: any, sku: string, delta: number): Promise<void> {
+  if (!sku || !delta) return
+  if (delta < 0) {
+    const [row] = await tx.select({ stock: s.products.stock }).from(s.products).where(eq(s.products.sku, sku)).limit(1).for('update')
+    if (!row) return
+    const current = Number(row.stock ?? 0)
+    if (current + delta < 0) {
+      throw new Error(`Insufficient stock for SKU ${sku}: available ${current}, requested ${Math.abs(delta)}`)
+    }
+  }
+  await applyStockMovement({
+    sku,
+    qty: delta,
+    type: delta < 0 ? 'sale_out' : 'sale_return_in',
+    refType: 'invoice',
+    tx,
+  })
+}
+
+export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((it) => {
+      const item = it && typeof it === 'object' ? (it as Record<string, unknown>) : {}
+      const row = sanitize(item, s.salesInvoiceItems)
+      delete row.id
+      delete row.invoiceId
+      row.product = String(item.product ?? item.title ?? '').trim()
+      row.sku = String(item.sku ?? '').trim()
+      row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
+      row.weight = num(item.weight, 0)
+      row.silverRate = num(item.silverRate, 0)
+      row.makingCharge = num(item.makingCharge, 0)
+      row.tax = num(item.tax, 0)
+      const weight = num(item.weight, 0)
+      const silverRate = num(item.silverRate, 0)
+      const makingCharge = num(item.makingCharge, 0)
+      if (weight > 0 && silverRate > 0) {
+        const silverValue = round2(weight * silverRate)
+        row.amount = round2(silverValue + makingCharge)
+      } else {
+        row.amount = num(item.amount, 0)
+      }
+      return row
+    })
+    .filter((it) => String(it.sku) !== '' || String(it.product) !== '')
+}
+
+// Duplicate an existing invoice into a fresh draft (same items/customer, new number, no payment)
+dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [source] = await db!.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
+    if (!source) return res.status(404).json({ error: 'Invoice not found' })
+    const sourceItems = await db!.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, source.id))
+    if (sourceItems.length === 0) return res.status(400).json({ error: 'Source invoice has no line items to duplicate' })
+
+    // New invoice number using the configured prefix
+    const [settingsRow] = await db!.select().from(s.settings).where(eq(s.settings.id, 'app')).limit(1)
+    const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
+    const now = new Date()
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+    let invoiceNumber = ''
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const candidate = `${prefix}${stamp}${Math.floor(1000 + Math.random() * 9000)}`
+      const [clash] = await db!.select({ id: s.salesInvoices.id }).from(s.salesInvoices).where(eq(s.salesInvoices.number, candidate)).limit(1)
+      if (!clash) { invoiceNumber = candidate; break }
+    }
+    if (!invoiceNumber) return res.status(500).json({ error: 'Could not generate invoice number' })
+
+    const newId = randomUUID()
+    const row = await db!.transaction(async (tx) => {
+      const [created] = await tx.insert(s.salesInvoices).values({
+        id: newId,
+        number: invoiceNumber,
+        customer: source.customer,
+        customerEmail: source.customerEmail,
+        customerPhone: source.customerPhone,
+        customerAddress: source.customerAddress,
+        customerCity: source.customerCity,
+        customerState: source.customerState,
+        customerPincode: source.customerPincode,
+        silverValue: source.silverValue,
+        makingCharge: source.makingCharge,
+        subtotal: source.subtotal,
+        gst: source.gst,
+        gstAmount: source.gstAmount,
+        discount: source.discount,
+        grandTotal: source.grandTotal,
+        paymentMethod: 'Pending',
+        paymentStatus: 'pending',
+        status: 'draft',
+        date: new Date().toISOString(),
+      }).returning()
+      for (const it of sourceItems) {
+        const { id: _oldId, invoiceId: _oldInvoiceId, ...itemData } = it
+        await tx.insert(s.salesInvoiceItems).values({ ...itemData, id: randomUUID(), invoiceId: newId })
+      }
+      return created
+    })
+    recordCrud('invoices', 'Created', req, row)
+    res.status(201).json(stripHash(row))
+  } catch {
+    res.status(400).json({ error: 'Failed to duplicate invoice' })
+  }
+})
+
+dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const body = req.body ?? {}
+    const items = normalizeInvoiceItems(body.items)
+    const clean = sanitize(body, s.salesInvoices)
+    delete clean.id
+    delete clean.items
+    if (!clean.number) return res.status(400).json({ error: 'Invoice number is required' })
+    // Every dated report (dashboard, GST, HSN, statements, day book) filters on
+    // this column ΓÇö an invoice without one is invisible in all of them.
+    if (!clean.date) clean.date = new Date().toISOString()
+
+    const hasItems = items.length > 0
+    const gst = num(body.gst, 3)
+    const subtotal = hasItems ? round2(items.reduce((a, it) => a + num(it.amount, 0), 0)) : num(clean.subtotal, 0)
+    const discount = num(body.discount, 0)
+    const gstAmount = hasItems ? round2(subtotal * gst / 100) : num(clean.gstAmount, round2(subtotal * gst / 100))
+    const grandTotal = hasItems ? round2(subtotal + gstAmount - discount) : num(clean.grandTotal, round2(subtotal + gstAmount - discount))
+    const silverValue = hasItems ? round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0)) : num(clean.silverValue, 0)
+    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0)) : num(clean.makingCharge, 0)
+
+    const id = randomUUID()
+    const row = await db!.transaction(async (tx) => {
+      const [invoice] = await tx
+        .insert(s.salesInvoices)
+        .values({
+          ...clean,
+          id,
+          subtotal,
+          gst,
+          gstAmount,
+          discount,
+          grandTotal,
+          silverValue,
+          makingCharge,
+        } as any)
+        .returning()
+      for (const it of items) {
+        await tx.insert(s.salesInvoiceItems).values({ ...it, id: randomUUID(), invoiceId: id })
+        await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0))
+      }
+      return invoice
+    })
+
+    recordCrud('invoices', 'Created', req, row)
+    // Loyalty: award points on new invoices (fire-and-forget, never blocks billing)
+    void import('../loyalty').then(({ earnForInvoice }) =>
+      earnForInvoice({ id: row.id, number: row.number ?? '', customer: row.customer ?? '', grandTotal: row.grandTotal, status: row.status }),
+    )
+    // E-invoicing: in `automatic` mode every new invoice is pushed to the
+    // gateway straight away. Fire-and-forget so billing is never blocked.
+    void import('../einvoice')
+      .then(async ({ resolveEInvoiceMode, generateEInvoiceForInvoice }) => {
+        if ((await resolveEInvoiceMode()) !== 'automatic') return
+        const result = await generateEInvoiceForInvoice(row.id)
+        if (!result.ok) logger.error({ err: result.error, invoice: row.number }, 'automatic IRN generation failed')
+      })
+      .catch(() => undefined)
+    res.status(201).json(stripHash(row))
+  } catch {
+    res.status(400).json({ error: 'Failed to create invoice' })
+  }
+})
+
+dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const body = req.body ?? {}
+    const clean = sanitize(body, s.salesInvoices)
+    delete clean.id
+    delete clean.items
+
+    const row = await db!.transaction(async (tx) => {
+      const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
+      if (!existing) return null
+      const items = normalizeInvoiceItems(body.items)
+      if (items.length > 0) {
+        // First, restore old stock
+        const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
+        for (const oi of oldItems) {
+          await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0))
+        }
+        // Delete old items
+        await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
+        // Insert new items and deduct stock
+        for (const it of items) {
+          await tx.insert(s.salesInvoiceItems).values({ ...it, id: randomUUID(), invoiceId: routeParam(req.params.id) })
+          await applyStockDelta(tx, String(it.sku ?? ''), -num(it.qty, 0))
+        }
+        const gst = num(body.gst, num(existing.gst, 3))
+        const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
+        const discount = num(body.discount, num(existing.discount, 0))
+        const gstAmount = round2(subtotal * gst / 100)
+        const grandTotal = round2(subtotal + gstAmount - discount)
+        const silverValue = round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0))
+        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0))
+        clean.subtotal = subtotal
+        clean.gst = gst
+        clean.gstAmount = gstAmount
+        clean.discount = discount
+        clean.grandTotal = grandTotal
+        clean.silverValue = silverValue
+        clean.makingCharge = makingCharge
+      } else if (clean.discount !== undefined || clean.gst !== undefined) {
+        // Header-only edit that changes discount/GST: recompute the totals
+        // from the existing subtotal so grandTotal never goes stale. No items
+        // were sent, so stock is untouched.
+        const subtotal = num(existing.subtotal, 0)
+        const gst = num(clean.gst ?? existing.gst, 3)
+        const discount = num(clean.discount ?? existing.discount, 0)
+        const gstAmount = round2(subtotal * gst / 100)
+        clean.gstAmount = gstAmount
+        clean.grandTotal = round2(subtotal + gstAmount - discount)
+      }
+      if (Object.keys(clean).length === 0) return existing
+      const [updated] = await tx.update(s.salesInvoices).set(clean).where(eq(s.salesInvoices.id, routeParam(req.params.id))).returning()
+      return updated
+    })
+
+    if (!row) return res.status(404).json({ error: 'Not found' })
+    recordCrud('invoices', 'Updated', req, row)
+
+    // Marking an invoice cancelled / refunded gives back the loyalty points it
+    // earned (the earn entry is skipped when an invoice is voided up front).
+    const nextStatus = String(row.status ?? '').toLowerCase()
+    if (nextStatus === 'cancelled' || nextStatus === 'refunded') {
+      void import('../loyalty')
+        .then(({ reverseEarnedForInvoice }) =>
+          reverseEarnedForInvoice({
+            id: row.id,
+            number: row.number,
+            customer: String(row.customer ?? ''),
+            reason: `Reversed ΓÇö invoice ${row.number} marked ${nextStatus}`,
+          }),
+        )
+        .catch(() => undefined)
+    }
+
+    res.json(stripHash(row))
+  } catch {
+    res.status(400).json({ error: 'Failed to update invoice' })
+  }
+})
+
+dbRouter.delete('/invoices/:id', requirePermission('sales', 'delete'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const removed = await db!.transaction(async (tx) => {
+      const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
+      if (!existing) return null
+      const items = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
+      for (const it of items) {
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0))
+      }
+      await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
+      await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id)))
+      recordCrud('invoices', 'Deleted', req, existing)
+      return existing
+    })
+    if (!removed) return res.status(404).json({ error: 'Not found' })
+    // Deleting an invoice must undo everything it granted: stock is restored
+    // above, and the loyalty points it earned go back too ΓÇö the same rule as
+    // marking it cancelled/refunded. Fire-and-forget so the delete never
+    // blocks; reverseEarnedForInvoice tolerates the now-missing invoice row
+    // (it falls back to reversing the full outstanding balance).
+    void import('../loyalty')
+      .then(({ reverseEarnedForInvoice }) =>
+        reverseEarnedForInvoice({
+          id: removed.id,
+          number: String(removed.number ?? ''),
+          customer: String(removed.customer ?? ''),
+          reason: `Reversed ΓÇö invoice ${removed.number} deleted`,
+        }),
+      )
+      .catch(() => undefined)
+    res.json({ ok: true, id: routeParam(req.params.id) })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+dbRouter.get('/sales-orders', listOf(s.salesOrders, s.salesOrders.date))
+dbRouter.get('/sales-orders/:id', oneOf(s.salesOrders, s.salesOrders.id))
+
+/** Raise an invoice for an order that doesn't have one yet (inline action). */
+dbRouter.post('/sales-orders/:id/create-invoice', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    const existing = order.invoice
+    const invoiceNumber = await createInvoiceForOrderRow(order)
+    if (invoiceNumber && !existing) {
+      const [fresh] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+      if (fresh) recordCrud('sales-orders', 'Updated', req, fresh)
+      await insertOrderEvent(routeParam(req.params.id), 'Invoice Created', `Invoice ${invoiceNumber} generated`, actorFromRequest(req).userId ?? 'system')
+    }
+    res.json({ created: Boolean(invoiceNumber) && !existing, invoiceNumber })
+  } catch (err) {
+    logger.error({ err }, 'create-invoice for order failed')
+    res.status(500).json({ error: 'Failed to create invoice from order' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Bulk product import (CSV rows parsed client-side) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+const PRODUCT_FIELD_ALIASES: Record<string, string> = {
+  name: 'name', title: 'name', product: 'name', 'product name': 'name',
+  sku: 'sku', 'item code': 'sku', code: 'sku',
+  barcode: 'barcode', 'bar code': 'barcode',
+  category: 'category', type: 'category',
+  collection: 'collection',
+  purity: 'purity',
+  grossweight: 'grossWeight', 'gross weight': 'grossWeight',
+  stoneweight: 'stoneWeight', 'stone weight': 'stoneWeight',
+  netweight: 'netWeight', 'net weight': 'netWeight',
+  makingcharge: 'makingCharge', 'making charge': 'makingCharge', mc: 'makingCharge',
+  gst: 'gst', 'gst rate': 'gst',
+  hsn: 'hsn', 'hsn code': 'hsn',
+  supplier: 'supplier',
+  silverrate: 'silverRate', 'silver rate': 'silverRate', rate: 'silverRate',
+  sellingprice: 'sellingPrice', 'selling price': 'sellingPrice', price: 'sellingPrice',
+  compareatprice: 'compareAtPrice', 'compare at price': 'compareAtPrice', mrp: 'compareAtPrice',
+  stock: 'stock', quantity: 'stock', qty: 'stock',
+  reorderlevel: 'reorderLevel', 'reorder level': 'reorderLevel',
+  status: 'status',
+  vendor: 'vendor',
+  producttype: 'productType', 'product type': 'productType',
+  tags: 'tags',
+  huid: 'huid',
+  metal: 'metal',
+  puritylabel: 'purityLabel', 'purity label': 'purityLabel', purityLabel: 'purityLabel',
+  diamondweight: 'diamondWeight', 'diamond weight': 'diamondWeight', diamondWeight: 'diamondWeight',
+}
+
+function normalizeHeader(h: string): string {
+  const key = h.trim().toLowerCase().replace(/[\s_-]+/g, ' ')
+  return PRODUCT_FIELD_ALIASES[key] ?? PRODUCT_FIELD_ALIASES[key.replace(/\s/g, '')] ?? ''
+}
+
+function toNum(v: unknown): number | null {
+  if (v == null || v === '') return null
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rawRows: unknown[] = Array.isArray(req.body?.rows) ? req.body.rows : []
+    if (rawRows.length === 0) return res.status(400).json({ error: 'rows is required (array of objects with CSV headers as keys)' })
+    if (rawRows.length > 2000) return res.status(400).json({ error: 'Maximum 2000 rows per import' })
+
+    const errors: string[] = []
+    let created = 0
+    let updated = 0
+
+    // Load existing products by normalized SKU for upsert
+    const existing = await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products)
+    const bySku = new Map(existing.map((p) => [p.sku.trim().toLowerCase(), p]))
+
+    for (let i = 0; i < rawRows.length; i++) {
+      const raw = rawRows[i] as Record<string, unknown>
+      if (!raw || typeof raw !== 'object') continue
+      const mapped: Record<string, string> = {}
+      for (const [k, v] of Object.entries(raw)) {
+        const field = normalizeHeader(k)
+        if (field && v != null && String(v).trim() !== '') mapped[field] = String(v).trim()
+      }
+      const rowNo = i + 2 // +2: header row + 1-indexed
+      const name = mapped.name
+      const sku = mapped.sku
+      if (!name) { errors.push(`Row ${rowNo}: missing name ΓÇö skipped`); continue }
+      if (!sku) { errors.push(`Row ${rowNo}: missing SKU ΓÇö skipped`); continue }
+      const skuKey = sku.toLowerCase()
+      const numeric = {
+        purity: toNum(mapped.purity),
+        grossWeight: toNum(mapped.grossWeight),
+        stoneWeight: toNum(mapped.stoneWeight),
+        netWeight: toNum(mapped.netWeight),
+        makingCharge: toNum(mapped.makingCharge),
+        gst: toNum(mapped.gst),
+        silverRate: toNum(mapped.silverRate),
+        sellingPrice: toNum(mapped.sellingPrice),
+        compareAtPrice: toNum(mapped.compareAtPrice),
+        stock: toNum(mapped.stock),
+        reorderLevel: toNum(mapped.reorderLevel),
+      }
+      const text = {
+        name,
+        barcode: mapped.barcode ?? null,
+        category: mapped.category ?? 'Imported',
+        collection: mapped.collection ?? null,
+        hsn: mapped.hsn ?? null,
+        supplier: mapped.supplier ?? null,
+        status: mapped.status ?? 'active',
+        vendor: mapped.vendor ?? null,
+        productType: mapped.productType ?? null,
+        tags: mapped.tags ?? null,
+        huid: mapped.huid ?? null,
+      }
+      try {
+        const hit = bySku.get(skuKey)
+        if (hit) {
+          const patch: Record<string, unknown> = { ...text }
+          for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
+          updated++
+        } else {
+          const values: Record<string, unknown> = {
+            id: randomUUID(), sku, ...text, ...numeric,
+            stock: numeric.stock ?? 0,
+            reorderLevel: numeric.reorderLevel ?? 5,
+            purity: numeric.purity ?? 92.5,
+            trackInventory: true,
+            chargeOnTax: true,
+            createdAt: new Date().toISOString().slice(0, 10),
+          }
+          const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
+          bySku.set(skuKey, { id: row.id, sku })
+          created++
+        }
+      } catch (rowErr) {
+        const base = rowErr instanceof Error ? rowErr.message : 'insert failed'
+        const cause = rowErr instanceof Error && (rowErr as any).cause ? String((rowErr as any).cause?.message ?? (rowErr as any).cause) : ''
+        errors.push(`Row ${rowNo} (${sku}): ${`${base} ${cause}`.replace(/\s+/g, ' ')}`)
+      }
+    }
+    recordCrud('products', 'Created', req, { created, updated })
+    res.json({ created, updated, errors })
+  } catch (err) {
+    logger.error({ err }, 'bulk import failed')
+    res.status(500).json({ error: 'Bulk import failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Bulk image upload, auto-matched to products by SKU from filename ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Own body limit: batches of data-URL images dwarf the global 1mb json limit
+// (200-image cap ├ù up to 8MB per image ΓåÆ allow up to 25mb like /uploads/image)
+dbRouter.post('/products/bulk-images', requirePermission('inventory', 'edit'), expressJson({ limit: '25mb' }), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const images: Array<{ filename?: unknown; dataUrl?: unknown }> = Array.isArray(req.body?.images) ? req.body.images : []
+    if (images.length === 0) return res.status(400).json({ error: 'images is required ([{ filename, dataUrl }])' })
+    if (images.length > 200) return res.status(400).json({ error: 'Maximum 200 images per batch' })
+
+    const { saveUploadedImage } = await import('../uploads')
+    const all = await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products)
+    const bySku = new Map(all.map((p) => [p.sku.trim().toLowerCase(), p.id]))
+
+    let matched = 0
+    const unmatched: string[] = []
+    const errors: string[] = []
+    for (const img of images) {
+      const filename = typeof img.filename === 'string' ? img.filename : ''
+      const dataUrl = typeof img.dataUrl === 'string' ? img.dataUrl : ''
+      if (!filename || !dataUrl) { errors.push(`${filename || 'image'}: missing filename or data`); continue }
+      const base = filename.split('/').pop() ?? filename
+      const sku = base.replace(/\.[^.]+$/, '').trim().toLowerCase()
+      const productId = bySku.get(sku)
+      if (!productId) { unmatched.push(filename); continue }
+      const path = saveUploadedImage(dataUrl)
+      if (!path) { errors.push(`${filename}: invalid image data (must be a data:image/... URL)`); continue }
+      const [prod] = await db!.select({ images: s.products.images, image: s.products.image }).from(s.products).where(eq(s.products.id, productId)).limit(1)
+      const gallery = Array.isArray(prod?.images) ? (prod!.images as string[]) : []
+      if (!gallery.includes(path)) gallery.push(path)
+      await db!.update(s.products).set({ images: gallery, image: prod?.image ?? path }).where(eq(s.products.id, productId))
+      matched++
+    }
+    res.json({ matched, unmatched, errors })
+  } catch (err) {
+    logger.error({ err }, 'bulk image match failed')
+    res.status(500).json({ error: 'Bulk image upload failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Products CSV Import (server-side CSV parse + field mapping) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const csvText = typeof req.body?.csv === 'string' ? req.body.csv : ''
+    if (!csvText.trim()) return res.status(400).json({ error: 'csv is required (raw CSV text)' })
+
+    const lines = csvText.split(/\r?\n/).filter((l: string) => l.trim() !== '')
+    if (lines.length < 2) return res.status(400).json({ error: 'CSV must have a header row and at least one data row' })
+    if (lines.length > 2001) return res.status(400).json({ error: 'Maximum 2000 data rows per import' })
+
+    const splitCsvLine = (line: string): string[] => {
+      const out: string[] = []
+      let cur = ''
+      let inQ = false
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i]
+        if (ch === '"') {
+          if (inQ && line[i + 1] === '"') { cur += '"'; i++ } else inQ = !inQ
+        } else if (ch === ',' && !inQ) { out.push(cur); cur = '' } else cur += ch
+      }
+      out.push(cur)
+      return out.map((c) => c.trim())
+    }
+
+    const headers = splitCsvLine(lines[0])
+    const rawRows: Array<Record<string, string>> = lines.slice(1).map((line: string) => {
+      const cells = splitCsvLine(line)
+      const row: Record<string, string> = {}
+      headers.forEach((h, i) => { if (cells[i] !== undefined && cells[i] !== '') row[h] = cells[i] })
+      return row
+    })
+
+    if (rawRows.length === 0) return res.status(400).json({ error: 'No data rows found in CSV' })
+
+    const errors: string[] = []
+    let created = 0
+    let updated = 0
+
+    const existing = await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products)
+    const bySku = new Map(existing.map((p) => [p.sku.trim().toLowerCase(), p]))
+
+    for (let i = 0; i < rawRows.length; i++) {
+      const raw = rawRows[i]
+      const mapped: Record<string, string> = {}
+      for (const [k, v] of Object.entries(raw)) {
+        const field = normalizeHeader(k)
+        if (field && v != null && String(v).trim() !== '') mapped[field] = String(v).trim()
+      }
+      const rowNo = i + 2
+      const name = mapped.name
+      const sku = mapped.sku
+      if (!name) { errors.push(`Row ${rowNo}: missing name ΓÇö skipped`); continue }
+      if (!sku) { errors.push(`Row ${rowNo}: missing SKU ΓÇö skipped`); continue }
+      const skuKey = sku.toLowerCase()
+      const numeric = {
+        purity: toNum(mapped.purity),
+        grossWeight: toNum(mapped.grossWeight),
+        stoneWeight: toNum(mapped.stoneWeight),
+        netWeight: toNum(mapped.netWeight),
+        makingCharge: toNum(mapped.makingCharge),
+        gst: toNum(mapped.gst),
+        silverRate: toNum(mapped.silverRate),
+        sellingPrice: toNum(mapped.sellingPrice),
+        compareAtPrice: toNum(mapped.compareAtPrice),
+        stock: toNum(mapped.stock),
+        reorderLevel: toNum(mapped.reorderLevel),
+      }
+      const text = {
+        name,
+        barcode: mapped.barcode ?? null,
+        category: mapped.category ?? 'Imported',
+        collection: mapped.collection ?? null,
+        hsn: mapped.hsn ?? null,
+        supplier: mapped.supplier ?? null,
+        status: mapped.status ?? 'active',
+        vendor: mapped.vendor ?? null,
+        productType: mapped.productType ?? null,
+        tags: mapped.tags ?? null,
+        huid: mapped.huid ?? null,
+      }
+      try {
+        const hit = bySku.get(skuKey)
+        if (hit) {
+          const patch: Record<string, unknown> = { ...text }
+          for (const [k, v] of Object.entries(numeric)) if (v != null) patch[k] = v
+          await db!.update(s.products).set(patch).where(eq(s.products.id, hit.id))
+          updated++
+        } else {
+          const values: Record<string, unknown> = {
+            id: randomUUID(), sku, ...text, ...numeric,
+            stock: numeric.stock ?? 0,
+            reorderLevel: numeric.reorderLevel ?? 5,
+            purity: numeric.purity ?? 92.5,
+            trackInventory: true,
+            chargeOnTax: true,
+            createdAt: new Date().toISOString().slice(0, 10),
+          }
+          const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
+          bySku.set(skuKey, { id: row.id, sku })
+          created++
+        }
+      } catch (rowErr) {
+        const base = rowErr instanceof Error ? rowErr.message : 'insert failed'
+        const cause = rowErr instanceof Error && (rowErr as any).cause ? String((rowErr as any).cause?.message ?? (rowErr as any).cause) : ''
+        errors.push(`Row ${rowNo} (${sku}): ${`${base} ${cause}`.replace(/\s+/g, ' ')}`)
+      }
+    }
+    recordCrud('products', 'Created', req, { created, updated })
+    res.json({ ok: true, imported: created + updated, created, updated, errors })
+  } catch (err) {
+    logger.error({ err }, 'CSV import failed')
+    res.status(500).json({ error: 'CSV import failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Order status pipeline (kanban drag & drop) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+/**
+ * Auto-raise the sales invoice when an order lands in the fulfilled stage.
+ *
+ * Idempotent (createInvoiceForOrderRow returns the existing number when the
+ * order is already invoiced) and non-blocking: a failure here must never
+ * undo the status move the user just asked for, so errors are logged and
+ * swallowed. Returns the invoice number when one exists after the call.
+ */
+async function autoInvoiceFulfilledOrder(
+  order: typeof s.salesOrders.$inferSelect,
+  actor: { userId?: string | null; ip?: string | null },
+): Promise<string | null> {
+  if (!db || order.invoice) return order.invoice ?? null
+  try {
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    const invoiceNumber = await createInvoiceForOrderRow(order)
+    if (invoiceNumber) {
+      await insertOrderEvent(order.id, 'Invoice Created', `Invoice ${invoiceNumber} generated automatically on fulfilment`, actor.userId ?? 'system')
+      void recordActivity({
+        action: 'Auto-Invoiced Order',
+        module: 'sales',
+        entity: order.internalId ?? order.id,
+        details: `Invoice ${invoiceNumber} created on fulfilment`,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+    return invoiceNumber
+  } catch (err) {
+    logger.error({ err, orderId: order.id }, 'auto-invoice on fulfilment failed')
+    return null
+  }
+}
+
+dbRouter.patch('/sales-orders/:id/status', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const status = String(req.body?.status ?? '').trim()
+    const allowed = ['imported', 'confirmed', 'processing', 'fulfilled', 'cancelled']
+    if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
+    const [row] = await db!.update(s.salesOrders).set({ status }).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+    if (!row) return res.status(404).json({ error: 'Order not found' })
+    const actor = actorFromRequest(req)
+    await insertOrderEvent(row.id, 'Status Change', `Status moved to ${status}`, actor.userId ?? 'system')
+    void recordActivity({
+      action: 'Updated Order Status',
+      module: 'sales',
+      entity: row.internalId ?? row.id,
+      details: `Status ΓåÆ ${status}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    // Receiving the order (fulfilled stage) raises its sales invoice
+    // automatically ΓÇö the same idempotent pipeline the manual button uses.
+    let autoInvoice: string | null = null
+    if (status === 'fulfilled') autoInvoice = await autoInvoiceFulfilledOrder(row, actor)
+    res.json({ ...row, autoInvoice })
+  } catch {
+    res.status(400).json({ error: 'Failed to update order status' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Returns & credit notes: return invoice items, restock, credit note ΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.post('/invoices/:id/return', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [invoice] = await db!.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
+    if (!invoice) return res.status(404).json({ error: 'Invoice not found' })
+    const invItems = await db!.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, invoice.id))
+    if (invItems.length === 0) return res.status(400).json({ error: 'Invoice has no line items to return' })
+
+    // Return spec: explicit items list (partial) or whole invoice
+    const requested: Array<{ sku?: string; qty: number }> = Array.isArray(req.body?.items) && req.body.items.length > 0
+      ? req.body.items
+      : invItems.map((it) => ({ sku: it.sku ?? undefined, qty: it.qty ?? 1 }))
+    const qtyBySku = new Map<string, number>()
+    for (const r of requested) {
+      if (r.sku && Number(r.qty) > 0) qtyBySku.set(r.sku, (qtyBySku.get(r.sku) ?? 0) + Number(r.qty))
+    }
+    const returnItems = invItems
+      .filter((it) => it.sku && qtyBySku.has(it.sku))
+      .map((it) => {
+        const sku = it.sku as string
+        const qty = Math.min(qtyBySku.get(sku) ?? 0, it.qty ?? 1)
+        return {
+          product: it.product, sku, qty,
+          amount: Math.round(((it.amount ?? 0) * qty) / (it.qty || 1) * 100) / 100,
+        }
+      })
+      .filter((it) => it.qty > 0)
+    if (returnItems.length === 0) return res.status(400).json({ error: 'No matching items to return (SKU + qty required)' })
+
+    const amount = Math.round(returnItems.reduce((a, it) => a + (it.amount ?? 0), 0) * 100) / 100
+    const restock = req.body?.restock !== false
+    if (restock) {
+      for (const it of returnItems) {
+        const [prod] = await db!.select({ id: s.products.id, stock: s.products.stock }).from(s.products).where(eq(s.products.sku, it.sku!)).limit(1)
+        if (prod) {
+          await db!.update(s.products).set({ stock: (prod.stock ?? 0) + it.qty }).where(eq(s.products.id, prod.id))
+        }
+      }
+    }
+
+    const now = new Date()
+    const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
+    let number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const [dup] = await db!.select({ id: s.salesReturns.id }).from(s.salesReturns).where(eq(s.salesReturns.number, number)).limit(1)
+      if (!dup) break
+      number = `CR${ym}-${Math.floor(100000 + Math.random() * 900000)}`
+    }
+
+    const [ret] = await db!.insert(s.salesReturns).values({
+      id: randomUUID(),
+      number,
+      invoiceId: invoice.id,
+      creditNoteNumber: number,
+      restocked: restock,
+      returnItems,
+      order: invoice.shopifyOrder,
+      customer: invoice.customer,
+      items: returnItems.reduce((a, it) => a + it.qty, 0),
+      amount,
+      status: 'processed',
+      date: now.toISOString(),
+    }).returning()
+
+    // Accounting trail: negative payment against the invoice
+    await db!.insert(s.payments).values({
+      id: randomUUID(), ref: number, invoice: invoice.number, customer: invoice.customer,
+      amount: -amount, method: 'Credit Note', gateway: 'return', status: 'refunded', date: now.toISOString(),
+    })
+
+    recordCrud('sales-returns', 'Created', req, ret)
+    // Give back the points earned on the value being returned.
+    void import('../loyalty')
+      .then(({ reverseEarnedForInvoice }) =>
+        reverseEarnedForInvoice({
+          id: invoice.id,
+          number: invoice.number,
+          customer: String(invoice.customer ?? ''),
+          value: amount,
+          reason: `Reversed on return ΓÇö credit note ${number} (Γé╣${amount.toLocaleString('en-IN')})`,
+        }),
+      )
+      .catch(() => undefined)
+    if (invoice.id) await insertOrderEvent(invoice.id, 'Return Processed', `Credit note ${number} ΓÇö ${returnItems.length} item(s), Γé╣${amount.toLocaleString('en-IN')}${restock ? ', restocked' : ''}`, actorFromRequest(req).userId ?? 'system')
+    void import('../statusNotifications').then((m) => m.notifyReturnProcessed({ customer: invoice.customer, invoiceNumber: invoice.number, amount, restocked: restock, creditNoteNumber: number })).catch(() => undefined)
+    res.json({ return: ret, creditNoteNumber: number, amount, restocked: restock })
+  } catch (err) {
+    logger.error({ err }, 'invoice return failed')
+    res.status(500).json({ error: 'Failed to process return' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Booking orders: advance payment, convert to invoice on completion ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.post('/bookings', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const customer = String(req.body?.customer ?? '').trim()
+    const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(req.body?.items) ? req.body.items : []
+    if (!customer) return res.status(400).json({ error: 'customer is required' })
+    const items = rawItems
+      .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
+      .filter((it) => it.title && it.quantity > 0)
+    if (items.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
+    const discount = toNum(req.body?.discount) ?? 0
+    const value = Math.round((items.reduce((a, it) => a + it.price * it.quantity, 0) - discount) * 100) / 100
+    const advancePaid = Math.min(Math.max(toNum(req.body?.advanceAmount) ?? 0, 0), value)
+
+    const now = new Date()
+    const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`
+    const internalId = `BK${ym}-${Math.floor(100000 + Math.random() * 900000)}`
+    const [row] = await db!.insert(s.salesOrders).values({
+      id: randomUUID(),
+      internalId,
+      customer,
+      value,
+      payment: advancePaid >= value && value > 0 ? 'paid' : 'pending',
+      fulfillment: 'pending',
+      status: 'confirmed',
+      date: now.toISOString(),
+      items: items.reduce((a, it) => a + it.quantity, 0),
+      tags: 'booking',
+      currency: 'INR',
+      discount,
+      lineItems: items,
+      isBooking: true,
+      advancePaid,
+    }).returning()
+    recordCrud('sales-orders', 'Created', req, row)
+    await insertOrderEvent(row.id, 'Booking Created', `Booking ${internalId} ΓÇö ${items.reduce((a, it) => a + it.quantity, 0)} item(s), value Γé╣${value.toLocaleString('en-IN')}, advance Γé╣${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    res.json(row)
+  } catch (err) {
+    logger.error({ err }, 'booking create failed')
+    res.status(500).json({ error: 'Failed to create booking' })
+  }
+})
+
+// Edit a booking that hasn't been converted to an invoice yet: customer,
+// line items, discount and advance. Value/advance are recomputed the same
+// way as create so totals never drift.
+dbRouter.patch('/bookings/:id', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [booking] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+    if (!booking.isBooking) return res.status(400).json({ error: 'Order is not a booking' })
+    if (booking.invoice) return res.status(400).json({ error: 'Booking already converted to an invoice ΓÇö edit the invoice instead' })
+
+    const body = req.body ?? {}
+    const patch: Partial<typeof s.salesOrders.$inferInsert> = {}
+
+    if (body.customer !== undefined) {
+      const customer = String(body.customer ?? '').trim()
+      if (!customer) return res.status(400).json({ error: 'customer cannot be empty' })
+      patch.customer = customer
+    }
+
+    let items = (Array.isArray(booking.lineItems) ? booking.lineItems : []) as Array<{ title?: string; sku?: string; quantity?: number; price?: number }>
+    let discount = num(booking.discount, 0)
+    if (body.items !== undefined) {
+      const rawItems: Array<{ product?: unknown; sku?: unknown; qty?: unknown; price?: unknown }> = Array.isArray(body.items) ? body.items : []
+      const parsed = rawItems
+        .map((it) => ({ title: String(it.product ?? ''), sku: String(it.sku ?? ''), quantity: Number(it.qty ?? 0), price: Number(it.price ?? 0) }))
+        .filter((it) => it.title && it.quantity > 0)
+      if (parsed.length === 0) return res.status(400).json({ error: 'at least one item with product + qty is required' })
+      items = parsed
+      patch.lineItems = parsed
+      patch.items = parsed.reduce((a, it) => a + it.quantity, 0)
+    }
+    if (body.discount !== undefined) {
+      discount = Math.max(toNum(body.discount) ?? 0, 0)
+      patch.discount = discount
+    }
+
+    if (body.items !== undefined || body.discount !== undefined) {
+      const value = Math.round((items.reduce((a, it) => a + Number(it.price ?? 0) * Number(it.quantity ?? 0), 0) - discount) * 100) / 100
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? num(booking.advancePaid, 0), 0), Math.max(value, 0))
+      patch.value = value
+      patch.advancePaid = advancePaid
+      patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
+    } else if (body.advanceAmount !== undefined) {
+      const value = num(booking.value, 0)
+      const advancePaid = Math.min(Math.max(toNum(body.advanceAmount) ?? 0, 0), Math.max(value, 0))
+      patch.advancePaid = advancePaid
+      patch.payment = advancePaid >= value && value > 0 ? 'paid' : 'pending'
+    }
+
+    if (Object.keys(patch).length === 0) return res.json(booking)
+    const [updated] = await db!.update(s.salesOrders).set(patch).where(eq(s.salesOrders.id, routeParam(req.params.id))).returning()
+    recordCrud('sales-orders', 'Updated', req, updated)
+    await insertOrderEvent(updated.id, 'Booking Edited', `Booking ${updated.internalId ?? updated.id} ΓÇö customer ${updated.customer}, value Γé╣${num(updated.value, 0).toLocaleString('en-IN')}, advance Γé╣${num(updated.advancePaid, 0).toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    res.json(updated)
+  } catch (err) {
+    logger.error({ err }, 'booking update failed')
+    res.status(500).json({ error: 'Failed to update booking' })
+  }
+})
+
+// Booking advance payment link ΓÇö customers pay their advance online via Razorpay
+dbRouter.post('/bookings/:id/payment-link', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [booking] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+    if (!booking.isBooking) return res.status(400).json({ error: 'Order is not a booking' })
+    const value = Number(booking.value ?? 0)
+    const advancePaid = Number(booking.advancePaid ?? 0)
+    const remaining = Math.round((value - advancePaid) * 100) / 100
+    if (remaining <= 0) return res.status(400).json({ error: 'Booking is already fully paid' })
+    const { createRazorpayPaymentLink, isRazorpayConfigured } = await import('../paymentLinks')
+    if (!isRazorpayConfigured()) return res.status(400).json({ error: 'Razorpay not configured (set RAZORPAY_KEY_ID + RAZORPAY_KEY_SECRET)', configured: false })
+    const link = await createRazorpayPaymentLink({
+      amount: remaining,
+      customer: booking.customer ?? 'Customer',
+      description: `Advance for booking ${booking.internalId ?? booking.id} ΓÇö Opal Line`,
+      referenceId: `BK-${booking.internalId ?? booking.id}`.replace(/[^a-zA-Z0-9-]/g, ''),
+    })
+    if (!link) return res.status(500).json({ error: 'Failed to create payment link' })
+    res.json({ url: link.url, id: link.id, amount: remaining, configured: true })
+  } catch (err) {
+    logger.error({ err }, 'booking payment link failed')
+    res.status(500).json({ error: 'Payment link generation failed' })
+  }
+})
+
+dbRouter.post('/bookings/:id/convert', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Booking not found' })
+    if (order.invoice) return res.status(400).json({ error: `Already converted to invoice ${order.invoice}` })
+    const value = Number(order.value ?? 0)
+    const advancePaid = Number(order.advancePaid ?? 0)
+    const fullyPaid = advancePaid >= value && value > 0
+    await db!.update(s.salesOrders).set({ payment: fullyPaid ? 'paid' : 'pending' }).where(eq(s.salesOrders.id, order.id))
+    const [fresh] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, order.id)).limit(1)
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    const invoiceNumber = await createInvoiceForOrderRow(fresh!)
+    if (!invoiceNumber) return res.status(400).json({ error: 'Conversion failed: booking has no convertible line items' })
+    await db!.update(s.salesOrders).set({ invoice: invoiceNumber, status: 'fulfilled' }).where(eq(s.salesOrders.id, order.id))
+    if (advancePaid > 0) {
+      await db!.insert(s.payments).values({
+        id: randomUUID(), ref: order.internalId ?? order.id, invoice: invoiceNumber, customer: order.customer,
+        amount: advancePaid, method: 'Advance', gateway: 'booking', status: 'paid', date: new Date().toISOString(),
+      })
+    }
+    recordCrud('sales-orders', 'Updated', req, { id: order.id, invoice: invoiceNumber })
+    await insertOrderEvent(order.id, 'Booking Converted', `Converted to invoice ${invoiceNumber}; advance applied Γé╣${advancePaid.toLocaleString('en-IN')}`, actorFromRequest(req).userId ?? 'system')
+    res.json({ invoiceNumber, advanceApplied: advancePaid, balance: Math.round((value - advancePaid) * 100) / 100 })
+  } catch (err) {
+    logger.error({ err }, 'booking convert failed')
+    res.status(500).json({ error: 'Failed to convert booking' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Order events timeline ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+export async function insertOrderEvent(orderId: string, event: string, details: string, actor?: string | null): Promise<void> {
+  if (!db) return
+  try {
+    await db.insert(s.orderEvents).values({
+      id: randomUUID(), orderId, event, details,
+      actor: actor ?? null,
+      createdAt: new Date().toISOString(),
+    })
+  } catch (err) {
+    logger.warn({ err }, 'order event insert failed')
+  }
+}
+
+// Seed a timeline for orders that have none (first time the dialog is opened)
+async function ensureOrderTimeline(order: typeof s.salesOrders.$inferSelect): Promise<void> {
+  const existing = await db!.select({ id: s.orderEvents.id }).from(s.orderEvents).where(eq(s.orderEvents.orderId, order.id)).limit(1)
+  if (existing.length > 0) return
+  const events: Array<[string, string]> = []
+  if (order.date) events.push(['Order Created', order.shopifyId ? `Imported from Shopify order ${order.shopifyId}` : 'Order recorded'])
+  if (order.isBooking && order.advancePaid) events.push(['Advance Received', `${Number(order.advancePaid).toLocaleString('en-IN')} collected at booking`])
+  if (order.invoice) events.push(['Invoice Created', `Invoice ${order.invoice}`])
+  if (order.status && order.status !== 'imported') events.push(['Status', `Status set to ${order.status}`])
+  for (const [e, d] of events) {
+    await insertOrderEvent(order.id, e, d, 'system')
+  }
+}
+
+dbRouter.get('/orders/:id/events', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    await ensureOrderTimeline(order)
+    const events = await db!.select().from(s.orderEvents).where(eq(s.orderEvents.orderId, routeParam(req.params.id))).orderBy(desc(s.orderEvents.createdAt))
+    res.json({ data: events })
+  } catch {
+    res.status(500).json({ error: 'Failed to load order events' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Customer 360: everything about one customer in a single call ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.get('/customers/:name/summary', requirePermission('sales', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const customer = routeParam(req.params.name)
+    const [orders, invoices, dues, pays] = await Promise.all([
+      db!.select().from(s.salesOrders).where(eq(s.salesOrders.customer, customer)).orderBy(desc(s.salesOrders.date)).limit(25),
+      db!.select().from(s.salesInvoices).where(eq(s.salesInvoices.customer, customer)).orderBy(desc(s.salesInvoices.date)).limit(25),
+      db!.select().from(s.salesInvoices).where(sql`${s.salesInvoices.customer} = ${customer} and ${s.salesInvoices.paymentStatus} is distinct from 'paid' and ${s.salesInvoices.status} is distinct from 'cancelled' and ${s.salesInvoices.status} is distinct from 'refunded'`),
+      db!.select().from(s.payments).where(eq(s.payments.customer, customer)).orderBy(desc(s.payments.date)).limit(15),
+    ])
+    const lifetimeValue = Math.round(orders.reduce((a, o) => a + Number(o.value ?? 0), 0) * 100) / 100
+    const outstanding = Math.round(dues.reduce((a, i) => a + Number(i.grandTotal ?? 0), 0) * 100) / 100
+    res.json({
+      customer,
+      totalOrders: orders.length,
+      lifetimeValue,
+      outstanding,
+      lastOrder: orders[0]?.date ?? null,
+      lastInvoice: invoices[0]?.number ?? null,
+      orders,
+      invoices,
+      payments: pays,
+    })
+  } catch (err) {
+    logger.error({ err }, 'customer summary failed')
+    res.status(500).json({ error: 'Failed to load customer summary' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Bulk order actions: status update + invoice creation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.post('/sales-orders/bulk-status', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids : []
+    const status = String(req.body?.status ?? '').trim()
+    const allowed = ['imported', 'confirmed', 'processing', 'fulfilled', 'cancelled']
+    if (ids.length === 0) return res.status(400).json({ error: 'ids is required' })
+    if (!allowed.includes(status)) return res.status(400).json({ error: `status must be one of: ${allowed.join(', ')}` })
+    let updated = 0
+    let invoicesCreated = 0
+    const newInvoices: string[] = []
+    for (const id of ids) {
+      const [row] = await db!.update(s.salesOrders).set({ status }).where(eq(s.salesOrders.id, id)).returning()
+      if (row) {
+        updated++
+        await insertOrderEvent(id, 'Status Change', `Bulk status moved to ${status}`, actorFromRequest(req).userId ?? 'system')
+        if (status === 'fulfilled') {
+          void import('../statusNotifications').then((m) => m.notifyOrderFulfilled(row)).catch(() => undefined)
+          // Receiving the order raises its sales invoice automatically.
+          const invoiceNumber = await autoInvoiceFulfilledOrder(row, actorFromRequest(req))
+          if (invoiceNumber) { invoicesCreated++; newInvoices.push(invoiceNumber) }
+        }
+      }
+    }
+    recordCrud('sales-orders', 'Updated', req, { bulkStatus: status, updated })
+    res.json({ updated, status, invoicesCreated, newInvoices })
+  } catch (err) {
+    logger.error({ err }, 'bulk status failed')
+    res.status(500).json({ error: 'Bulk status update failed' })
+  }
+})
+
+dbRouter.post('/sales-orders/bulk-invoice', requirePermission('sales', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids : []
+    if (ids.length === 0) return res.status(400).json({ error: 'ids is required' })
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    let created = 0
+    let alreadyInvoiced = 0
+    let failed = 0
+    const errors: string[] = []
+    for (const id of ids) {
+      const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, id)).limit(1)
+      if (!order) { failed++; errors.push(`${id}: not found`); continue }
+      if (order.invoice) { alreadyInvoiced++; continue }
+      try {
+        const invoiceNumber = await createInvoiceForOrderRow(order)
+        if (invoiceNumber) {
+          created++
+          await insertOrderEvent(id, 'Invoice Created', `Invoice ${invoiceNumber} generated (bulk)`, actorFromRequest(req).userId ?? 'system')
+        } else { failed++; errors.push(`${order.internalId ?? order.id}: no convertible line items`) }
+      } catch (e) {
+        failed++
+        errors.push(`${order.internalId ?? order.id}: ${e instanceof Error ? e.message : 'failed'}`)
+      }
+    }
+    recordCrud('sales-orders', 'Updated', req, { bulkInvoice: true, created })
+    res.json({ created, alreadyInvoiced, failed, errors })
+  } catch (err) {
+    logger.error({ err }, 'bulk invoice failed')
+    res.status(500).json({ error: 'Bulk invoicing failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Dispatch / shipments ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/shipments', requirePermission('sales', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.select().from(s.shipments).orderBy(desc(s.shipments.createdAt)).limit(300)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'shipments load failed')
+    res.status(500).json({ error: 'Failed to load shipments' })
+  }
+})
+
+dbRouter.post('/shipments/dispatch', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const orderId = String(req.body?.orderId ?? '').trim()
+    if (!orderId) return res.status(400).json({ error: 'orderId is required' })
+    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, orderId)).limit(1)
+    if (!order) return res.status(404).json({ error: 'Order not found' })
+    const courier = String(req.body?.courier ?? '').trim() || null
+    const trackingNumber = String(req.body?.trackingNumber ?? '').trim() || null
+    const expected = req.body?.expectedDelivery ? String(req.body.expectedDelivery).slice(0, 10) : null
+    const notes = String(req.body?.notes ?? '').trim() || null
+    const [existing] = await db!.select().from(s.shipments).where(eq(s.shipments.orderId, orderId)).limit(1)
+    const values = {
+      orderRef: order.internalId ?? order.shopifyId ?? orderId,
+      customer: order.customer,
+      courier,
+      trackingNumber,
+      status: 'dispatched',
+      dispatchedAt: new Date().toISOString(),
+      expectedDelivery: expected,
+      notes,
+    }
+    if (existing) {
+      await db!.update(s.shipments).set(values).where(eq(s.shipments.id, existing.id))
+    } else {
+      await db!.insert(s.shipments).values({ id: randomUUID(), orderId, ...values })
+    }
+    // Keep order fulfillment in sync
+    if (order.status !== 'cancelled') {
+      const [updated] = await db!.update(s.salesOrders).set({ fulfillment: 'fulfilled', status: order.status === 'imported' ? 'processing' : order.status }).where(eq(s.salesOrders.id, orderId)).returning()
+      // Dispatch means the goods went out ΓÇö raise the sales invoice
+      // automatically (idempotent, same pipeline as the manual button).
+      if (updated) await autoInvoiceFulfilledOrder(updated, actorFromRequest(req))
+    }
+    await insertOrderEvent(orderId, 'Dispatched', `Dispatched via ${courier ?? 'courier'}${trackingNumber ? ` ΓÇö tracking ${trackingNumber}` : ''}`, actorFromRequest(req).userId ?? 'system')
+    // Customer notification with tracking details
+    void import('../statusNotifications').then((m) => m.notifyOrderFulfilled({ ...order, trackingId: trackingNumber, carrier: courier })).catch(() => undefined)
+    recordCrud('sales-orders', 'Updated', req, { id: orderId, dispatched: true })
+    res.json({ ok: true })
+  } catch (err) {
+    logger.error({ err }, 'dispatch failed')
+    res.status(500).json({ error: 'Dispatch failed' })
+  }
+})
+
+dbRouter.post('/shipments/:id/delivered', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [ship] = await db!.update(s.shipments).set({ status: 'delivered', deliveredAt: new Date().toISOString() }).where(eq(s.shipments.id, routeParam(req.params.id))).returning()
+    if (!ship) return res.status(404).json({ error: 'Shipment not found' })
+    await insertOrderEvent(ship.orderId, 'Delivered', `Delivery confirmed${ship.trackingNumber ? ` (tracking ${ship.trackingNumber})` : ''}`, actorFromRequest(req).userId ?? 'system')
+    // Customer notification (fire-and-forget)
+    void import('../statusNotifications').then((m) => m.notifyOrderDelivered({
+      internalId: ship.orderRef,
+      customer: ship.customer,
+      trackingId: ship.trackingNumber,
+      courier: ship.courier,
+    })).catch(() => undefined)
+    res.json({ ok: true })
+  } catch (err) {
+    logger.error({ err }, 'delivery confirm failed')
+    res.status(500).json({ error: 'Failed to confirm delivery' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Notification log (audit + resend) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/notifications/log', requirePermission('system', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const limit = Math.min(Number(req.query.limit ?? 100), 300)
+    const rows = await db!.select().from(s.notificationLog).orderBy(desc(s.notificationLog.createdAt)).limit(limit)
+    res.json({ data: rows })
+  } catch (err) {
+    logger.error({ err }, 'notification log load failed')
+    res.status(500).json({ error: 'Failed to load notification log' })
+  }
+})
+
+dbRouter.post('/notifications/resend', requirePermission('system', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const id = String(req.body?.id ?? '').trim()
+    const [entry] = await db!.select().from(s.notificationLog).where(eq(s.notificationLog.id, id)).limit(1)
+    if (!entry) return res.status(404).json({ error: 'Notification not found' })
+    if (!entry.recipient) return res.status(400).json({ error: 'Original recipient unknown ΓÇö cannot resend' })
+    const ref = entry.ref ?? ''
+    const { sendEmail } = await import('../notifications')
+    const { sendWhatsAppMessage } = await import('../whatsapp')
+    let ok = false
+    if (entry.channel === 'email') {
+      ok = await sendEmail({ to: entry.recipient, subject: `[Re-send] ${ref} ΓÇö Opal Line`, html: `<p>Re-sent notification for <strong>${escapeHtml(ref)}</strong>.</p><p>Please contact us for the full details.</p>` })
+    } else {
+      ok = (await sendWhatsAppMessage(entry.recipient, `Re-sent notification for ${ref}. ΓÇö Opal Line`)) !== null
+    }
+    await logResend(entry, ok)
+    res.json({ ok })
+  } catch (err) {
+    logger.error({ err }, 'notification resend failed')
+    res.status(500).json({ error: 'Resend failed' })
+  }
+})
+
+async function logResend(entry: typeof s.notificationLog.$inferSelect, ok: boolean): Promise<void> {
+  try {
+    await db!.insert(s.notificationLog).values({
+      id: randomUUID(),
+      kind: entry.kind,
+      channel: entry.channel,
+      recipient: entry.recipient,
+      ref: entry.ref,
+      status: ok ? 'sent' : 'failed',
+      error: ok ? 'manual resend' : 'manual resend failed',
+      createdAt: new Date().toISOString(),
+    })
+  } catch { /* non-fatal */ }
+}
+
+// ΓöÇΓöÇΓöÇ Auto reorder suggestions: sales velocity vs. stock on hand ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+dbRouter.get('/inventory/reorder-suggestions', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    // Sales per SKU over the last 90 days.
+    //
+    // Velocity has to count what the shop *actually sold*, which means both
+    // sources: tax invoices (counter sales typed straight into the ERP) and
+    // order line items (Shopify / online). Reading only sales_orders made every
+    // manually issued invoice count as zero, so the bestsellers sold over the
+    // counter never earned a reorder suggestion. Orders that were invoiced are
+    // skipped here to avoid counting the same sale twice.
+    const salesRows = await db!.execute(sql`
+      SELECT sku, sum(qty)::numeric AS qty_sold FROM (
+        SELECT lower(trim(it.sku)) AS sku, coalesce(it.qty, 0)::numeric AS qty
+        FROM sales_invoice_items it
+        JOIN sales_invoices i ON i.id = it.invoice_id
+        WHERE i.date > now() - interval '90 days'
+          AND coalesce(i.status, '') NOT IN ('cancelled', 'refunded')
+          AND it.sku IS NOT NULL AND trim(it.sku) <> ''
+        UNION ALL
+        SELECT lower(trim(li->>'sku')) AS sku, (li->>'quantity')::numeric AS qty
+        FROM sales_orders, jsonb_array_elements(line_items) AS li
+        WHERE date > now() - interval '90 days'
+          AND coalesce(status, '') NOT IN ('cancelled', 'fulfilled', 'invoiced')
+          AND li->>'sku' IS NOT NULL AND trim(li->>'sku') <> ''
+      ) sold
+      GROUP BY sku
+    `)
+    const soldMap = new Map<string, number>()
+    for (const row of salesRows as any[]) {
+      soldMap.set(String(row.sku), Number(row.qty_sold ?? 0))
+    }
+    // Products are matched by SKU case-insensitively, same as the query.
+
+    const prods = await db!.select().from(s.products)
+    const suggestions: Array<{
+      id: string; name: string; sku: string; supplier: string | null; stock: number
+      reorderLevel: number; sold90d: number; weeklyVelocity: number; weeksOfCover: number
+      suggestedQty: number; priority: 'urgent' | 'soon' | 'ok'
+    }> = []
+    for (const p of prods) {
+      if (p.trackInventory === false) continue
+      const sold90d = soldMap.get(String(p.sku ?? '').trim().toLowerCase()) ?? 0
+      const weeklyVelocity = Math.round((sold90d / 13) * 100) / 100 // 13 weeks Γëê 90 days
+      const stock = p.stock ?? 0
+      const weeksOfCover = weeklyVelocity > 0 ? Math.round((stock / weeklyVelocity) * 10) / 10 : 99
+      const target = Math.max(p.reorderLevel ?? 5, Math.ceil(weeklyVelocity * 8)) // 8 weeks of stock
+      if (stock <= (p.reorderLevel ?? 5) || weeksOfCover < 4) {
+        suggestions.push({
+          id: p.id, name: p.name, sku: p.sku, supplier: p.supplier,
+          stock, reorderLevel: p.reorderLevel ?? 5, sold90d, weeklyVelocity,
+          weeksOfCover,
+          suggestedQty: Math.max(target - stock, 1),
+          priority: stock <= 0 || weeksOfCover < 1 ? 'urgent' : weeksOfCover < 2 ? 'soon' : 'ok',
+        })
+      }
+    }
+    suggestions.sort((a, b) => {
+      const rank = { urgent: 0, soon: 1, ok: 2 } as const
+      if (rank[a.priority] !== rank[b.priority]) return rank[a.priority] - rank[b.priority]
+      return a.weeksOfCover - b.weeksOfCover
+    })
+    res.json({ data: suggestions, generatedAt: new Date().toISOString() })
+  } catch (err) {
+    logger.error({ err }, 'reorder suggestions failed')
+    res.status(500).json({ error: 'Failed to generate reorder suggestions' })
+  }
+})
+
+// Create draft purchase orders from reorder suggestions, grouped by supplier.
+// Body: { ids: string[] } ΓÇö subset of suggestion product ids; omitted = all suggestions.
+dbRouter.post('/purchase-orders/from-reorder', requirePermission('purchase', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const ids = Array.isArray((req.body as { ids?: string[] })?.ids) ? (req.body as { ids: string[] }).ids : null
+    // Reuse the suggestion engine
+    const salesRows = await db!.execute(sql`
+      SELECT li->>'sku' AS sku,
+             sum((li->>'quantity')::numeric) AS qty_sold
+      FROM sales_orders, jsonb_array_elements(line_items) AS li
+      WHERE date > now() - interval '90 days'
+        AND li->>'sku' IS NOT NULL AND li->>'sku' <> ''
+      GROUP BY li->>'sku'
+    `)
+    const soldMap = new Map<string, number>()
+    for (const row of salesRows as any[]) soldMap.set(String(row.sku), Number(row.qty_sold ?? 0))
+
+    const prods = (await db!.select().from(s.products)).filter((p) => {
+      if (p.trackInventory === false) return false
+      if (ids && !ids.includes(p.id)) return false
+      const sold90d = soldMap.get(String(p.sku ?? '').trim().toLowerCase()) ?? 0
+      const weeklyVelocity = Math.round((sold90d / 13) * 100) / 100
+      const stock = p.stock ?? 0
+      const weeksOfCover = weeklyVelocity > 0 ? Math.round((stock / weeklyVelocity) * 10) / 10 : 99
+      return stock <= (p.reorderLevel ?? 5) || weeksOfCover < 4
+    })
+    if (prods.length === 0) return res.status(400).json({ error: 'No products currently need reordering' })
+
+    // Group by supplier (unknown supplier ΓåÆ 'Unassigned')
+    const bySupplier = new Map<string, typeof prods>()
+    for (const p of prods) {
+      const key = p.supplier?.trim() || 'Unassigned'
+      if (!bySupplier.has(key)) bySupplier.set(key, [])
+      bySupplier.get(key)!.push(p)
+    }
+
+    const now = new Date()
+    const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    const created: Array<{ number: string; supplier: string; items: number; qty: number }> = []
+    for (const [supplier, list] of bySupplier) {
+      // Find next sequential PO number for this month
+      let poNumber = ''
+      const existing = await db!.select({ number: s.purchaseOrders.number }).from(s.purchaseOrders)
+      const used = new Set(existing.map((e) => e.number))
+      for (let n = 1; n < 10000; n++) {
+        const candidate = `PO-${stamp}-${String(n).padStart(5, '0')}`
+        if (!used.has(candidate)) { poNumber = candidate; break }
+      }
+      if (!poNumber) return res.status(500).json({ error: 'Could not generate PO number' })
+
+      const qty = list.reduce((a, p) => {
+        const sold90d = soldMap.get(String(p.sku ?? '').trim().toLowerCase()) ?? 0
+        const weeklyVelocity = Math.round((sold90d / 13) * 100) / 100
+        const target = Math.max(p.reorderLevel ?? 5, Math.ceil(weeklyVelocity * 8))
+        return a + Math.max(target - (p.stock ?? 0), 1)
+      }, 0)
+      const weight = list.reduce((a, p) => a + Number(p.grossWeight ?? p.netWeight ?? 0) * Math.max(1, Math.floor(qty / Math.max(list.length, 1))), 0)
+      const value = list.reduce((a, p) => a + Number(p.sellingPrice ?? 0) * Math.max(1, Math.floor(qty / Math.max(list.length, 1))), 0)
+      const subtotal = Math.round(value * 100) / 100
+      const gstAmount = round2((subtotal * 3) / 100)
+
+      const [row] = await db!.insert(s.purchaseOrders).values({
+        id: randomUUID(),
+        number: poNumber,
+        supplier,
+        items: list.length,
+        qty,
+        weight: Math.round(weight * 100) / 100,
+        value: subtotal,
+        gst: 3,
+        gstAmount,
+        discount: 0,
+        grandTotal: round2(subtotal + gstAmount),
+        status: 'draft',
+        date: new Date().toISOString(),
+      }).returning()
+      created.push({ number: row.number, supplier, items: list.length, qty })
+      recordCrud('purchase-orders', 'Created', req, row)
+    }
+
+    res.status(201).json({ ok: true, created, suppliers: created.length, products: prods.length })
+  } catch (err) {
+    logger.error({ err }, 'auto-PO from reorder failed')
+    res.status(500).json({ error: 'Failed to create purchase order drafts' })
+  }
+})
+
+dbRouter.get('/purchase-invoices', listOf(s.purchaseInvoices, s.purchaseInvoices.date))
+// Line items + live balance for one purchase invoice.
+dbRouter.get('/purchase-invoices/:id/with-items', requirePermission('purchase', 'view'), async (req, res) => {
+  try {
+    const { getPurchaseInvoiceWithItems } = await import('../purchases')
+    const invoice = await getPurchaseInvoiceWithItems(routeParam(req.params.id))
+    if (!invoice) return res.status(404).json({ error: 'Purchase invoice not found' })
+    res.json(invoice)
+  } catch (err) {
+    logger.error({ err }, 'purchase invoice with-items failed')
+    res.status(500).json({ error: 'Failed to load purchase invoice' })
+  }
+})
+
+// Create a purchase invoice with line items. Each line adds its quantity to
+// stock ΓÇö purchases were previously totals-only, so nothing ever arrived.
+dbRouter.post('/purchase-invoices', requirePermission('purchase', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const {
+      normalizePurchaseItems, purchaseTotals, saveInvoiceItems,
+      splitInputGst, getBusinessState, computeTcs,
+    } = await import('../purchases')
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const number = String(body.number ?? '').trim()
+    const supplier = String(body.supplier ?? '').trim()
+    if (!number) return res.status(400).json({ error: 'Supplier invoice number is required' })
+    if (!supplier) return res.status(400).json({ error: 'supplier is required' })
+
+    const items = normalizePurchaseItems(body.items)
+    if (items.length === 0) {
+      return res.status(400).json({ error: 'At least one line item is required so stock can be updated' })
+    }
+    const totals = purchaseTotals(items)
+    const supplierGstin = String(body.supplierGstin ?? '').trim() || null
+    const gstSplit = splitInputGst(totals.tax, supplierGstin, await getBusinessState())
+    const tcs = computeTcs(totals.cost, body.tcsRate as number | null | undefined)
+    const date = body.date ? String(body.date) : new Date().toISOString()
+    const id = randomUUID()
+    // Where the goods are being received. Absent means the default store.
+    const locationId = await resolveMovementLocation(body.locationId as string | undefined)
+
+    const result = await db!.transaction(async (tx) => {
+      const [row] = await tx
+        .insert(s.purchaseInvoices)
+        .values({
+          id,
+          number,
+          supplier,
+          items: totals.qty,
+          qty: totals.qty,
+          weight: totals.weight,
+          rate: totals.rate,
+          cost: totals.cost,
+          tax: totals.tax,
+          total: totals.total,
+          paidAmount: 0,
+          supplierGstin,
+          supplierState: gstSplit.supplierState || null,
+          cgst: gstSplit.cgst,
+          sgst: gstSplit.sgst,
+          igst: gstSplit.igst,
+          tcsRate: tcs.tcsRate,
+          tcsAmount: tcs.tcsAmount,
+          // Link back to the PO this received, so ordered-vs-received works.
+          orderId: body.orderId ? String(body.orderId) : null,
+          status: String(body.status ?? 'pending'),
+          date,
+          // Goods can be delivered to a branch rather than the main store.
+          locationId,
+        } as any)
+        .returning()
+      const saved = await saveInvoiceItems(tx as never, id, items, { addStock: true, locationId })
+      return { row, saved }
+    })
+
+    recordCrud('purchase-invoices', 'Created', req, result.row)
+    logger.info(
+      { number, supplier, lines: result.saved.lines, stocked: result.saved.stocked, total: totals.total },
+      'Purchase invoice received ΓÇö stock updated',
+    )
+    res.status(201).json({ ...stripHash(result.row), items, lines: result.saved.lines, stockedSkus: result.saved.stocked })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    logger.error({ err }, 'purchase invoice create failed')
+    // Drizzle wraps the driver error, so the constraint text ("duplicate key
+    // value violates unique constraint") lives on the cause, not the message.
+    const causeMsg = (err as { cause?: unknown })?.cause instanceof Error ? (err as Error & { cause: Error }).cause.message : ''
+    const isDuplicate = /unique|duplicate key/i.test(`${msg} ${causeMsg}`)
+    res.status(isDuplicate ? 400 : 500).json({ error: isDuplicate ? 'That supplier invoice number already exists' : 'Failed to create purchase invoice' })
+  }
+})
+
+// Update a purchase invoice: replacing the lines reverses the stock the old
+// lines added and applies the new ones. Cancelling takes the stock back out.
+dbRouter.patch('/purchase-invoices/:id', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const {
+      normalizePurchaseItems, purchaseTotals, saveInvoiceItems,
+      splitInputGst, getBusinessState, computeTcs, reversePurchaseStock,
+      restorePurchaseStock, balanceOf,
+    } = await import('../purchases')
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const [existing] = await db!.select().from(s.purchaseInvoices).where(eq(s.purchaseInvoices.id, routeParam(req.params.id))).limit(1)
+    if (!existing) return res.status(404).json({ error: 'Purchase invoice not found' })
+
+    const paid = Number(existing.paidAmount ?? 0)
+    const nextStatus = body.status !== undefined ? String(body.status) : null
+    const beingCancelled = nextStatus === 'cancelled' && String(existing.status ?? '') !== 'cancelled'
+    const beingReinstated = String(existing.status ?? '') === 'cancelled' && nextStatus && nextStatus !== 'cancelled'
+
+    const patch: Record<string, unknown> = {}
+    for (const key of ['number', 'supplier', 'supplierGstin', 'orderId', 'date'] as const) {
+      if (body[key] !== undefined) patch[key] = body[key] === null ? null : String(body[key])
+    }
+    if (nextStatus) patch.status = nextStatus
+
+    const rawItems = body.items !== undefined ? normalizePurchaseItems(body.items) : null
+    if (rawItems && rawItems.length > 0) {
+      const totals = purchaseTotals(rawItems)
+      const supplierGstin = String(body.supplierGstin ?? existing.supplierGstin ?? '').trim() || null
+      const gstSplit = splitInputGst(totals.tax, supplierGstin, await getBusinessState())
+      const tcs = computeTcs(totals.cost, (body.tcsRate ?? existing.tcsRate) as number | null | undefined)
+      Object.assign(patch, {
+        items: totals.qty,
+        qty: totals.qty,
+        weight: totals.weight,
+        rate: totals.rate,
+        cost: totals.cost,
+        tax: totals.tax,
+        total: totals.total,
+        supplierGstin,
+        supplierState: gstSplit.supplierState || null,
+        cgst: gstSplit.cgst,
+        sgst: gstSplit.sgst,
+        igst: gstSplit.igst,
+        tcsRate: tcs.tcsRate,
+        tcsAmount: tcs.tcsAmount,
+      })
+      if (Number(totals.total) < paid - 0.01) {
+        return res.status(400).json({ error: `Total is lower than the ${paid.toFixed(2)} already paid ΓÇö adjust the payment first` })
+      }
+    }
+
+    const { updated, reversedSkus, stockedSkus } = await db!.transaction(async (tx) => {
+      let reversed = 0
+      let stocked = 0
+      // Lines are only rewritten when the caller actually sends new ones. A
+      // metadata-only edit (renumbering, fixing a GSTIN) must never drop them
+      // ΓÇö that would silently delete the record of what arrived while leaving
+      // its stock in place, with no way to reconcile it later.
+      const replacingLines = Boolean(rawItems && rawItems.length > 0)
+      if (replacingLines) {
+        // Take back what the previous lines added, then apply the new ones.
+        reversed = await reversePurchaseStock(existing.id, tx as never)
+        await tx.delete(s.purchaseInvoiceItems).where(eq(s.purchaseInvoiceItems.invoiceId, existing.id))
+        // A cancelled invoice still records its lines ΓÇö they just don't move stock.
+        stocked = (await saveInvoiceItems(tx as never, existing.id, rawItems!, { addStock: !beingCancelled, locationId: existing.locationId ?? null })).stocked
+      } else if (beingCancelled) {
+        // Cancelling reverses the stock but KEEPS the lines, so the invoice
+        // still shows what was received and can be reinstated as-is.
+        reversed = await reversePurchaseStock(existing.id, tx as never)
+      } else if (beingReinstated) {
+        // Put back exactly the stock the kept lines describe.
+        stocked = await restorePurchaseStock(existing.id, tx as never)
+      }
+      const [row] = await tx
+        .update(s.purchaseInvoices)
+        .set(patch as never)
+        .where(eq(s.purchaseInvoices.id, existing.id))
+        .returning()
+      return { updated: row, reversedSkus: reversed, stockedSkus: stocked }
+    })
+
+    recordCrud('purchase-invoices', 'Updated', req, updated)
+    res.json({
+      ...stripHash(updated),
+      balance: balanceOf(updated),
+      reversedSkus,
+      stockedSkus,
+      note: beingReinstated ? 'Invoice reinstated ΓÇö stock re-applied' : undefined,
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    logger.error({ err }, 'purchase invoice update failed')
+    res.status(500).json({ error: msg })
+  }
+})
+// Permanently remove a purchase invoice. Cancelling is usually enough, but a
+// duplicate or test entry should not sit in the books forever. Stock the
+// invoice added is reversed in the same transaction, and the ledger rows that
+// reference it go with it (ON DELETE CASCADE).
+dbRouter.delete('/purchase-invoices/:id', requirePermission('purchase', 'delete'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { reversePurchaseStock } = await import('../purchases')
+    const wasCancelled = String((await db!.select({ status: s.purchaseInvoices.status })
+      .from(s.purchaseInvoices)
+      .where(eq(s.purchaseInvoices.id, routeParam(req.params.id)))
+      .limit(1))[0]?.status ?? '').toLowerCase() === 'cancelled'
+    const removed = await db!.transaction(async (tx) => {
+      const [existing] = await tx.select().from(s.purchaseInvoices).where(eq(s.purchaseInvoices.id, routeParam(req.params.id))).limit(1)
+      if (!existing) return null
+      // A cancelled invoice already had its stock taken back, so don't take it
+      // out a second time.
+      if (!wasCancelled) await reversePurchaseStock(existing.id, tx as never)
+      await tx.delete(s.purchaseInvoices).where(eq(s.purchaseInvoices.id, existing.id))
+      return existing
+    })
+    if (!removed) return res.status(404).json({ error: 'Purchase invoice not found' })
+    recordCrud('purchase-invoices', 'Deleted', req, removed)
+    res.json({ ok: true, id: routeParam(req.params.id) })
+  } catch (err) {
+    logger.error({ err }, 'purchase invoice delete failed')
+    res.status(500).json({ error: 'Failed to delete purchase invoice' })
+  }
+})
+
+dbRouter.get('/purchase-invoices/:id', oneOf(s.purchaseInvoices, s.purchaseInvoices.id))
+dbRouter.get('/purchase-orders', listOf(s.purchaseOrders, s.purchaseOrders.date))
+
+// Purchase orders with their line items attached (an order without lines only
+// carries totals, so the "what did we actually order" question is unanswerable).
+dbRouter.get('/purchase-orders/with-items', requirePermission('purchase', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { getOrderLines } = await import('../purchases')
+    const limit = Math.min(200, Math.max(1, num(req.query.limit, 100)))
+    const orders = await db!.select().from(s.purchaseOrders).orderBy(desc(s.purchaseOrders.date)).limit(limit)
+    const lines = await getOrderLines(orders.map((o) => o.id))
+    const byOrder = new Map<string, typeof lines>()
+    for (const l of lines) {
+      const key = String(l.orderId)
+      const arr = byOrder.get(key) ?? []
+      arr.push(l)
+      byOrder.set(key, arr)
+    }
+    res.json({
+      page: 1,
+      pageSize: limit,
+      total: orders.length,
+      data: orders.map((o) => ({
+        ...o,
+        lines: (byOrder.get(o.id) ?? []).map((l) => ({
+          id: l.id,
+          product: l.product ?? '',
+          sku: l.sku ?? '',
+          qty: Number(l.qty ?? 0),
+          weight: Number(l.weight ?? 0),
+          rate: Number(l.rate ?? 0),
+          amount: Number(l.amount ?? 0),
+        })),
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase orders with-items failed')
+    res.status(500).json({ error: 'Failed to load purchase orders' })
+  }
+})
+
+dbRouter.get('/purchase-orders/:id/with-items', requirePermission('purchase', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { getOrderLines } = await import('../purchases')
+    const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Purchase order not found' })
+    const lines = await getOrderLines([order.id])
+    res.json({
+      ...order,
+      lines: lines.map((l) => ({
+        id: l.id,
+        product: l.product ?? '',
+        sku: l.sku ?? '',
+        qty: Number(l.qty ?? 0),
+        weight: Number(l.weight ?? 0),
+        rate: Number(l.rate ?? 0),
+        amount: Number(l.amount ?? 0),
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase order with-items failed')
+    res.status(500).json({ error: 'Failed to load purchase order' })
+  }
+})
+
+// Shared GST math for a PO: subtotal (from lines or the stored value) plus
+// the order's gst rate/discount ΓåÆ { gstAmount, grandTotal }.
+function poMoneyTotals(subtotal: number, gstRate: number, discount: number) {
+  const gstAmount = round2((subtotal * gstRate) / 100)
+  return { gstAmount, grandTotal: round2(subtotal + gstAmount - discount) }
+}
+
+// GST rate for a stored PO row. NULL predates the GST columns (or was set
+// explicitly) ΓÇö fall back to the 3% default. Never use num() here: num(null, 3)
+// returns 0 because Number(null) is a finite 0, which would silently zero the
+// rate on every legacy edit.
+function poGstRate(stored: unknown): number {
+  return stored == null || stored === '' ? 3 : num(stored, 3)
+}
+
+// Full edit of a purchase order: header fields (supplier, status, dates,
+// notes, GST rate, discount) plus optional replacement lines. Registered
+// before the generic /:resource loop so it ΓÇö not the generic handler ΓÇö owns
+// PATCH /purchase-orders/:id. Totals (items/qty/weight/value, gst amount,
+// grand total) are ALWAYS derived server-side so the header can never drift
+// from the lines.
+dbRouter.patch('/purchase-orders/:id', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { normalizeOrderLines, orderLineTotals, saveOrderLines, ensurePurchaseInvoiceForOrder } = await import('../purchases')
+    const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Purchase order not found' })
+
+    const body = sanitize(req.body ?? {}, s.purchaseOrders)
+    delete body.id
+    // Numbers are system-minted with a unique index ΓÇö never client-editable.
+    delete body.number
+    // Derived fields are recomputed below, never taken from the client.
+    delete body.items
+    delete body.qty
+    delete body.weight
+    delete body.value
+    delete body.gstAmount
+    delete body.grandTotal
+
+    const rawGst = (req.body ?? {}).gst
+    const gst = rawGst === undefined || rawGst === null || rawGst === '' ? poGstRate(order.gst) : Number(rawGst)
+    const rawDiscount = (req.body ?? {}).discount
+    const discount = rawDiscount === undefined || rawDiscount === null || rawDiscount === '' ? num(order.discount, 0) : Number(rawDiscount)
+    if (!Number.isFinite(gst) || gst < 0 || gst > 100) return res.status(400).json({ error: 'gst must be a percentage between 0 and 100' })
+    if (!Number.isFinite(discount) || discount < 0) return res.status(400).json({ error: 'discount must be 0 or more' })
+
+    // Lines are only replaced when an array was sent (count-shaped `items: 3`
+    // from legacy bodies is ignored ΓÇö it is a derived field, not line data).
+    const rawLines = Array.isArray(req.body?.lines)
+      ? req.body.lines
+      : Array.isArray(req.body?.items)
+        ? req.body.items
+        : undefined
+    let lines: Awaited<ReturnType<typeof normalizeOrderLines>> | null = null
+    if (rawLines !== undefined) {
+      lines = normalizeOrderLines(rawLines)
+      if (lines.length === 0) return res.status(400).json({ error: 'At least one line item is required' })
+    }
+
+    const base = lines ? orderLineTotals(lines) : { items: order.items, qty: order.qty, weight: order.weight, value: order.value }
+    const subtotal = num(base.value, 0)
+    const { gstAmount, grandTotal } = poMoneyTotals(subtotal, gst, discount)
+
+    const [updated] = await db!
+      .update(s.purchaseOrders)
+      .set({ ...body, gst, discount, gstAmount, grandTotal, ...base })
+      .where(eq(s.purchaseOrders.id, order.id))
+      .returning()
+    let savedLines: number | undefined
+    if (lines) savedLines = await saveOrderLines(order.id, lines)
+    recordCrud('purchase-orders', 'Updated', req, updated)
+    // Auto-invoice: edited lines change what is owed to the supplier, so the
+    // linked purchase invoice is refreshed to match (header-only edits skip).
+    let autoInvoice: string | undefined
+    let autoInvoiceSkipped: string | undefined
+    if (lines) {
+      try {
+        const ensured = await ensurePurchaseInvoiceForOrder(order.id)
+        if (ensured.ok) {
+          autoInvoice = ensured.invoice.number
+          recordCrud('purchase-invoices', ensured.action === 'created' ? 'Created' : 'Updated', req, ensured.invoice)
+        } else {
+          autoInvoiceSkipped = ensured.skipped
+        }
+      } catch (err) {
+        logger.error({ err }, 'auto purchase invoice refresh failed')
+        autoInvoiceSkipped = 'auto-invoice failed ΓÇö check server logs'
+      }
+    }
+    res.json({
+      ...stripHash(updated),
+      ...(lines ? { lines } : {}),
+      ...(savedLines !== undefined ? { linesSaved: savedLines } : {}),
+      ...(autoInvoice ? { autoInvoice } : {}),
+      ...(autoInvoiceSkipped ? { autoInvoiceSkipped } : {}),
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase order update failed')
+    res.status(500).json({ error: 'Failed to update purchase order' })
+  }
+})
+
+// Replace a PO's lines. Orders only become stock when the purchase invoice is
+// recorded, so this never touches inventory.
+dbRouter.patch('/purchase-orders/:id/lines', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { normalizeOrderLines, orderLineTotals, saveOrderLines, ensurePurchaseInvoiceForOrder } = await import('../purchases')
+    const [order] = await db!.select().from(s.purchaseOrders).where(eq(s.purchaseOrders.id, routeParam(req.params.id))).limit(1)
+    if (!order) return res.status(404).json({ error: 'Purchase order not found' })
+    const lines = normalizeOrderLines(req.body?.items ?? req.body?.lines)
+    if (lines.length === 0) return res.status(400).json({ error: 'At least one line item is required' })
+    const totals = orderLineTotals(lines)
+    // Recompute the GST breakdown too ΓÇö the stored rate/discount apply to the
+    // new subtotal so the header totals can never go stale after a line edit.
+    const money = poMoneyTotals(num(totals.value, 0), poGstRate(order.gst), num(order.discount, 0))
+    const [updated] = await db!
+      .update(s.purchaseOrders)
+      .set({ ...totals, ...money })
+      .where(eq(s.purchaseOrders.id, order.id))
+      .returning()
+    const saved = await saveOrderLines(order.id, lines)
+    recordCrud('purchase-orders', 'Updated', req, updated)
+    // Auto-invoice: the order's lines are what gets billed ΓÇö as soon as they
+    // land, raise the order's purchase invoice (or refresh the one it has).
+    // Never fails the order save itself; the next save retries idempotently.
+    let autoInvoice: string | undefined
+    let autoInvoiceSkipped: string | undefined
+    try {
+      const ensured = await ensurePurchaseInvoiceForOrder(order.id)
+      if (ensured.ok) {
+        autoInvoice = ensured.invoice.number
+        recordCrud('purchase-invoices', ensured.action === 'created' ? 'Created' : 'Updated', req, ensured.invoice)
+      } else {
+        autoInvoiceSkipped = ensured.skipped
+      }
+    } catch (err) {
+      logger.error({ err }, 'auto purchase invoice failed')
+      autoInvoiceSkipped = 'auto-invoice failed ΓÇö check server logs'
+    }
+    res.json({
+      ...stripHash(updated),
+      lines,
+      linesSaved: saved,
+      ...(autoInvoice ? { autoInvoice } : {}),
+      ...(autoInvoiceSkipped ? { autoInvoiceSkipped } : {}),
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase order lines update failed')
+    res.status(500).json({ error: 'Failed to save purchase order lines' })
+  }
+})
+
+dbRouter.get('/purchase-orders/:id', oneOf(s.purchaseOrders, s.purchaseOrders.id))
+
+dbRouter.get('/sales-returns', listOf(s.salesReturns, s.salesReturns.date))
+dbRouter.get('/sales-returns/:id', oneOf(s.salesReturns, s.salesReturns.id))
+
+dbRouter.get('/purchase-returns', listOf(s.purchaseReturns, s.purchaseReturns.date))
+
+// ΓöÇΓöÇΓöÇ Purchase returns ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+// Returns carry line items so the goods can actually come back out of stock.
+// Stock only moves when the return is RECEIVED ΓÇö a pending or approved return
+// is paperwork.
+dbRouter.get('/purchase-returns/with-lines', requirePermission('purchase', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { getReturnLines } = await import('../purchases')
+    const limit = Math.min(200, Math.max(1, num(req.query.limit, 100)))
+    const returns = await db!.select().from(s.purchaseReturns).orderBy(desc(s.purchaseReturns.date)).limit(limit)
+    const byReturn = new Map<string, Awaited<ReturnType<typeof getReturnLines>>>()
+    for (const r of returns) byReturn.set(r.id, await getReturnLines(r.id))
+    res.json({
+      page: 1,
+      pageSize: limit,
+      total: returns.length,
+      data: returns.map((r) => ({
+        ...r,
+        lines: (byReturn.get(r.id) ?? []).map((l) => ({
+          id: l.id,
+          product: l.product ?? '',
+          sku: l.sku ?? '',
+          qty: Number(l.qty ?? 0),
+          weight: Number(l.weight ?? 0),
+          rate: Number(l.rate ?? 0),
+          amount: Number(l.amount ?? 0),
+        })),
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase returns with-lines failed')
+    res.status(500).json({ error: 'Failed to load purchase returns' })
+  }
+})
+
+dbRouter.post('/purchase-returns', requirePermission('purchase', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { normalizeReturnLines, returnLineTotals, saveReturnLines } = await import('../purchases')
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const number = String(body.number ?? '').trim()
+    const supplier = String(body.supplier ?? '').trim()
+    if (!number) return res.status(400).json({ error: 'Return number is required' })
+    if (!supplier) return res.status(400).json({ error: 'supplier is required' })
+    const lines = normalizeReturnLines(body.items ?? body.lines)
+    if (lines.length === 0) return res.status(400).json({ error: 'At least one line item is required so stock can be taken back' })
+    const totals = returnLineTotals(lines)
+    const status = String(body.status ?? 'pending')
+    const reverseStock = status === 'received'
+    // Goods go back to the shop they were received into, so resolve through the
+    // original invoice rather than defaulting to the main store.
+    const invoiceId = body.invoiceId ? String(body.invoiceId) : null
+    let existingInvoiceLocation: string | null = null
+    if (invoiceId) {
+      const [inv] = await db!
+        .select({ locationId: s.purchaseInvoices.locationId })
+        .from(s.purchaseInvoices)
+        .where(eq(s.purchaseInvoices.id, invoiceId))
+        .limit(1)
+      existingInvoiceLocation = inv?.locationId ?? null
+    }
+
+    const id = randomUUID()
+    const result = await db!.transaction(async (tx) => {
+      const [row] = await tx
+        .insert(s.purchaseReturns)
+        .values({
+          id,
+          number,
+          supplier,
+          invoiceId: invoiceId,
+          items: totals.items,
+          weight: totals.weight,
+          amount: totals.amount,
+          status,
+          date: body.date ? String(body.date) : new Date().toISOString(),
+        } as any)
+        .returning()
+      const saved = await saveReturnLines(tx as never, id, lines, { reverseStock, locationId: existingInvoiceLocation ?? null })
+      return { row, saved }
+    })
+
+    recordCrud('purchase-returns', 'Created', req, result.row)
+    logger.info(
+      { number, supplier, lines: result.saved.lines, reversed: result.saved.reversed },
+      'Purchase return recorded',
+    )
+    res.status(201).json({ ...stripHash(result.row), lines, linesSaved: result.saved.lines, reversedSkus: result.saved.reversed })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    logger.error({ err }, 'purchase return create failed')
+    const isDuplicate = /unique|duplicate key/i.test(`${msg} ${(err as { cause?: unknown })?.cause instanceof Error ? (err as Error & { cause: Error }).cause.message : ''}`)
+    res.status(isDuplicate ? 400 : 500).json({ error: isDuplicate ? 'That return number already exists' : 'Failed to create purchase return' })
+  }
+})
+
+// Receiving a return takes the goods back out of stock; un-receiving puts them
+// back. Cancelling a *received* return also reverses, so nothing is stranded.
+dbRouter.patch('/purchase-returns/:id', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { restoreReturnStock, reverseReturnStock } = await import('../purchases')
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const [existing] = await db!.select().from(s.purchaseReturns).where(eq(s.purchaseReturns.id, routeParam(req.params.id))).limit(1)
+    if (!existing) return res.status(404).json({ error: 'Purchase return not found' })
+
+    const wasReceived = String(existing.status ?? '').toLowerCase() === 'received'
+    const nextStatus = body.status !== undefined ? String(body.status).toLowerCase() : null
+    const nowReceived = nextStatus === 'received'
+    const nowCancelled = nextStatus === 'cancelled'
+    const patch: Record<string, unknown> = {}
+    for (const key of ['number', 'supplier', 'invoiceId', 'date'] as const) {
+      if (body[key] !== undefined) patch[key] = body[key] === null ? null : String(body[key])
+    }
+    if (nextStatus) patch.status = nextStatus
+
+    const { updated, moved } = await db!.transaction(async (tx) => {
+      let moved = 0
+      if (wasReceived && (nowCancelled || (nextStatus !== null && !nowReceived))) {
+        // Leaving the received state ΓÇö goods go back on the shelf.
+        moved = await restoreReturnStock(existing.id, tx as never)
+      } else if (!wasReceived && (nowReceived || nowCancelled)) {
+        // Entering received (or being cancelled while already received).
+        moved = await reverseReturnStock(existing.id, tx as never)
+      }
+      const [row] = await tx.update(s.purchaseReturns).set(patch as never).where(eq(s.purchaseReturns.id, existing.id)).returning()
+      return { updated: row, moved }
+    })
+
+    recordCrud('purchase-returns', 'Updated', req, updated)
+    res.json({ ...stripHash(updated), stockMoved: moved })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    logger.error({ err }, 'purchase return update failed')
+    res.status(500).json({ error: msg })
+  }
+})
+
+// Ordered vs received ΓÇö what a PO actually got, ignoring cancelled invoices.
+dbRouter.get('/purchase-orders/:id/receipt', requirePermission('purchase', 'view'), async (req, res) => {
+  try {
+    const { reconcileOrder } = await import('../purchases')
+    const receipt = await reconcileOrder(routeParam(req.params.id))
+    if (!receipt) return res.status(404).json({ error: 'Purchase order not found' })
+    res.json(receipt)
+  } catch (err) {
+    logger.error({ err }, 'order receipt reconciliation failed')
+    res.status(500).json({ error: 'Failed to reconcile purchase order' })
+  }
+})
+dbRouter.get('/purchase-returns/:id', oneOf(s.purchaseReturns, s.purchaseReturns.id))
+
+dbRouter.get('/inventory/locations', listOf(s.inventoryLocations, s.inventoryLocations.name))
+
+/**
+ * Per-location aggregates for the locations list: how many products are held
+ * there, how many units in total, and what they are worth at cost. Kept out of
+ * the plain list route so the existing `/inventory/locations` shape (used by
+ * the transfer dropdowns) does not change.
+ *
+ * Registered before `/inventory/locations/:id` so "stock-summary" is not
+ * swallowed by the :id pattern.
+ */
+dbRouter.get('/inventory/locations/stock-summary', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!
+      .select({
+        locationId: s.stockLevels.locationId,
+        products: sql<number>`count(distinct ${s.stockLevels.productId})::int`,
+        quantity: sql<string>`coalesce(sum(${s.stockLevels.qty}), 0)`,
+        valueAtCost: sql<string>`coalesce(sum(${s.stockLevels.qty} * coalesce(${s.products.costPrice}, 0)), 0)`,
+      })
+      .from(s.stockLevels)
+      .innerJoin(s.products, eq(s.products.id, s.stockLevels.productId))
+      .groupBy(s.stockLevels.locationId)
+
+    const summary = new Map(rows.map((r) => [r.locationId, {
+      products: Number(r.products ?? 0),
+      quantity: Number(r.quantity ?? 0),
+      valueAtCost: Number(r.valueAtCost ?? 0),
+    }]))
+    res.json(summary)
+  } catch (err) {
+    logger.error({ err }, 'location stock summary failed')
+    res.status(500).json({ error: 'Could not load location stock summary' })
+  }
+})
+
+/**
+ * Create a location, optionally counting stock in at the point of opening it.
+ *
+ * A new location starts empty, so without this the only way to give it stock is
+ * a transfer or a stock count some time later. The counted quantities post as
+ * `opening` movements at the new location, which is deliberate: they are stock
+ * that physically exists and belongs to the business, so the total across all
+ * locations goes UP. This is not a split of an existing position ΓÇö that is what
+ * a transfer is for.
+ */
+dbRouter.post('/inventory/locations', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const name = String(req.body?.name ?? '').trim()
+    if (!name) return res.status(400).json({ error: 'Location name is required' })
+    if (name.length > 120) return res.status(400).json({ error: 'Location name is too long' })
+
+    const [existing] = await db!.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.name, name)).limit(1)
+    if (existing) return res.status(400).json({ error: `A location called "${name}" already exists` })
+
+    const opening = Array.isArray(req.body?.openingBalances) ? req.body.openingBalances : []
+
+    // Resolve every SKU up front so a typo fails the whole request instead of
+    // silently opening a location that is missing stock the user counted.
+    const wanted = new Map<string, number>()
+    for (const entry of opening) {
+      const sku = String((entry as { sku?: unknown })?.sku ?? '').trim()
+      const qty = Math.floor(Number((entry as { qty?: unknown })?.qty ?? 0))
+      if (!sku || Number.isNaN(qty) || qty === 0) continue
+      wanted.set(sku, (wanted.get(sku) ?? 0) + qty)
+    }
+    const skus = [...wanted.keys()]
+    const products = skus.length
+      ? await db!.select({ id: s.products.id, sku: s.products.sku }).from(s.products).where(inArray(s.products.sku, skus))
+      : []
+    const found = new Set(products.map((p) => p.sku))
+    const missing = skus.filter((sku) => !found.has(sku))
+    if (missing.length) return res.status(400).json({ error: `Unknown SKU: ${missing.join(', ')}` })
+
+    const result = await db!.transaction(async (tx) => {
+      const [location] = await tx
+        .insert(s.inventoryLocations)
+        .values({
+          id: randomUUID(),
+          name,
+          type: String(req.body?.type ?? '').trim() || 'store',
+          city: req.body?.city != null && String(req.body.city).trim() ? String(req.body.city).trim() : null,
+          manager: req.body?.manager != null && String(req.body.manager).trim() ? String(req.body.manager).trim() : null,
+        })
+        .returning()
+
+      const actor = actorFromRequest(req).userId ?? 'system'
+      for (const product of products) {
+        await applyStockMovement({
+          sku: product.sku,
+          qty: wanted.get(product.sku) ?? 0,
+          type: 'opening',
+          locationId: location.id,
+          refType: 'inventory_location',
+          refId: location.id,
+          note: `opening balance for ${name}`,
+          createdBy: actor,
+          tx,
+        })
+      }
+      return location
+    })
+
+    recordCrud('inventory/locations', 'Created', req, { name, type: result.type, openingLines: products.length })
+    res.status(201).json({ ...result, openingLines: products.length })
+  } catch (err) {
+    logger.error({ err }, 'location create failed')
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not create location' })
+  }
+})
+
+dbRouter.get('/inventory/locations/:id', oneOf(s.inventoryLocations, s.inventoryLocations.id))
+
+dbRouter.get('/inventory/transfers', listOf(s.stockTransfers, s.stockTransfers.date))
+dbRouter.get('/inventory/transfers/:id', oneOf(s.stockTransfers, s.stockTransfers.id))
+
+// The stock ledger: every movement, newest first. Optionally filtered to one
+// SKU and/or a date window, which is what the product page shows.
+dbRouter.get('/inventory/movements', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : ''
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200))
+
+    // A date-only "to" bound is inclusive, so widen it to the end of that day ΓÇö
+    // otherwise everything on the final day is silently dropped.
+    const fromRaw = typeof req.query.from === 'string' ? req.query.from.trim() : ''
+    const toRaw = typeof req.query.to === 'string' ? req.query.to.trim() : ''
+    const from = fromRaw ? new Date(fromRaw) : null
+    let to = toRaw ? new Date(toRaw) : null
+    if (to && /^\d{4}-\d{2}-\d{2}$/.test(toRaw)) to = new Date(to.getTime() + 86_399_999)
+
+    const filters = []
+    if (sku) filters.push(eq(s.stockMovements.sku, sku))
+    if (from && !Number.isNaN(from.getTime())) filters.push(gte(s.stockMovements.date, from.toISOString()))
+    if (to && !Number.isNaN(to.getTime())) filters.push(lte(s.stockMovements.date, to.toISOString()))
+    const where = filters.length ? and(...filters) : undefined
+
+    const rows = await db!
+      .select()
+      .from(s.stockMovements)
+      .where(where)
+      .orderBy(desc(s.stockMovements.date))
+      .limit(limit)
+    res.json(rows)
+  } catch (err) {
+    logger.error({ err }, 'stock movements list failed')
+    res.status(500).json({ error: 'Could not load stock movements' })
+  }
+})
+
+// Stock on hand per location for one product, or for everything.
+dbRouter.get('/inventory/levels', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const sku = typeof req.query.sku === 'string' ? req.query.sku.trim() : ''
+    const rows = sku
+      ? await db!.select().from(s.stockLevels).innerJoin(s.products, eq(s.products.id, s.stockLevels.productId)).where(eq(s.products.sku, sku))
+      : await db!.select().from(s.stockLevels)
+    res.json(rows.map((r) => {
+      const level = 'stock_levels' in r ? r.stock_levels : r
+      const product = 'products' in r ? r.products : null
+      return {
+        productId: level.productId,
+        sku: product?.sku ?? null,
+        locationId: level.locationId,
+        qty: Number(level.qty ?? 0),
+      }
+    }))
+  } catch (err) {
+    logger.error({ err }, 'stock levels list failed')
+    res.status(500).json({ error: 'Could not load stock levels' })
+  }
+})
+
+// Create a transfer. This is what makes a transfer actually move stock: the
+// record and the paired ledger movements are written together, so the document
+// and the balances can never disagree.
+/** Resolves a location given its id or its display name (the UI sends names). */
+async function resolveLocation(input: string): Promise<string | null> {
+  const value = String(input ?? '').trim()
+  if (!value) return null
+  const [byId] = await db!.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.id, value)).limit(1)
+  if (byId) return byId.id
+  const [byName] = await db!.select({ id: s.inventoryLocations.id }).from(s.inventoryLocations).where(eq(s.inventoryLocations.name, value)).limit(1)
+  return byName?.id ?? null
+}
+
+dbRouter.post('/inventory/transfers', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const sku = String(req.body?.sku ?? '').trim()
+    const qty = Math.floor(Number(req.body?.qty ?? 0))
+    const fromRaw = String(req.body?.from ?? '').trim()
+    const toRaw = String(req.body?.to ?? '').trim()
+    if (!sku || qty <= 0 || !fromRaw || !toRaw) {
+      return res.status(400).json({ error: 'sku, qty, from and to are required' })
+    }
+
+    const from = await resolveLocation(fromRaw)
+    const to = await resolveLocation(toRaw)
+    if (!from) return res.status(400).json({ error: `Unknown source location "${fromRaw}"` })
+    if (!to) return res.status(400).json({ error: `Unknown destination location "${toRaw}"` })
+    if (from === to) return res.status(400).json({ error: 'Source and destination must differ' })
+
+    const [product] = await db!.select({ id: s.products.id, name: s.products.name }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
+    if (!product) return res.status(404).json({ error: `Unknown SKU ${sku}` })
+
+    // Available at the source must cover it now, or dispatch will fail later
+    // and the transfer would be a promise nobody can keep.
+    const [fromLevel] = await db!
+      .select({ qty: s.stockLevels.qty })
+      .from(s.stockLevels)
+      .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
+      .limit(1)
+    const available = Number(fromLevel?.qty ?? 0)
+    if (available < qty) {
+      return res.status(400).json({ error: `Only ${available} in stock at ${fromRaw}, tried to move ${qty}` })
+    }
+
+    const number = String(req.body?.number ?? '').trim() || `ST-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`
+    const [created] = await db!
+      .insert(s.stockTransfers)
+      .values({
+        id: randomUUID(),
+        number,
+        from: fromRaw,
+        to: toRaw,
+        product: product.name ?? null,
+        sku,
+        qty,
+        weight: req.body?.weight != null ? Number(req.body.weight) : null,
+        initiatedBy: actorFromRequest(req).userId ?? 'system',
+        // Pending means the goods are still sitting at the source. Stock moves
+        // on dispatch, not on creation ΓÇö otherwise a transfer that is never
+        // dispatched has already emptied the shelf it was meant to refill.
+        status: 'pending',
+        date: new Date().toISOString(),
+      })
+      .returning()
+
+    recordCrud('stockTransfers', 'Created', req, { number, sku, qty, from: fromRaw, to: toRaw })
+    res.status(201).json(created)
+  } catch (err) {
+    logger.error({ err }, 'stock transfer create failed')
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Transfer failed' })
+  }
+})
+
+/** Dispatch: the goods leave the source, so the balance there drops. */
+dbRouter.post('/inventory/transfers/:id/dispatch', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const updated = await db!.transaction(async (tx) => {
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
+      if (transfer.status !== 'pending') {
+        throw Object.assign(new Error(`Cannot dispatch a transfer that is ${transfer.status}`), { status: 400 })
+      }
+      const from = await resolveLocation(String(transfer.from ?? ''))
+      const to = await resolveLocation(String(transfer.to ?? ''))
+      if (!from || !to) throw Object.assign(new Error('Transfer locations no longer exist'), { status: 400 })
+
+      const sku = String(transfer.sku ?? '')
+      const [product] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.sku, sku)).limit(1)
+      if (!product) throw Object.assign(new Error(`Unknown SKU ${sku}`), { status: 400 })
+      const [level] = await tx
+        .select({ qty: s.stockLevels.qty })
+        .from(s.stockLevels)
+        .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, from)))
+        .limit(1)
+      const available = Number(level?.qty ?? 0)
+      if (available < Number(transfer.qty ?? 0)) {
+        throw Object.assign(new Error(`Only ${available} in stock at ${transfer.from}, tried to move ${transfer.qty}`), { status: 400 })
+      }
+
+      // Stock physically leaves the source. It lands at the destination on
+      // receive, so goods in transit are in neither location's balance.
+      await applyStockMovement({
+        sku,
+        qty: -Number(transfer.qty ?? 0),
+        type: 'transfer_out',
+        locationId: from,
+        refType: 'stock_transfer',
+        refId: transfer.id,
+        createdBy: actorFromRequest(req).userId ?? 'system',
+      })
+      const [row] = await tx
+        .update(s.stockTransfers)
+        .set({ status: 'in-transit' })
+        .where(eq(s.stockTransfers.id, transfer.id))
+        .returning()
+      return row
+    })
+    recordCrud('stockTransfers', 'Updated', req, { id: routeParam(req.params.id), status: 'in-transit' })
+    res.json(updated)
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500
+    if (status === 500) logger.error({ err }, 'transfer dispatch failed')
+    res.status(status).json({ error: err instanceof Error ? err.message : 'Dispatch failed' })
+  }
+})
+
+/**
+ * Receive: the goods arrive, so the destination balance rises.
+ *
+ * The counted quantity may differ from what was dispatched ΓÇö goods go missing
+ * or turn up extra between stores. That variance needs no correcting movement:
+ * dispatch already removed the dispatched quantity from the source, so posting
+ * only what was actually counted leaves the total across locations correctly
+ * lower (or higher) by exactly the variance. Recording it on the transfer and
+ * in the movement note is what makes the difference explainable rather than a
+ * mystery discrepancy.
+ */
+dbRouter.post('/inventory/transfers/:id/receive', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const updated = await db!.transaction(async (tx) => {
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
+      if (transfer.status !== 'in-transit') {
+        throw Object.assign(new Error(`Cannot receive a transfer that is ${transfer.status}`), { status: 400 })
+      }
+      const to = await resolveLocation(String(transfer.to ?? ''))
+      if (!to) throw Object.assign(new Error('Destination location no longer exists'), { status: 400 })
+
+      const dispatched = Math.floor(Number(transfer.qty ?? 0))
+      // Absent means "received in full", so callers that post no body keep the
+      // previous behaviour unchanged.
+      const raw = req.body?.receivedQty
+      const received = raw == null || raw === '' ? dispatched : Math.floor(Number(raw))
+      if (!Number.isFinite(received) || received < 0) {
+        throw Object.assign(new Error('Counted quantity must be zero or more'), { status: 400 })
+      }
+      const variance = received - dispatched
+
+      // received === 0 is legitimate (everything was lost or refused); it just
+      // has no inbound movement to post.
+      if (received > 0) {
+        await applyStockMovement({
+          sku: String(transfer.sku ?? ''),
+          qty: received,
+          type: 'transfer_in',
+          locationId: to,
+          refType: 'stock_transfer',
+          refId: transfer.id,
+          note: variance === 0 ? undefined : `received ${received} of ${dispatched} (${variance < 0 ? `${-variance} short` : `${variance} over`})`,
+          createdBy: actorFromRequest(req).userId ?? 'system',
+          tx,
+        })
+      }
+
+      const [row] = await tx
+        .update(s.stockTransfers)
+        .set({ status: 'received', receivedQty: received, variance })
+        .where(eq(s.stockTransfers.id, transfer.id))
+        .returning()
+      return row
+    })
+    recordCrud('stockTransfers', 'Updated', req, {
+      id: routeParam(req.params.id),
+      status: 'received',
+      receivedQty: updated.receivedQty,
+      variance: updated.variance,
+    })
+    res.json(updated)
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500
+    if (status === 500) logger.error({ err }, 'transfer receive failed')
+    res.status(status).json({ error: err instanceof Error ? err.message : 'Receive failed' })
+  }
+})
+
+/** Cancel: an in-transit transfer has to put the stock back where it came from. */
+dbRouter.post('/inventory/transfers/:id/cancel', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const updated = await db!.transaction(async (tx) => {
+      const [transfer] = await tx.select().from(s.stockTransfers).where(eq(s.stockTransfers.id, routeParam(req.params.id))).limit(1)
+      if (!transfer) throw Object.assign(new Error('Transfer not found'), { status: 404 })
+      if (transfer.status === 'received') {
+        throw Object.assign(new Error('A received transfer cannot be cancelled'), { status: 400 })
+      }
+      if (transfer.status === 'in-transit') {
+        const from = await resolveLocation(String(transfer.from ?? ''))
+        if (!from) throw Object.assign(new Error('Source location no longer exists'), { status: 400 })
+        // It left the source on dispatch, so cancelling returns it there.
+        await applyStockMovement({
+          sku: String(transfer.sku ?? ''),
+          qty: Number(transfer.qty ?? 0),
+          type: 'transfer_in',
+          locationId: from,
+          refType: 'stock_transfer',
+          refId: transfer.id,
+          note: 'transfer cancelled ΓÇö returned to source',
+          createdBy: actorFromRequest(req).userId ?? 'system',
+        })
+      }
+      const [row] = await tx
+        .update(s.stockTransfers)
+        .set({ status: 'cancelled' })
+        .where(eq(s.stockTransfers.id, transfer.id))
+        .returning()
+      return row
+    })
+    recordCrud('stockTransfers', 'Updated', req, { id: routeParam(req.params.id), status: 'cancelled' })
+    res.json(updated)
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 500
+    if (status === 500) logger.error({ err }, 'transfer cancel failed')
+    res.status(status).json({ error: err instanceof Error ? err.message : 'Cancel failed' })
+  }
+})
+
+dbRouter.get('/bank-accounts', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const result = await paginate(s.bankAccounts, req.query, s.bankAccounts.name, req)
+    result.data = result.data.map(stripHash).map(maskBankAccount)
+    res.json(result)
+  } catch (err) { logger.error({ err }, 'bank-accounts list failed'); res.status(500).json({ error: 'Internal server error' }) }
+})
+dbRouter.get('/bank-accounts/:id', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.select().from(s.bankAccounts).where(eq(s.bankAccounts.id, routeParam(req.params.id))).limit(1)
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+    res.json(maskBankAccount(stripHash(rows[0])))
+  } catch (err) { logger.error({ err }, 'bank-accounts get failed'); res.status(500).json({ error: 'Internal server error' }) }
+})
+
+dbRouter.get('/ledger', listOf(s.ledgerEntries, s.ledgerEntries.date))
+dbRouter.get('/ledger/:id', oneOf(s.ledgerEntries, s.ledgerEntries.id))
+
+dbRouter.get('/expenses', listOf(s.expenses, s.expenses.date))
+dbRouter.get('/expenses/:id', oneOf(s.expenses, s.expenses.id))
+
+dbRouter.get('/payments', listOf(s.payments, s.payments.date))
+dbRouter.get('/payments/:id', oneOf(s.payments, s.payments.id))
+
+dbRouter.get('/users', requirePermission('system', 'view'), listOf(s.users, s.users.name))
+dbRouter.get('/users/:id', requirePermission('system', 'view'), oneOf(s.users, s.users.id))
+
+dbRouter.get('/audit-logs', listOf(s.auditLogs, s.auditLogs.timestamp))
+dbRouter.get('/audit-logs/:id', oneOf(s.auditLogs, s.auditLogs.id))
+
+dbRouter.get('/activity-logs', listOf(s.activityLogs, s.activityLogs.timestamp))
+dbRouter.get('/activity-logs/:id', oneOf(s.activityLogs, s.activityLogs.id))
+
+dbRouter.get('/sync-logs', listOf(s.syncLogs, desc(s.syncLogs.time)))
+dbRouter.get('/sync-logs/:id', oneOf(s.syncLogs, s.syncLogs.id))
+
+dbRouter.get('/silver-rates', listOf(s.silverRates, s.silverRates.updatedAt))
+dbRouter.get('/silver-rates/:id', oneOf(s.silverRates, s.silverRates.id))
+
+dbRouter.get('/gold-rates', listOf(s.goldRates, s.goldRates.updatedAt))
+dbRouter.get('/gold-rates/:id', oneOf(s.goldRates, s.goldRates.id))
+
+dbRouter.get('/currencies', listOf(s.currencies, s.currencies.code))
+
+dbRouter.get('/currencies/exchange-rate', requirePermission('system', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const from = String(req.query.from ?? '').trim().toUpperCase()
+    const to = String(req.query.to ?? 'INR').trim().toUpperCase()
+    if (!from) return res.status(400).json({ error: 'from parameter is required' })
+
+    const rows = await db!.select().from(s.currencies)
+    const byCode = new Map(rows.map((r) => [r.code, r]))
+
+    const fromCurrency = byCode.get(from)
+    const toCurrency = byCode.get(to)
+    if (!fromCurrency) return res.status(404).json({ error: `Currency ${from} not found` })
+    if (!toCurrency) return res.status(404).json({ error: `Currency ${to} not found` })
+
+    // Both rates are relative to INR; convert through INR
+    const fromRate = Number(fromCurrency.exchangeRate ?? 1)
+    const toRate = Number(toCurrency.exchangeRate ?? 1)
+    const rate = toRate / fromRate
+
+    res.json({ from, to, rate: Math.round(rate * 10000) / 10000, fromCurrency, toCurrency })
+  } catch (err) {
+    logger.error({ err }, 'exchange rate lookup failed')
+    res.status(500).json({ error: 'Exchange rate lookup failed' })
+  }
+})
+
+const SETTINGS_ID = 'app'
+
+/** Secrets are shown masked (ΓÇóΓÇóΓÇóΓÇólast4) ΓÇö never raw in API responses. */
+const maskSecret = (v: string): string => (v ? (v.length <= 4 ? 'ΓÇóΓÇóΓÇóΓÇó' : 'ΓÇóΓÇóΓÇóΓÇó' + v.slice(-4)) : '')
+
+// Encrypted credential columns must never be returned by the generic GET /settings
+// (they are only surfaced through /settings/connections which masks them).
+const SETTINGS_SECRET_COLUMNS = new Set([
+  'shopifyStoreUrlEncrypted',
+  'shopifyAccessTokenEncrypted',
+  'webhookSecretEncrypted',
+  'dbHostEncrypted',
+  'dbPortEncrypted',
+  'dbDatabaseEncrypted',
+  'dbUserEncrypted',
+  'dbPasswordEncrypted',
+])
+
+dbRouter.get('/settings', requirePermission('system', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.select().from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
+    const row = rows[0] ? { ...rows[0] } : null
+    if (row) {
+      for (const k of SETTINGS_SECRET_COLUMNS) delete row[k as keyof typeof row]
+      // The recovery password (hash or legacy ciphertext) never rides along
+      // in the generic payload ΓÇö it is read/written only by
+      // /settings/recovery-password.
+      if (row.notificationSettings && typeof row.notificationSettings === 'object') {
+        const ns = { ...(row.notificationSettings as Record<string, unknown>) }
+        delete ns[RECOVERY_PASSWORD_KEY]
+        delete ns[RECOVERY_PASSWORD_HASH_KEY]
+        ;(row as Record<string, unknown>).notificationSettings = ns
+      }
+    }
+    res.json(row ?? null)
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+dbRouter.put('/settings', requirePermission('system', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const body = sanitize(req.body ?? {}, s.settings)
+    delete body.id
+    // Never allow writing encrypted credential columns through the generic
+    // settings endpoint; connection secrets are managed via /settings/connections.
+    for (const k of SETTINGS_SECRET_COLUMNS) delete body[k as keyof typeof body]
+    // Same rule for the recovery password override: a settings round-trip must
+    // preserve the stored value untouched (the dedicated endpoint manages it).
+    // The two "Daily Summary" switches (Business Settings column + Notification
+    // Settings flag) drive the same email, so a write to either one updates both.
+    const wantsNsUpdate = !!(body.notificationSettings && typeof body.notificationSettings === 'object')
+    if (wantsNsUpdate || typeof body.dailySummary === 'boolean') {
+      const [current] = await db!.select({ ns: s.settings.notificationSettings }).from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
+      const existingNs = (current?.ns ?? null) as Record<string, unknown> | null
+      const incoming: Record<string, unknown> = wantsNsUpdate
+        ? { ...(body.notificationSettings as Record<string, unknown>) }
+        : { ...existingNs }
+      delete incoming[RECOVERY_PASSWORD_KEY]
+      delete incoming[RECOVERY_PASSWORD_HASH_KEY]
+      if (existingNs && RECOVERY_PASSWORD_KEY in existingNs) {
+        incoming[RECOVERY_PASSWORD_KEY] = existingNs[RECOVERY_PASSWORD_KEY]
+      }
+      if (existingNs && RECOVERY_PASSWORD_HASH_KEY in existingNs) {
+        incoming[RECOVERY_PASSWORD_HASH_KEY] = existingNs[RECOVERY_PASSWORD_HASH_KEY]
+      }
+      if (typeof body.dailySummary === 'boolean') {
+        incoming.dailySummaryEnabled = body.dailySummary
+      }
+      body.notificationSettings = incoming
+    }
+    body.updatedAt = new Date().toISOString()
+    const [row] = await db!
+      .insert(s.settings)
+      .values({ id: SETTINGS_ID, ...body })
+      .onConflictDoUpdate({ target: s.settings.id, set: body })
+      .returning()
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Updated Settings',
+      module: 'system',
+      entity: 'Settings',
+      details: `Business settings updated (${Object.keys(body).filter((k) => k !== 'updatedAt').join(', ')})`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json(row)
+  } catch {
+    res.status(400).json({ error: 'Failed to update settings' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Superadmin recovery password ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// The stable password that can act as an Admin / Super Admin login password
+// when the owner has forgotten theirs (login-direct; see recoveryPassword.ts).
+// Owner roles only: a system.view/edit user with any other role gets 403 and
+// never sees the value.
+async function ownerOnlyGuard(req: Request, res: Response): Promise<boolean> {
+  const userId = req.userId
+  if (!userId) {
+    res.status(401).json({ error: 'Not authenticated' })
+    return false
+  }
+  const perms = await computeUserPermissions(userId)
+  if (!perms) {
+    res.status(401).json({ error: 'User not found' })
+    return false
+  }
+  if (!isRecoveryRole(perms.role)) {
+    res.status(403).json({ error: 'Only Admin / Super Admin accounts can manage the recovery password' })
+    return false
+  }
+  return true
+}
+
+dbRouter.get('/settings/recovery-password', requirePermission('system', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    if (!(await ownerOnlyGuard(req, res))) return
+    res.json({ source: await getRecoveryPasswordSource() })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+dbRouter.put('/settings/recovery-password', requirePermission('system', 'edit'), validate(recoveryPasswordSchema), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    if (!(await ownerOnlyGuard(req, res))) return
+    const reset = req.body?.reset === true
+    if (reset) await clearRecoveryPassword()
+    else await setRecoveryPassword(String(req.body?.password ?? ''))
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: reset ? 'Recovery Password Reset to Default' : 'Recovery Password Rotated',
+      module: 'system',
+      entity: 'Settings',
+      details: reset
+        ? 'Recovery password set back to the built-in default'
+        : 'Recovery password changed to a custom value',
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, source: await getRecoveryPasswordSource() })
+  } catch (err) {
+    logger.error({ err }, 'recovery password update failed')
+    res.status(500).json({ error: 'Failed to update recovery password' })
+  }
+})
+
+dbRouter.get('/settings/connections', requirePermission('system', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const rows = await db!.select().from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
+    const row = rows[0]
+    if (!row) {
+      res.json({
+        shopifyStoreUrl: shopifyConfig.shop || '',
+        shopifyAccessToken: maskSecret(shopifyConfig.accessToken || ''),
+        shopifyApiVersion: shopifyConfig.apiVersion || '2025-10',
+        webhookSecret: '',
+        shopifyConfigured: isShopifyConfigured(),
+        dbHost: '',
+        dbPort: '5432',
+        dbDatabase: 'opal_line',
+        dbUser: '',
+        dbPassword: '',
+        dbConfigured: false,
+      })
+      return
+    }
+
+    let shopifyStoreUrl = ''
+    let shopifyAccessToken = ''
+    let webhookSecret = ''
+    try { if (row.shopifyStoreUrlEncrypted) shopifyStoreUrl = decrypt(row.shopifyStoreUrlEncrypted) } catch { /* */ }
+    try { if (row.shopifyAccessTokenEncrypted) shopifyAccessToken = decrypt(row.shopifyAccessTokenEncrypted) } catch { /* */ }
+    try { if (row.webhookSecretEncrypted) webhookSecret = decrypt(row.webhookSecretEncrypted) } catch { /* */ }
+
+    let dbHost = ''
+    let dbPort = '5432'
+    let dbDatabase = 'opal_line'
+    let dbUser = ''
+    let dbPassword = ''
+    try { if (row.dbHostEncrypted) dbHost = decrypt(row.dbHostEncrypted) } catch { /* */ }
+    try { if (row.dbPortEncrypted) dbPort = decrypt(row.dbPortEncrypted) } catch { /* */ }
+    try { if (row.dbDatabaseEncrypted) dbDatabase = decrypt(row.dbDatabaseEncrypted) } catch { /* */ }
+    try { if (row.dbUserEncrypted) dbUser = decrypt(row.dbUserEncrypted) } catch { /* */ }
+    try { if (row.dbPasswordEncrypted) dbPassword = decrypt(row.dbPasswordEncrypted) } catch { /* */ }
+
+    res.json({
+      shopifyStoreUrl: shopifyStoreUrl || '',
+      shopifyAccessToken: maskSecret(shopifyAccessToken),
+      shopifyApiVersion: row.shopifyApiVersion ?? '2025-10',
+      webhookSecret: maskSecret(webhookSecret),
+      shopifyConfigured: isShopifyConfigured() || Boolean(shopifyStoreUrl && shopifyAccessToken),
+      dbHost: dbHost || '',
+      dbPort: dbPort || '',
+      dbDatabase: dbDatabase || '',
+      dbUser: dbUser || '',
+      dbPassword: maskSecret(dbPassword),
+      dbConfigured: Boolean(dbHost && dbUser && dbPassword),
+    })
+  } catch {
+    res.status(500).json({ error: 'Failed to load connection settings' })
+  }
+})
+
+// Masked values are ΓÇó-prefixed (ΓÇóΓÇóΓÇóΓÇólast4 or all bullets) ΓÇö a real credential
+// never starts with ΓÇó, so prefix-matching is the safe ΓÇ£leave unchangedΓÇ¥ test.
+const MASKED_VALUE_PATTERN = /^ΓÇó/
+
+dbRouter.put('/settings/connections', requirePermission('system', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { shopifyStoreUrl, shopifyAccessToken, shopifyApiVersion, webhookSecret, dbHost, dbPort, dbDatabase, dbUser, dbPassword } = req.body ?? {}
+    const body: Record<string, unknown> = { updatedAt: new Date().toISOString() }
+
+    const isMasked = (value: unknown): boolean =>
+      typeof value === 'string' && (MASKED_VALUE_PATTERN.test(value) || value.includes('\uFFFD'))
+
+    if (typeof shopifyStoreUrl === 'string' && shopifyStoreUrl.length > 0 && !isMasked(shopifyStoreUrl)) {
+      body.shopifyStoreUrlEncrypted = encrypt(normalizeShopDomain(shopifyStoreUrl))
+    } else if (shopifyStoreUrl === '') {
+      body.shopifyStoreUrlEncrypted = null
+    }
+
+    if (typeof shopifyAccessToken === 'string' && shopifyAccessToken.length > 0 && !isMasked(shopifyAccessToken)) {
+      body.shopifyAccessTokenEncrypted = encrypt(shopifyAccessToken)
+    }
+
+    if (typeof shopifyApiVersion === 'string') {
+      body.shopifyApiVersion = shopifyApiVersion
+    }
+
+    if (typeof webhookSecret === 'string' && webhookSecret.length > 0 && !isMasked(webhookSecret)) {
+      body.webhookSecretEncrypted = encrypt(webhookSecret)
+    } else if (webhookSecret === '') {
+      body.webhookSecretEncrypted = null
+    }
+
+    if (typeof dbHost === 'string' && dbHost.length > 0 && !isMasked(dbHost)) {
+      body.dbHostEncrypted = encrypt(dbHost)
+    }
+    if (typeof dbPort === 'string' && dbPort.length > 0 && !isMasked(dbPort)) {
+      body.dbPortEncrypted = encrypt(dbPort)
+    }
+    if (typeof dbDatabase === 'string' && dbDatabase.length > 0 && !isMasked(dbDatabase)) {
+      body.dbDatabaseEncrypted = encrypt(dbDatabase)
+    }
+    if (typeof dbUser === 'string' && dbUser.length > 0 && !isMasked(dbUser)) {
+      body.dbUserEncrypted = encrypt(dbUser)
+    }
+    if (typeof dbPassword === 'string' && dbPassword.length > 0 && !isMasked(dbPassword)) {
+      body.dbPasswordEncrypted = encrypt(dbPassword)
+    }
+
+    await db!
+      .insert(s.settings)
+      .values({ id: SETTINGS_ID, ...body })
+      .onConflictDoUpdate({ target: s.settings.id, set: body })
+      .returning()
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Updated Connection Settings',
+      module: 'system',
+      entity: 'Settings',
+      details: 'Connection settings updated',
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+
+    // If DB credentials changed, reconnect
+    if (typeof dbHost === 'string' && typeof dbPassword === 'string' && typeof dbUser === 'string' && dbHost && dbUser && dbPassword && !isMasked(dbPassword)) {
+      const { reconnect } = await import('../db/client')
+      const port = (typeof dbPort === 'string' && dbPort) ? dbPort : '5432'
+      const database = (typeof dbDatabase === 'string' && dbDatabase) ? dbDatabase : 'opal_line'
+      const host = typeof dbHost === 'string' ? dbHost.replace(/[^\w.-]/g, '') : ''
+      if (!host || !/^[a-zA-Z0-9._-]+$/.test(host)) {
+        res.status(400).json({ error: 'Invalid database host' })
+        return
+      }
+      const dbPortNum = parseInt(port, 10)
+      if (isNaN(dbPortNum) || dbPortNum < 1 || dbPortNum > 65535) {
+        res.status(400).json({ error: 'Invalid database port' })
+        return
+      }
+      if (!/^[a-zA-Z0-9_]+$/.test(dbUser)) {
+        res.status(400).json({ error: 'Invalid database user' })
+        return
+      }
+      if (!/^[a-zA-Z0-9_-]+$/.test(database)) {
+        res.status(400).json({ error: 'Invalid database name' })
+        return
+      }
+      const url = `postgresql://${encodeURIComponent(dbUser)}:${encodeURIComponent(dbPassword)}@${host}:${port}/${database}`
+      const result = await reconnect(url)
+      if (!result.ok) {
+        res.json({ ok: true, reconnectError: result.error })
+        return
+      }
+    }
+
+    // Reload secrets into runtime config
+    const { loadSecretsFromDb } = await import('../config')
+    await loadSecretsFromDb()
+
+    // Persist Shopify config to the .env file (encrypted) so it drives the app on next start too
+    if (typeof shopifyStoreUrl === 'string' && shopifyStoreUrl.length > 0 && !isMasked(shopifyStoreUrl)) {
+      upsertEnvVar('SHOPIFY_STORE_URL', encryptSecret(normalizeShopDomain(shopifyStoreUrl)))
+    }
+    if (typeof shopifyAccessToken === 'string' && shopifyAccessToken.length > 0 && !isMasked(shopifyAccessToken)) {
+      upsertEnvVar('SHOPIFY_ACCESS_TOKEN', encryptSecret(shopifyAccessToken))
+    }
+    if (typeof shopifyApiVersion === 'string' && shopifyApiVersion.length > 0) {
+      upsertEnvVar('SHOPIFY_API_VERSION', shopifyApiVersion)
+    }
+    if (typeof webhookSecret === 'string' && webhookSecret.length > 0 && !isMasked(webhookSecret)) {
+      upsertEnvVar('SHOPIFY_WEBHOOK_SECRET', encryptSecret(webhookSecret))
+    }
+
+    // Test the Shopify connection and report the result to the caller
+    const { testShopifyConnection } = await import('../shopify')
+    const shopify = await testShopifyConnection()
+    if (shopify.ok) {
+      logger.info('Shopify connection verified on save')
+    } else {
+      logger.warn({ error: shopify.error }, 'Shopify connection test failed on save')
+    }
+
+    res.json({ ok: true, shopify })
+  } catch {
+    res.status(400).json({ error: 'Failed to save connection settings' })
+  }
+})
+
+dbRouter.get('/settings/db-status', requirePermission('system', 'view'), async (_req, res) => {
+  try {
+    const { isDbConnected } = await import('../db/client')
+    if (!isDbConnected()) {
+      res.json({ connected: false, error: 'Not connected' })
+      return
+    }
+    const health = await checkDbHealth()
+    const url = process.env.DATABASE_URL ?? ''
+    let host = '', port = '5432', dbname = '', user = ''
+    try {
+      const u = new URL(url)
+      host = u.hostname
+      port = u.port || '5432'
+      dbname = u.pathname.replace(/^\//, '')
+      user = u.username
+    } catch { /* */ }
+
+    res.json({
+      connected: health.healthy,
+      latencyMs: health.latencyMs,
+      error: health.error,
+      host: host || '',
+      port: port || '',
+      database: dbname || '',
+      user: user || '',
+    })
+  } catch {
+    res.json({ connected: false, error: 'Health check failed' })
+  }
+})
+
+// products.stock is the rollup across stock_levels, recomputed on every
+// movement. These two routes shadow the generic resource CRUD for products so
+// the ledger stays the only writer: a direct write would be silently reverted
+// by the next movement of any kind, which reads to a user as "my edit didn't
+// save". Stock is changed by a stock count at a location, or by a transfer.
+dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const body = sanitize(req.body ?? {}, s.products)
+    delete body.id
+    if (body.stock != null) {
+      return res.status(400).json({
+        error: 'Stock is managed by the stock ledger. Use a stock count for the location, or a transfer.',
+      })
+    }
+    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+    // Same duplicate guard as create, ignoring the product being updated.
+    if (body.sku != null) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(and(sql`lower(${s.products.sku}) = lower(${String(body.sku).trim()})`, ne(s.products.id, routeParam(req.params.id))))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    }
+    if (body.barcode != null) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(and(eq(s.products.barcode, String(body.barcode).trim()), ne(s.products.id, routeParam(req.params.id))))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
+    }
+    const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
+    if (!row) return res.status(404).json({ error: 'Not found' })
+    recordCrud('products', 'Updated', req, row)
+    res.json(row)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : ''
+    logger.error({ err }, 'product update failed')
+    if (msg.includes('duplicate')) {
+      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
+    }
+    res.status(400).json({ error: 'Failed to update product' })
+  }
+})
+
+// Set a product's count at ONE location, straight from the product edit
+// dialog. Unlike POST /inventory/stock-count, the baseline here mirrors
+// applyStockMovement's pre-ledger adoption rule: a product that has never
+// been through the ledger counts against products.stock instead of a missing
+// level row, which would double-count it. Each call posts a count_adjust
+// movement, so the ledger still explains the new balance.
+dbRouter.patch('/products/:id/stock', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock, shopifyId: s.products.shopifyId })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+    const sku = String(product.sku ?? '').trim()
+    if (!sku) return res.status(400).json({ error: 'Product has no SKU ΓÇö stock cannot be tracked' })
+
+    const target = Math.floor(Number(req.body?.stock))
+    if (!Number.isFinite(target) || target < 0) {
+      return res.status(400).json({ error: 'stock must be a whole number of 0 or more' })
+    }
+
+    const locationId = await resolveMovementLocation(String(req.body?.locationId ?? ''))
+    const [level] = await db!
+      .select({ qty: s.stockLevels.qty })
+      .from(s.stockLevels)
+      .where(and(eq(s.stockLevels.productId, product.id), eq(s.stockLevels.locationId, locationId)))
+      .limit(1)
+    let current = stockAtLocation(level?.qty)
+    if (!level) {
+      const [anywhere] = await db!
+        .select({ locationId: s.stockLevels.locationId })
+        .from(s.stockLevels)
+        .where(eq(s.stockLevels.productId, product.id))
+        .limit(1)
+      if (!anywhere && locationId === DEFAULT_LOCATION_ID) current = stockAtLocation(product.stock)
+    }
+
+    const delta = target - current
+    if (delta === 0) {
+      return res.json({ ok: true, changed: false, stock: stockAtLocation(product.stock), previous: current, locationId })
+    }
+    const next = await applyStockMovement({
+      sku,
+      qty: delta,
+      type: 'count_adjust',
+      locationId,
+      refType: 'product_edit',
+      note: `stock set to ${target} from product edit (was ${current} at ${locationId})`,
+      createdBy: actorFromRequest(req).userId ?? 'system',
+    })
+    // Push the new balance to Shopify for genuinely listed products ΓÇö editing
+    // a stock count in the product dialog must move the store too, not just
+    // the ledger. Best-effort and awaited (same pattern as the stock-count
+    // endpoint's pushToShopify): the local count already stands on failure.
+    // Unlisted / placeholder-linked SKUs are skipped so a plain local edit
+    // never triggers a Shopify round-trip.
+    let shopifyPush: Awaited<ReturnType<typeof pushInventoryToShopify>> | null = null
+    const shopifyId = String(product.shopifyId ?? '').trim()
+    const linked = shopifyId !== '' && !shopifyId.startsWith('#')
+    if (next !== null && linked) {
+      try {
+        shopifyPush = await pushInventoryToShopify([product.id])
+      } catch (err) {
+        shopifyPush = { ok: false, updated: 0, skipped: 0, errors: [err instanceof Error ? err.message : 'Shopify push failed'] }
+      }
+    }
+    res.json({ ok: true, changed: true, stock: next ?? target, previous: current, locationId, shopifyPush })
+  } catch (err) {
+    logger.error({ err }, 'product stock update failed')
+    res.status(400).json({ error: 'Failed to update stock' })
+  }
+})
+
+// Creating a product may state an opening quantity, but it is posted through
+// the ledger as an `opening` movement so the new product has real history
+// rather than a balance that appears from nowhere.
+dbRouter.post('/products', requirePermission('inventory', 'create'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const body = sanitize(req.body ?? {}, s.products)
+    const openingQty = Math.floor(Number(body.stock ?? 0))
+    delete body.stock
+    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+    if (!body.id) body.id = randomUUID()
+
+    // Identifier uniqueness: sku also has a DB unique index; barcode only has
+    // this check. Either way, respond with the conflicting product so the UI
+    // can offer "edit existing" or fresh codes instead of a blind failure.
+    const skuStr = body.sku != null ? String(body.sku).trim() : ''
+    const barcodeStr = body.barcode != null ? String(body.barcode).trim() : ''
+    if (skuStr) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(sql`lower(${s.products.sku}) = lower(${skuStr})`)
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    }
+    if (barcodeStr) {
+      const [hit] = await db!
+        .select({ id: s.products.id, name: s.products.name })
+        .from(s.products)
+        .where(eq(s.products.barcode, barcodeStr))
+        .limit(1)
+      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
+    }
+
+    const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
+    const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
+    if (openingQty > 0 && !locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
+
+    const row = await db!.transaction(async (tx) => {
+      const [created] = await tx.insert(s.products).values(body as never).returning()
+      if (openingQty > 0 && created.sku) {
+        await applyStockMovement({
+          sku: String(created.sku),
+          qty: openingQty,
+          type: 'opening',
+          locationId,
+          note: 'opening stock recorded when the product was created',
+          createdBy: actorFromRequest(req).userId ?? 'system',
+          tx,
+        })
+      }
+      return created
+    })
+    recordCrud('products', 'Created', req, row)
+    res.status(201).json(row)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    logger.error({ err }, 'product create failed')
+    if (msg.includes('duplicate')) {
+      // Unique-index race (two saves at once) ΓÇö same shape as the pre-check.
+      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
+    }
+    res.status(400).json({ error: 'Failed to create product' })
+  }
+})
+
+const resources: Record<string, any> = {
+  products: s.products,
+  customers: s.customers,
+  suppliers: s.suppliers,
+  'sales-orders': s.salesOrders,
+  'purchase-orders': s.purchaseOrders,
+  'purchase-invoices': s.purchaseInvoices,
+  'sales-returns': s.salesReturns,
+  'purchase-returns': s.purchaseReturns,
+  'inventory/locations': s.inventoryLocations,
+  'inventory/transfers': s.stockTransfers,
+  'bank-accounts': s.bankAccounts,
+  ledger: s.ledgerEntries,
+  expenses: s.expenses,
+  payments: s.payments,
+  users: s.users,
+  'audit-logs': s.auditLogs,
+  'sync-logs': s.syncLogs,
+  'silver-rates': s.silverRates,
+  'gold-rates': s.goldRates,
+  batches: s.batches,
+  boms: s.boms,
+  'bom-items': s.bomItems,
+  karigars: s.karigars,
+  branches: s.branches,
+}
+
+const resourceModule: Record<string, string> = {
+  products: 'inventory',
+  customers: 'sales',
+  suppliers: 'purchase',
+  'sales-orders': 'sales',
+  invoices: 'sales',
+  'purchase-orders': 'purchase',
+  'purchase-invoices': 'purchase',
+  'sales-returns': 'sales',
+  'purchase-returns': 'purchase',
+  'inventory/locations': 'inventory',
+  'inventory/transfers': 'inventory',
+  'bank-accounts': 'accounts',
+  ledger: 'accounts',
+  expenses: 'accounts',
+  payments: 'accounts',
+  users: 'system',
+  'audit-logs': 'system',
+  'sync-logs': 'shopify',
+  'silver-rates': 'silver-rate',
+  'gold-rates': 'gold-rate',
+  batches: 'inventory',
+  boms: 'inventory',
+  'bom-items': 'inventory',
+  karigars: 'inventory',
+  branches: 'system',
+  currencies: 'system',
+}
+
+const RESOURCE_LABELS: Record<string, string> = {
+  products: 'Product',
+  customers: 'Customer',
+  suppliers: 'Supplier',
+  'sales-orders': 'Sales Order',
+  invoices: 'Invoice',
+  'purchase-orders': 'Purchase Order',
+  'purchase-invoices': 'Purchase Invoice',
+  'sales-returns': 'Sales Return',
+  'purchase-returns': 'Purchase Return',
+  'inventory/locations': 'Inventory Location',
+  'inventory/transfers': 'Stock Transfer',
+  'bank-accounts': 'Bank Account',
+  ledger: 'Ledger Entry',
+  expenses: 'Expense',
+  payments: 'Payment',
+  users: 'User',
+  'audit-logs': 'Audit Log',
+  'sync-logs': 'Sync Log',
+  'silver-rates': 'Silver Rate',
+  'gold-rates': 'Gold Rate',
+  batches: 'Batch',
+  boms: 'BOM',
+  'bom-items': 'BOM Item',
+  karigars: 'Karigar',
+  branches: 'Branch',
+}
+
+function entityDisplayName(row: Record<string, unknown> | null): string {
+  if (!row) return ''
+  const name = String(row.name ?? row.number ?? row.ref ?? row.title ?? row.sku ?? row.description ?? '').trim()
+  return name || String(row.id ?? '')
+}
+
+function recordCrud(name: string, action: string, req: Request, row: Record<string, unknown> | null) {
+  const label = RESOURCE_LABELS[name] ?? name
+  const entity = `${label} ${entityDisplayName(row)}`.trim()
+  const actor = actorFromRequest(req)
+  void recordActivity({
+    action,
+    module: resourceModule[name] ?? 'system',
+    entity,
+    details: undefined,
+    userId: actor.userId,
+    ip: actor.ip,
+  })
+}
+
+for (const [name, table] of Object.entries(resources)) {
+  dbRouter.post(`/${name}`, requirePermission(resourceModule[name], 'create'), async (req, res) => {
+    if (!requireDb(res)) return
+    try {
+      const isUser = name === 'users'
+      const isBankAccount = name === 'bank-accounts'
+      const isSupplier = name === 'suppliers'
+      let body = isSupplier
+        ? await prepareSupplierBody(req.body ?? {})
+        : isUser
+          ? await prepareUserBody(req.body ?? {})
+          : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
+      if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
+        body.accountNumberEncrypted = encrypt(body.accountNumber)
+        delete body.accountNumber
+      }
+      if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+      if (!body.id) body.id = randomUUID()
+      const [row] = await db!.insert(table).values(body).returning()
+      recordCrud(name, 'Created', req, row)
+      res.status(201).json(stripHash(row))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
+        res.status(400).json({ error: msg })
+      } else {
+        res.status(400).json({ error: 'Failed to create resource' })
+      }
+    }
+  })
+
+  dbRouter.patch(`/${name}/:id`, requirePermission(resourceModule[name], 'edit'), async (req, res) => {
+    if (!requireDb(res)) return
+    try {
+      const isUser = name === 'users'
+      if (isUser && routeParam(req.params.id) === req.userId) {
+        return res.status(403).json({ error: 'Cannot modify your own account' })
+      }
+      const isBankAccount = name === 'bank-accounts'
+      const isSupplier = name === 'suppliers'
+      let body = isSupplier
+        ? await prepareSupplierBody(req.body ?? {}, { isUpdate: true, id: routeParam(req.params.id) })
+        : isUser
+          ? await prepareUserBody(req.body ?? {}, true)
+          : sanitize(req.body ?? {}, table)
+      if (isUser) {
+        const escalation = await assertNoPrivilegeEscalation(req, body)
+        if (escalation) return res.status(403).json({ error: escalation })
+      }
+      if (isBankAccount && body.accountNumber && typeof body.accountNumber === 'string') {
+        body.accountNumberEncrypted = encrypt(body.accountNumber)
+        delete body.accountNumber
+      }
+      delete body.id
+      if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
+      const [row] = await db!.update(table).set(body).where(eq(table.id, routeParam(req.params.id))).returning()
+      if (!row) return res.status(404).json({ error: 'Not found' })
+      recordCrud(name, 'Updated', req, row)
+      res.json(stripHash(row))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unknown error'
+      if (name === 'suppliers' || msg.includes('password') || msg.includes('Password')) {
+        res.status(400).json({ error: msg })
+      } else {
+        res.status(400).json({ error: 'Failed to update resource' })
+      }
+    }
+  })
+
+  dbRouter.delete(`/${name}/:id`, requirePermission(resourceModule[name], 'delete'), async (req, res) => {
+    if (!requireDb(res)) return
+    try {
+      if (name === 'users' && routeParam(req.params.id) === req.userId) {
+        return res.status(400).json({ error: 'You cannot delete your own account' })
+      }
+      const [existing] = await db!.select().from(table).where(eq(table.id, routeParam(req.params.id))).limit(1)
+      if (!existing) return res.status(404).json({ error: 'Not found' })
+      await db!.delete(table).where(eq(table.id, routeParam(req.params.id)))
+      recordCrud(name, 'Deleted', req, existing)
+      res.json({ ok: true, id: routeParam(req.params.id) })
+    } catch {
+      res.status(500).json({ error: 'Failed to delete resource' })
+    }
+  })
+}
+
+dbRouter.get('/stats', async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [productCount] = await db!.select({ count: sql<number>`count(*)` }).from(s.products)
+    const [customerCount] = await db!.select({ count: sql<number>`count(*)` }).from(s.customers)
+    const [supplierCount] = await db!.select({ count: sql<number>`count(*)` }).from(s.suppliers)
+    const [invoiceCount] = await db!.select({ count: sql<number>`count(*)` }).from(s.salesInvoices)
+    const stock = await db!.select({ qty: sql<number>`coalesce(sum(stock),0)` }).from(s.products)
+    res.json({
+      totalProducts: Number(productCount.count),
+      activeProducts: Number((await db!.select({ count: sql<number>`count(*)` }).from(s.products).where(eq(s.products.status, 'active')))[0].count),
+      totalCustomers: Number(customerCount.count),
+      totalSuppliers: Number(supplierCount.count),
+      totalInvoices: Number(invoiceCount.count),
+      totalStockQty: Number(stock[0].qty),
+    })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+dbRouter.get('/search', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const q = String(req.query.q ?? '').trim().toLowerCase().slice(0, 100)
+    if (!q) return res.json({ products: [], customers: [], invoices: [], suppliers: [], salesOrders: [], purchaseInvoices: [], payments: [] })
+    const escaped = q.replace(/[%_]/g, (ch) => `\\${ch}`)
+    const like = `%${escaped}%`
+    const [products, customers, invoices, suppliers, salesOrders, purchaseInvoices, payments] = await Promise.all([
+      db!.select().from(s.products).where(ilike(s.products.name, like)).limit(8),
+      db!.select().from(s.customers).where(ilike(s.customers.name, like)).limit(8),
+      db!.select().from(s.salesInvoices).where(ilike(s.salesInvoices.number, like)).limit(8),
+      db!.select().from(s.suppliers).where(ilike(s.suppliers.name, like)).limit(8),
+      db!.select().from(s.salesOrders).where(ilike(s.salesOrders.shopifyId, like)).limit(8),
+      db!.select().from(s.purchaseInvoices).where(ilike(s.purchaseInvoices.number, like)).limit(8),
+      db!.select().from(s.payments).where(ilike(s.payments.ref, like)).limit(8),
+    ])
+    res.json({ products, customers, invoices, suppliers, salesOrders, purchaseInvoices, payments })
+  } catch {
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Record a payment against a customer's outstanding invoices ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.post('/dues/pay', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const customer = String(req.body?.customer ?? '').trim()
+    const amount = Number(req.body?.amount ?? 0)
+    const method = String(req.body?.method ?? 'cash').trim().toLowerCase()
+    const allocate = Array.isArray(req.body?.allocate) ? req.body.allocate : null
+    if (!customer) return res.status(400).json({ error: 'customer required' })
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'amount must be > 0' })
+
+    // Open (unpaid, non-cancelled/refunded) invoices for this customer, oldest first
+    const open = await db
+      .select()
+      .from(schema.salesInvoices)
+      .where(
+        sql`${schema.salesInvoices.customer} = ${customer} and ${schema.salesInvoices.paymentStatus} is distinct from 'paid' and ${schema.salesInvoices.status} is distinct from 'cancelled' and ${schema.salesInvoices.status} is distinct from 'refunded'`,
+      )
+      .orderBy(sql`${schema.salesInvoices.date} asc`)
+    const outstanding = open.reduce((a, inv) => a + Number(inv.grandTotal ?? 0), 0)
+    if (open.length === 0) return res.status(400).json({ error: 'No outstanding invoices for this customer' })
+    if (amount > outstanding + 0.01) return res.status(400).json({ error: `Amount exceeds outstanding (${outstanding.toFixed(2)})` })
+
+    // Allocation: explicit invoice list or FIFO across oldest first
+    let remaining = amount
+    const settled: string[] = []
+    const touched: Array<{ inv: typeof open[number]; applied: number }> = []
+    const plan = allocate
+      ? open.filter((inv) => allocate.map(String).includes(inv.id))
+      : open
+    for (const inv of plan) {
+      if (remaining <= 0) break
+      const due = Number(inv.grandTotal ?? 0)
+      const applied = Math.min(due, remaining)
+      if (applied <= 0) continue
+      remaining = Math.round((remaining - applied) * 100) / 100
+      touched.push({ inv, applied })
+      if (applied >= due - 0.01) {
+        await db.update(schema.salesInvoices).set({ paymentStatus: 'paid', status: 'paid' }).where(eq(schema.salesInvoices.id, inv.id))
+        settled.push(inv.number)
+      } else {
+        await db.update(schema.salesInvoices).set({ paymentStatus: 'partial' }).where(eq(schema.salesInvoices.id, inv.id))
+      }
+    }
+
+    const ref = `PAY-${Date.now().toString(36).toUpperCase()}`
+    await db.insert(schema.payments).values({
+      id: randomUUID(),
+      ref,
+      invoice: touched[0]?.inv.number ?? null,
+      customer,
+      amount,
+      method,
+      gateway: method === 'razorpay' ? 'razorpay' : null,
+      status: 'success',
+      date: new Date().toISOString(),
+      reconciled: true,
+    } as any)
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Recorded Payment',
+      module: 'sales',
+      entity: customer,
+      details: `${ref} ┬╖ Γé╣${amount} (${method})${settled.length ? ` ┬╖ settled ${settled.join(', ')}` : ''}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    logger.info({ ref, customer, amount, method, settled }, 'Payment recorded from Dues page')
+    res.json({ ok: true, ref, settled, remainingOutstanding: Math.round((outstanding - amount) * 100) / 100 })
+  } catch (err) {
+    logger.error({ err }, 'Record payment failed')
+    res.status(500).json({ error: 'Failed to record payment' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Dues: outstanding summary + on-demand statement email ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/dues', requirePermission('sales', 'view'), async (_req, res) => {
+  try {
+    const { collectDues } = await import('../statements')
+    const dues = await collectDues()
+    const total = dues.reduce((a, d) => a + d.total, 0)
+    res.json({ dues, total, customerCount: dues.length })
+  } catch (err) {
+    logger.error({ err }, 'Dues collection failed')
+    res.status(500).json({ error: 'Failed to collect dues' })
+  }
+})
+
+// Bulk payment reminders: one email per customer with outstanding dues.
+// Recipients come from the customers table (matched by name); customers
+// without an email on file are counted as skipped.
+dbRouter.post('/dues/remind', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { collectDues } = await import('../statements')
+    const dues = await collectDues()
+    if (dues.length === 0) return res.status(200).json({ sent: 0, skipped: 0, reason: 'No outstanding dues' })
+    const customers = await db!.select({ name: schema.customers.name, email: schema.customers.email }).from(schema.customers)
+    const emailByName = new Map(customers.filter((c) => c.email).map((c) => [c.name.toLowerCase(), c.email as string]))
+    const { sendEmail } = await import('../notifications')
+    let sent = 0
+    let skipped = 0
+    const failures: string[] = []
+    for (const d of dues) {
+      const to = emailByName.get((d.customer ?? '').toLowerCase())
+      if (!to) { skipped++; continue }
+      const invoiceList = d.invoiceNumbers.slice(0, 8).map((n) => `ΓÇó ${escapeHtml(n)}`).join('<br/>')
+      const ok = await sendEmail({
+        to,
+        subject: `Payment reminder ΓÇö ${d.invoiceCount} outstanding invoice${d.invoiceCount === 1 ? '' : 's'} (Γé╣${d.total.toLocaleString('en-IN')})`,
+        html: `<p>Dear ${escapeHtml(d.customer)},</p><p>Our records show <strong>${d.invoiceCount}</strong> unpaid invoice${d.invoiceCount === 1 ? '' : 's'} totalling <strong>Γé╣${d.total.toLocaleString('en-IN')}</strong>:</p><p style="font-family: monospace; font-size: 12px;">${invoiceList}</p><p>Please arrange payment at your earliest convenience. Reply to this email or call us if you have already paid or need a copy of any invoice.</p><p>ΓÇö Opal Line Jewels LLP</p>`,
+      })
+      if (ok) sent++
+      else failures.push(d.customer ?? 'unknown')
+    }
+    logger.info({ sent, skipped }, 'Bulk payment reminders processed')
+    res.json({ sent, skipped, failures })
+  } catch (err) {
+    logger.error({ err }, 'payment reminders failed')
+    res.status(500).json({ error: 'Failed to send payment reminders' })
+  }
+})
+
+dbRouter.post('/dues/email', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const [settingsRow] = await db!.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
+    const recipient = String(req.body?.to || '').trim() || process.env.NOTIFICATION_EMAIL?.trim() || settingsRow?.email?.trim()
+    if (!recipient) return res.status(400).json({ error: 'No recipient (no "to", NOTIFICATION_EMAIL, or settings.email)' })
+    const { generateDuesStatementPDF } = await import('../statements')
+    const statement = await generateDuesStatementPDF()
+    if (!statement) return res.status(200).json({ sent: false, reason: 'No outstanding dues ΓÇö nothing to send' })
+    const { notifyDuesStatement } = await import('../notifications')
+    const sent = await notifyDuesStatement(recipient, statement)
+    if (sent) logger.info({ recipient }, 'On-demand dues statement emailed')
+    res.json({ sent, recipient, total: statement.totalDue, customerCount: statement.customerCount })
+  } catch (err) {
+    logger.error({ err }, 'Dues statement email failed')
+    res.status(500).json({ error: 'Failed to send dues statement' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Customer account statements (PDF download + email) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/customers/:name/statement', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const customer = decodeURIComponent(routeParam(req.params.name))
+    const { generateCustomerStatementPDF } = await import('../statements')
+    const statement = await generateCustomerStatementPDF(customer)
+    if (!statement) return res.status(404).json({ error: 'No invoices found for this customer' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="statement-${customer.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.pdf"`)
+    res.send(statement.buffer)
+  } catch (err) {
+    logger.error({ err }, 'Customer statement PDF failed')
+    res.status(500).json({ error: 'Statement generation failed' })
+  }
+})
+
+dbRouter.post('/customers/:name/statement/email', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const customer = decodeURIComponent(routeParam(req.params.name))
+    const to = String(req.body?.to ?? '').trim()
+    if (!to) return res.status(400).json({ error: 'Recipient "to" required' })
+    const { generateCustomerStatementPDF } = await import('../statements')
+    const statement = await generateCustomerStatementPDF(customer)
+    if (!statement) return res.status(404).json({ error: 'No invoices found for this customer' })
+    const { notifyCustomerStatement } = await import('../notifications')
+    const sent = await notifyCustomerStatement(to, customer, statement)
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Emailed Customer Statement',
+      module: 'sales',
+      entity: customer,
+      details: `Statement sent to ${to} (${statement.invoiceCount} invoices)`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ sent, invoiceCount: statement.invoiceCount, outstanding: statement.outstanding })
+  } catch (err) {
+    logger.error({ err }, 'Customer statement email failed')
+    res.status(500).json({ error: 'Statement email failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Razorpay payment link ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.post('/dues/payment-link', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { createRazorpayPaymentLink, isRazorpayConfigured } = await import('../paymentLinks')
+    if (!isRazorpayConfigured()) return res.status(400).json({ error: 'Razorpay not configured (set RAZORPAY_KEY_ID + RAZORPAY_KEY_SECRET)', configured: false })
+    const customer = String(req.body?.customer ?? '').trim()
+    const amount = Number(req.body?.amount ?? 0)
+    if (!customer) return res.status(400).json({ error: 'customer required' })
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: 'amount must be > 0' })
+    const link = await createRazorpayPaymentLink({
+      amount,
+      customer,
+      description: `Outstanding dues for ${customer} ΓÇö Opal Line`,
+      referenceId: `OL-${customer.slice(0, 20).replace(/[^a-z0-9]/gi, '')}-${Date.now().toString(36).toUpperCase()}`,
+    })
+    if (!link) return res.status(500).json({ error: 'Failed to create payment link' })
+    res.json({ url: link.url, id: link.id, configured: true })
+  } catch (err) {
+    logger.error({ err }, 'Razorpay payment link failed')
+    res.status(500).json({ error: 'Payment link generation failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ WhatsApp send (server-side) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.post('/send-whatsapp', requirePermission('sales', 'edit'), async (req, res) => {
+  try {
+    const { sendWhatsAppMessage, isWhatsAppConfigured } = await import('../whatsapp')
+    if (!isWhatsAppConfigured()) return res.status(400).json({ error: 'WhatsApp Business API not configured', configured: false })
+    const phone = String(req.body?.phone ?? '').trim()
+    const message = String(req.body?.message ?? '').trim()
+    if (!phone || !message) return res.status(400).json({ error: 'phone and message required' })
+    const result = await sendWhatsAppMessage(phone, message)
+    if (!result) return res.status(500).json({ error: 'WhatsApp send failed', configured: true })
+    const actor = actorFromRequest(req)
+    void recordActivity({ action: 'Sent WhatsApp', module: 'sales', entity: phone, details: message.slice(0, 100), userId: actor.userId, ip: actor.ip })
+    res.json({ ok: true, messageId: result.messageId, configured: true })
+  } catch (err) {
+    logger.error({ err }, 'WhatsApp send endpoint failed')
+    res.status(500).json({ error: 'WhatsApp send failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Supplier purchase invoice aging (outstanding dues) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/supplier-dues', requirePermission('purchase', 'view'), async (_req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const { collectSupplierDues } = await import('../purchases')
+    const dues = await collectSupplierDues()
+    const total = dues.reduce((a, d) => a + d.balance, 0)
+    const aging = {
+      current: dues.reduce((a, d) => a + d.current, 0),
+      d1_30: dues.reduce((a, d) => a + d.d1_30, 0),
+      d31_60: dues.reduce((a, d) => a + d.d31_60, 0),
+      d60plus: dues.reduce((a, d) => a + d.d60plus, 0),
+    }
+    res.json({
+      dues: dues.map((d) => ({ ...d, count: d.invoiceCount })),
+      total,
+      aging,
+      supplierCount: dues.length,
+    })
+  } catch (err) {
+    logger.error({ err }, 'Supplier dues query failed')
+    res.status(500).json({ error: 'Failed to load supplier dues' })
+  }
+})
+
+// Open invoices for one supplier ΓÇö drives the payment dialog.
+dbRouter.get('/supplier-dues/:supplier', requirePermission('purchase', 'view'), async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const { getSupplierOpenInvoices, getSupplierPayments, getPaymentAllocations } = await import('../purchases')
+    const supplier = decodeURIComponent(routeParam(req.params.supplier))
+    const invoices = await getSupplierOpenInvoices(supplier)
+    const payments = await getSupplierPayments(supplier, 25)
+    const allocations = await Promise.all(payments.map((p) => getPaymentAllocations(p.id)))
+    res.json({
+      supplier,
+      invoices,
+      outstanding: Math.round(invoices.reduce((a, i) => a + i.balance, 0) * 100) / 100,
+      payments: payments.map((p, i) => ({
+        id: p.id,
+        ref: p.ref,
+        amount: Number(p.amount ?? 0),
+        method: p.method,
+        date: p.date,
+        note: p.note,
+        allocations: allocations[i],
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'Supplier dues detail failed')
+    res.status(500).json({ error: 'Failed to load supplier dues' })
+  }
+})
+
+// Record a supplier payment: writes a ledger row plus per-invoice allocations
+// and advances each invoice's paid amount, so partial payments settle properly.
+dbRouter.post('/supplier-dues/pay', requirePermission('purchase', 'edit'), async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const { recordSupplierPayment } = await import('../purchases')
+    const allocate = Array.isArray(req.body?.allocate) ? (req.body.allocate as unknown[]).map(String) : null
+    const result = await recordSupplierPayment({
+      supplier: String(req.body?.supplier ?? ''),
+      amount: Number(req.body?.amount ?? 0),
+      method: String(req.body?.method ?? 'cash').trim().toLowerCase(),
+      note: typeof req.body?.note === 'string' ? req.body.note.slice(0, 200) : null,
+      createdBy: actorFromRequest(req).userId ?? null,
+      allocate,
+    })
+    if (!result.ok) return res.status(400).json({ error: result.error })
+
+    const actor = actorFromRequest(req)
+    recordCrud('purchase-invoices', 'Payment recorded', req, {
+      supplier: String(req.body?.supplier ?? ''),
+      ref: result.ref,
+      allocations: result.allocations,
+    })
+    void recordActivity({
+      action: 'Recorded Supplier Payment',
+      module: 'purchase',
+      entity: String(req.body?.supplier ?? ''),
+      details: `${result.ref} ┬╖ Γé╣${Number(req.body?.amount ?? 0).toLocaleString('en-IN')}${result.settled.length ? ` ┬╖ settled ${result.settled.join(', ')}` : ''}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json(result)
+  } catch (err) {
+    logger.error({ err }, 'Supplier payment failed')
+    res.status(500).json({ error: 'Failed to record supplier payment' })
+  }
+})
+
+// Email the shop owner a summary of what is owed to suppliers and how overdue.
+// Run the same summary the daily scheduler sends, on demand.
+dbRouter.post('/supplier-dues/sweep', requirePermission('purchase', 'edit'), async (_req, res) => {
+  try {
+    const { runSupplierPayables } = await import('../supplierPayables')
+    const result = await runSupplierPayables({ force: true })
+    res.json({ ok: result.sent, ...result })
+  } catch (err) {
+    logger.error({ err }, 'supplier payables sweep failed')
+    res.status(500).json({ error: 'Failed to run the supplier payables summary' })
+  }
+})
+
+dbRouter.post('/supplier-dues/remind', requirePermission('purchase', 'edit'), async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ error: 'Database not configured' })
+    const { collectSupplierDues } = await import('../purchases')
+    const { sendEmail } = await import('../notifications')
+    const { escapeHtml } = await import('../htmlEscape')
+    const [settingsRow] = await db!.select().from(s.settings).where(eq(s.settings.id, SETTINGS_ID)).limit(1)
+    const recipient =
+      typeof req.body?.to === 'string' && req.body.to.trim()
+        ? req.body.to.trim()
+        : (process.env.NOTIFICATION_EMAIL ?? String(settingsRow?.email ?? '')).trim()
+    if (!recipient) return res.status(400).json({ error: 'No recipient configured ΓÇö pass "to" or set the business email' })
+
+    const dues = await collectSupplierDues()
+    if (dues.length === 0) return res.json({ ok: true, sent: 0, message: 'No supplier dues outstanding' })
+    const total = dues.reduce((a, d) => a + d.balance, 0)
+    const rows = dues
+      .map(
+        (d) =>
+          `<tr><td style="padding:6px;border-bottom:1px solid #eee">${escapeHtml(d.supplier ?? 'Unknown')}</td>` +
+          `<td style="padding:6px;border-bottom:1px solid #eee;text-align:right">${d.invoiceCount}</td>` +
+          `<td style="padding:6px;border-bottom:1px solid #eee;text-align:right">Γé╣${d.balance.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td></tr>`,
+      )
+      .join('')
+    const sent = await sendEmail({
+      to: recipient,
+      subject: `Supplier dues ΓÇö Γé╣${total.toLocaleString('en-IN')} outstanding`,
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px">
+          <h2 style="color:#1a1a2e">Supplier payables</h2>
+          <p>Total outstanding across ${dues.length} supplier(s).</p>
+          <table style="width:100%;border-collapse:collapse;margin:12px 0">
+            <tr><th align="left" style="padding:6px">Supplier</th><th align="right" style="padding:6px">Invoices</th><th align="right" style="padding:6px">Balance</th></tr>
+            ${rows}
+            <tr><td style="padding:6px;font-weight:bold">Total</td><td></td><td align="right" style="padding:6px;font-weight:bold">Γé╣${total.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td></tr>
+          </table>
+          <p style="color:#999;font-size:12px">Opal Line ERP ΓÇö Purchase payables summary</p>
+        </div>`,
+    })
+    if (!sent) return res.status(500).json({ error: 'Failed to send summary. Check server logs.' })
+    res.json({ ok: true, sent: dues.length, to: recipient })
+  } catch (err) {
+    logger.error({ err }, 'supplier dues reminder failed')
+    res.status(500).json({ error: 'Failed to send supplier dues summary' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Notification settings ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/settings/notifications', requirePermission('system', 'view'), async (_req, res) => {
+  try {
+    const [row] = await db!.select().from(schema.settings).where(sql`${schema.settings.id} = 'app'`).limit(1)
+    const notif = (row as any)?.notificationSettings ?? {
+      dailySummaryEnabled: true,
+      monthlyStatementsEnabled: true,
+      dueRemindersEnabled: true,
+      weeklyReportEnabled: true,
+      recipientEmail: process.env.NOTIFICATION_EMAIL ?? '',
+    }
+    const out = { ...(notif as Record<string, unknown>) }
+    delete out[RECOVERY_PASSWORD_KEY]
+    delete out[RECOVERY_PASSWORD_HASH_KEY]
+    res.json(out)
+  } catch (err) {
+    logger.error({ err }, 'Notification settings load failed')
+    res.status(500).json({ error: 'Failed to load notification settings' })
+  }
+})
+
+dbRouter.put('/settings/notifications', requirePermission('system', 'edit'), async (req, res) => {
+  try {
+    const body = { ...(req.body as Record<string, unknown>) }
+    // The recovery password is managed only by its dedicated endpoint ΓÇö
+    // a generic notification-settings write must not inject it.
+    delete body[RECOVERY_PASSWORD_KEY]
+    delete body[RECOVERY_PASSWORD_HASH_KEY]
+    const [row] = await db!.select().from(schema.settings).where(sql`${schema.settings.id} = 'app'`).limit(1)
+    const existing = (row as any)?.notificationSettings ?? {}
+    const merged = { ...existing, ...body }
+    // Mirror the switch onto the legacy Business Settings column (same email).
+    const setClause: Record<string, unknown> = { notificationSettings: merged }
+    if (typeof body.dailySummaryEnabled === 'boolean') setClause.dailySummary = body.dailySummaryEnabled
+    await db!.update(schema.settings).set(setClause as any).where(sql`${schema.settings.id} = 'app'`)
+    const actor = actorFromRequest(req)
+    void recordActivity({ action: 'Updated Notification Settings', module: 'system', entity: 'Notifications', details: Object.keys(body).join(', '), userId: actor.userId, ip: actor.ip })
+    res.json(merged)
+  } catch (err) {
+    logger.error({ err }, 'Notification settings update failed')
+    res.status(500).json({ error: 'Failed to update notification settings' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Email Invoice ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.post('/invoices/:id/email', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { emailInvoicePDF } = await import('../invoicePdf')
+    const invoiceId = routeParam(req.params.id)
+    const [inv] = await db!.select({ customer: s.salesInvoices.customer, customerEmail: s.salesInvoices.customerEmail }).from(s.salesInvoices).where(eq(s.salesInvoices.id, invoiceId)).limit(1)
+    if (!inv) return res.status(404).json({ error: 'Invoice not found' })
+
+    let recipientEmail = typeof req.body?.to === 'string' ? req.body.to.trim() : ''
+    if (!recipientEmail && inv.customerEmail) recipientEmail = inv.customerEmail.trim()
+    if (!recipientEmail) {
+      const [cust] = await db!.select({ email: s.customers.email }).from(s.customers).where(eq(s.customers.name, inv.customer ?? '')).limit(1)
+      if (cust?.email) recipientEmail = cust.email.trim()
+    }
+    if (!recipientEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail)) {
+      return res.status(400).json({ error: 'No valid email address found. Provide "to" in request body or ensure the customer has an email.' })
+    }
+
+    const sent = await emailInvoicePDF(invoiceId, recipientEmail)
+    if (!sent) return res.status(500).json({ error: 'Failed to send email. Check server logs.' })
+
+    const actor = actorFromRequest(req)
+    void recordActivity({
+      action: 'Emailed Invoice',
+      module: 'sales',
+      entity: inv.customer ?? invoiceId,
+      details: `Invoice emailed to ${recipientEmail}`,
+      userId: actor.userId,
+      ip: actor.ip,
+    })
+    res.json({ ok: true, message: 'Invoice emailed successfully', to: recipientEmail })
+  } catch (err) {
+    logger.error({ err }, 'Email invoice failed')
+    res.status(500).json({ error: 'Email invoice failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Invoice PDF Download ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/invoices/:id/pdf', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const { generateInvoicePDF } = await import('../invoicePdf')
+    const pdf = await generateInvoicePDF(routeParam(req.params.id))
+    if (!pdf) return res.status(404).json({ error: 'Invoice not found or PDF generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="invoice-${routeParam(req.params.id)}.pdf"`)
+    res.send(pdf)
+  } catch {
+    res.status(500).json({ error: 'PDF generation failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Credit Note PDF Download (for a sales return) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/credit-notes/:id/pdf', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const { generateCreditNotePDF } = await import('../creditNotePdf')
+    const pdf = await generateCreditNotePDF(routeParam(req.params.id))
+    if (!pdf) return res.status(404).json({ error: 'Credit note not found or PDF generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="credit-note-${routeParam(req.params.id)}.pdf"`)
+    res.send(pdf)
+  } catch {
+    res.status(500).json({ error: 'Credit note PDF generation failed' })
+  }
+})
+
+
+
+// ΓöÇΓöÇΓöÇ Quotation PDF Download ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+dbRouter.get('/quotations/:id/pdf', requirePermission('sales', 'view'), async (req, res) => {
+  try {
+    const { generateQuotationPDF } = await import('../quotationPdf')
+    const pdf = await generateQuotationPDF(routeParam(req.params.id))
+    if (!pdf) return res.status(404).json({ error: 'Quotation not found or PDF generation failed' })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="quotation-${routeParam(req.params.id)}.pdf"`)
+    res.send(pdf)
+  } catch {
+    res.status(500).json({ error: 'Quotation PDF generation failed' })
+  }
+})
+
+// ΓöÇΓöÇΓöÇ Quotations (pre-sale estimates ΓåÆ convert to invoice) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+import { registerQuotationRoutes } from './quotations'
+registerQuotationRoutes(dbRouter)

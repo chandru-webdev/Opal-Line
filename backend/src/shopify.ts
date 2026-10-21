@@ -2377,6 +2377,35 @@ export interface DraftOrderLineInput {
   quantity: number
   price: number | null
   sku?: string
+  /** Shopify ProductVariant id (numeric or gid:// form) when the line was billed against a specific variant. */
+  variantId?: string | number
+}
+
+/** Shopify's GraphQL API wants variant ids in gid form. */
+export function toShopifyVariantGid(variantId: string | number): string {
+  const s = String(variantId).trim()
+  return s.startsWith('gid://') ? s : `gid://shopify/ProductVariant/${s}`
+}
+
+/**
+ * Draft-order line mapping, kept pure so the variant plumbing is testable:
+ * a line with a variantId targets that exact Shopify variant (so multi-variant
+ * products sync the right SKU/price), while flat lines keep the historic
+ * title/sku/price shape.
+ */
+export function buildDraftOrderLineItems(lineItems: DraftOrderLineInput[]): Array<Record<string, unknown>> {
+  return (lineItems ?? [])
+    .filter((li) => li.title && li.quantity > 0)
+    .map((li) => ({
+      ...(li.variantId != null && String(li.variantId).trim() !== ''
+        ? { variantId: toShopifyVariantGid(li.variantId) }
+        : {}),
+      title: li.title,
+      quantity: li.quantity,
+      sku: li.sku || undefined,
+      originalUnitPrice:
+        li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
+    }))
 }
 
 export interface DraftOrderAddressInput {
@@ -2528,15 +2557,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
     }
   }
 
-  const lineItems = (payload.lineItems ?? [])
-    .filter((li) => li.title && li.quantity > 0)
-    .map((li) => ({
-      title: li.title,
-      quantity: li.quantity,
-      sku: li.sku || undefined,
-      originalUnitPrice:
-        li.price != null && Number.isFinite(li.price) && li.price >= 0 ? li.price.toFixed(2) : '0.00',
-    }))
+  const lineItems = buildDraftOrderLineItems(payload.lineItems ?? [])
 
   if (lineItems.length === 0) {
     return { ok: false, errors: ['At least one line item with a quantity is required'] }

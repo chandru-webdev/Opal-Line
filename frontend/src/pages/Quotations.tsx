@@ -29,7 +29,7 @@ import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { AppDialog } from '@/components/ui/app-dialog'
-import { dbApi, backupApi } from '@/lib/api'
+import { dbApi, backupApi, formatApiError } from '@/lib/api'
 import { SalesFollowUpsCard } from '@/components/sales-follow-ups-card'
 import type { AppSettings, Quotation } from '@/types'
 import { formatCurrency, formatDate } from '@/lib/format'
@@ -360,7 +360,7 @@ export default function QuotationsPage() {
       setMessage({ ok: true, text: `${q.number} converted to invoice ${r.invoiceNumber}` })
       load()
     } catch (err) {
-      setMessage({ ok: false, text: err instanceof Error ? err.message : 'Conversion failed' })
+      setMessage({ ok: false, text: formatApiError(err, 'Conversion failed') })
     } finally {
       setConvertingId(null)
     }
@@ -675,7 +675,7 @@ export default function QuotationsPage() {
         <Card className={`border ${message.ok ? 'border-success-200 bg-success-50' : 'border-red-200 bg-red-50'}`}>
           <CardContent className="flex items-center gap-2 p-3 text-sm">
             {message.ok ? <CheckCircle2 className="h-4 w-4 text-success-600" /> : <span className="text-red-600 dark:text-red-400">⚠</span>}
-            <span className={message.ok ? 'text-success-800' : 'text-red-800'}>{message.text}</span>
+            <span className={`${message.ok ? 'text-success-800' : 'text-red-800'} whitespace-pre-line`}>{message.text}</span>
           </CardContent>
         </Card>
       )}
