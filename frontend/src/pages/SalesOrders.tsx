@@ -37,14 +37,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import {
@@ -230,6 +223,8 @@ export default function SalesOrdersPage() {
   const [formError, setFormError] = useState('')
   const [created, setCreated] = useState<CreateResult | null>(null)
   const [editing, setEditing] = useState<SalesOrder | null>(null)
+  // Order-form snapshot as of dialog open, for the unsaved-changes close guard.
+  const [formBaseline, setFormBaseline] = useState('')
 
   const [customerSel, setCustomerSel] = useState('')
   const [customerName, setCustomerName] = useState('')
@@ -750,6 +745,31 @@ export default function SalesOrdersPage() {
     [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
   )
 
+  const snapshotForm = () =>
+    JSON.stringify({
+      customerSel,
+      customerName,
+      customerEmail,
+      customerPhone,
+      billingAddr,
+      shippingAddr,
+      sameAsBilling,
+      orderDate,
+      payment,
+      fulfillment,
+      orderStatus,
+      note,
+      syncToShopify,
+      lineItems,
+    })
+
+  // Capture the freshly reset form each time the dialog opens (create, edit
+  // and duplicate all set the fields right before setDialogOpen(true)).
+  useEffect(() => {
+    if (dialogOpen) setFormBaseline(snapshotForm())
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dialogOpen])
+
   const openDialog = () => {
     setEditing(null)
     setFormError('')
@@ -1126,7 +1146,8 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        size="3xl"
+        size="lg"
+        isDirty={dialogOpen && snapshotForm() !== formBaseline}
         title={editing ? `Edit Order ${editing.shopifyId}` : 'Create Manual Order'}
         description={
           editing
@@ -1137,7 +1158,7 @@ export default function SalesOrdersPage() {
           created ? (
             <Button onClick={() => setDialogOpen(false)}>Done</Button>
           ) : (
-            <>
+            <DialogFooter>
               <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={saving}>Cancel</Button>
               <Button onClick={createOrder} disabled={saving}>
                 {saving ? (
@@ -1156,7 +1177,7 @@ export default function SalesOrdersPage() {
                   'Create Order'
                 )}
               </Button>
-            </>
+            </DialogFooter>
           )
         }
       >
@@ -1485,7 +1506,7 @@ export default function SalesOrdersPage() {
       <AppDialog
         open={viewOrder !== null}
         onOpenChange={(open) => { if (!open) setViewOrder(null) }}
-        size="2xl"
+        size="xl"
         className="print-dialog"
         footerClassName="no-print"
         title={<>Order {viewOrder?.shopifyId ?? ''}</>}
@@ -1629,26 +1650,27 @@ export default function SalesOrdersPage() {
           ) : null}
       </AppDialog>
 
-      <Dialog open={viewDialogOpen} onOpenChange={setViewDialogOpen}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Save current view</DialogTitle>
-            <DialogDescription>
-              Stores the current search and status filter as a one-click chip above the table.
-            </DialogDescription>
-          </DialogHeader>
-          <Input
-            placeholder="View name (e.g. Today's Shopify orders)"
-            value={viewName}
-            onChange={(e) => setViewName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
-          />
+      <AppDialog
+        open={viewDialogOpen}
+        onOpenChange={setViewDialogOpen}
+        size="sm"
+        isDirty={viewDialogOpen && viewName.trim() !== ''}
+        title="Save current view"
+        description="Stores the current search and status filter as a one-click chip above the table."
+        footer={
           <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setViewDialogOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={saveView}>Save view</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        <Input
+          placeholder="View name (e.g. Today's Shopify orders)"
+          value={viewName}
+          onChange={(e) => setViewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
+        />
+      </AppDialog>
 
       <ProductDialog
         open={newProductLineKey !== null}

@@ -17,7 +17,8 @@ import {
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Input } from '@/components/ui/input'
 import { PrintTemplatePicker } from '@/components/print-template-picker'
 import { printDocument, mergePrintConfig, type PrintDoc } from '@/lib/printTemplate'
@@ -511,12 +512,22 @@ export default function InvoiceDetailPage() {
         </div>
       </div>
 
-      <Dialog open={returnOpen} onOpenChange={setReturnOpen}>
-        <DialogContent size="md">
-          <DialogHeader>
-            <DialogTitle>Return items — {invoice.number}</DialogTitle>
-            <DialogDescription>Choose quantities to return. A credit note is generated automatically.</DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={returnOpen}
+        onOpenChange={setReturnOpen}
+        size="md"
+        isDirty={returnOpen && (Object.values(returnQty).some((q) => q > 0) || restock)}
+        title={`Return items — ${invoice.number}`}
+        description="Choose quantities to return. A credit note is generated automatically."
+        footer={
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setReturnOpen(false)}>Cancel</Button>
+            <Button size="sm" onClick={submitReturn} disabled={returning}>
+              {returning ? 'Processing…' : 'Process return & credit note'}
+            </Button>
+          </DialogFooter>
+        }
+      >
           <div className="space-y-2">
             {invoice.items.filter((it) => it.sku).map((it) => (
               <div key={it.sku} className="flex items-center justify-between gap-2 rounded-md border p-2">
@@ -539,14 +550,7 @@ export default function InvoiceDetailPage() {
               Restock returned items into inventory
             </label>
           </div>
-          <DialogFooter>
-            <Button variant="outline" size="sm" onClick={() => setReturnOpen(false)}>Cancel</Button>
-            <Button size="sm" onClick={submitReturn} disabled={returning}>
-              {returning ? 'Processing…' : 'Process return & credit note'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }

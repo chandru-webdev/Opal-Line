@@ -23,14 +23,8 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { DataTable } from '@/components/ui/data-table'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { dbApi } from '@/lib/api'
 import { exportTable } from '@/lib/export'
 import type { InventoryLocation, Product, PurchaseInvoice, PurchaseInvoiceDetail, Supplier } from '@/types'
@@ -115,6 +109,8 @@ export default function PurchaseInvoicesPage() {
   const [formError, setFormError] = useState('')
   const [header, setHeader] = useState({ number: '', supplier: '', date: todayIST(), supplierGstin: '', tcsRate: '0' })
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
+  // Snapshot of the create/edit form as it opened, for the close guard.
+  const [formBaseline, setFormBaseline] = useState('')
 
   const load = useCallback(() => {
     setLoading(true)
@@ -168,9 +164,12 @@ export default function PurchaseInvoicesPage() {
   const openViewById = useCallback((i: PurchaseInvoice) => { void openView(i.id) }, [openView])
 
   const openCreate = () => {
+    const nextHeader = { number: `PI-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(4, '0')}`, supplier: '', date: todayIST(), supplierGstin: '', tcsRate: '0' }
+    const nextLines = [emptyLine()]
     setEditing(null)
-    setHeader({ number: `PI-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(4, '0')}`, supplier: '', date: todayIST(), supplierGstin: '', tcsRate: '0' })
-    setLines([emptyLine()])
+    setHeader(nextHeader)
+    setLines(nextLines)
+    setFormBaseline(JSON.stringify({ header: nextHeader, lines: nextLines }))
     setFormError('')
     setFormOpen(true)
   }
@@ -178,15 +177,14 @@ export default function PurchaseInvoicesPage() {
   const openEdit = useCallback(async (invoice: PurchaseInvoice) => {
     try {
       const detail = await dbApi.getPurchaseInvoiceWithItems(invoice.id)
-      setEditing(detail)
-      setHeader({
+      const nextHeader = {
         number: detail.number,
         supplier: detail.supplier ?? '',
         date: (detail.date ?? '').slice(0, 10) || todayIST(),
         supplierGstin: detail.supplierGstin ?? '',
         tcsRate: String(detail.tcsRate ?? 0),
-      })
-      setLines(
+      }
+      const nextLines =
         detail.lines.length > 0
           ? detail.lines.map((it) => ({
               product: it.product,
@@ -196,8 +194,11 @@ export default function PurchaseInvoicesPage() {
               rate: String(it.rate),
               tax: String(it.tax),
             }))
-          : [emptyLine()],
-      )
+          : [emptyLine()]
+      setEditing(detail)
+      setHeader(nextHeader)
+      setLines(nextLines)
+      setFormBaseline(JSON.stringify({ header: nextHeader, lines: nextLines }))
       setFormError('')
       setFormOpen(true)
     } catch (err) {
@@ -518,15 +519,33 @@ export default function PurchaseInvoicesPage() {
       </Card>
 
       {/* View detail */}
-      <Dialog open={viewInvoice !== null} onOpenChange={(open) => { if (!open) setViewInvoice(null) }}>
-        <DialogContent size="2xl">
-          <DialogHeader>
-            <DialogTitle>Purchase Invoice {viewInvoice?.number}</DialogTitle>
-            <DialogDescription>
-              {viewInvoice ? formatDate(viewInvoice.date) : ''}
-              {viewLoading ? ' · loading…' : ''}
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={viewInvoice !== null}
+        onOpenChange={(open) => { if (!open) setViewInvoice(null) }}
+        size="xl"
+        title={`Purchase Invoice ${viewInvoice?.number ?? ''}`}
+        description={
+          <>
+            {viewInvoice ? formatDate(viewInvoice.date) : ''}
+            {viewLoading ? ' · loading…' : ''}
+          </>
+        }
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
+            {viewInvoice && viewInvoice.status !== 'cancelled' ? (
+              <Button variant="outline" onClick={() => cancelInvoice(viewInvoice)}>
+                <Ban className="h-3.5 w-3.5" /> Cancel Invoice
+              </Button>
+            ) : null}
+            {viewInvoice ? (
+              <Button variant="outline" onClick={() => deleteInvoice(viewInvoice)} className="text-red-600 dark:text-red-400">
+                <Trash2 className="h-3.5 w-3.5" /> Delete
+              </Button>
+            ) : null}
+          </DialogFooter>
+        }
+      >
           {viewInvoice ? (
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
@@ -592,33 +611,30 @@ export default function PurchaseInvoicesPage() {
               </div>
             </div>
           ) : null}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setViewInvoice(null)}>Close</Button>
-            {viewInvoice && viewInvoice.status !== 'cancelled' ? (
-              <Button variant="outline" onClick={() => cancelInvoice(viewInvoice)}>
-                <Ban className="h-3.5 w-3.5" /> Cancel Invoice
-              </Button>
-            ) : null}
-            {viewInvoice ? (
-              <Button variant="outline" onClick={() => deleteInvoice(viewInvoice)} className="text-red-600 dark:text-red-400">
-                <Trash2 className="h-3.5 w-3.5" /> Delete
-              </Button>
-            ) : null}
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
 
       {/* Create / edit */}
-      <Dialog open={formOpen} onOpenChange={(open) => { if (!open) setFormOpen(false) }}>
-        <DialogContent size="3xl">
-          <DialogHeader>
-            <DialogTitle>{editing ? `Edit ${editing.number}` : 'Record Purchase'}</DialogTitle>
-            <DialogDescription>
-              {editing
-                ? 'Changing the lines restocks the difference. Cancelling an invoice takes its stock back out.'
-                : 'Every line adds its quantity to stock. Input GST is split from the supplier GSTIN.'}
-            </DialogDescription>
-          </DialogHeader>
+      <AppDialog
+        open={formOpen}
+        onOpenChange={(open) => { if (!open) setFormOpen(false) }}
+        size="lg"
+        isDirty={formOpen && JSON.stringify({ header, lines }) !== formBaseline}
+        title={editing ? `Edit ${editing.number}` : 'Record Purchase'}
+        description={
+          editing
+            ? 'Changing the lines restocks the difference. Cancelling an invoice takes its stock back out.'
+            : 'Every line adds its quantity to stock. Input GST is split from the supplier GSTIN.'
+        }
+        footer={
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
+            <Button onClick={submit} disabled={saving}>
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {editing ? 'Save changes' : 'Record purchase'}
+            </Button>
+          </DialogFooter>
+        }
+      >
 
           <div className="space-y-4">
             <div className="grid gap-3 sm:grid-cols-2">
@@ -793,16 +809,7 @@ export default function PurchaseInvoicesPage() {
 
             {formError ? <p className="text-sm text-red-600 dark:text-red-400">{formError}</p> : null}
           </div>
-
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setFormOpen(false)}>Cancel</Button>
-            <Button onClick={submit} disabled={saving}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-              {editing ? 'Save changes' : 'Record purchase'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </AppDialog>
     </div>
   )
 }
