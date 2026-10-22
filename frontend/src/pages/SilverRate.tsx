@@ -28,14 +28,8 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
+import { AppDialog } from '@/components/ui/app-dialog'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { dbApi, shopifyApi } from '@/lib/api'
 import { useSilverRate } from '@/lib/silver-rate-context'
@@ -700,16 +694,24 @@ export default function SilverRatePage() {
           </CardContent>
         </Card>
 
-        <Dialog open={scheduleOpen} onOpenChange={setScheduleOpen}>
-          <DialogContent size="md">
-            <DialogHeader>
-              <DialogTitle>Silver rate update schedule</DialogTitle>
-              <DialogDescription>
-                Choose the days and the time (IST) the automatic silver-rate update runs. Weekend days are
-                allowed — note that MCX is closed on Saturdays and Sundays, so on those days the fetch may
-                return the last traded rate or fail; manual entry stays available on this page.
-              </DialogDescription>
-            </DialogHeader>
+        <AppDialog
+          open={scheduleOpen}
+          onOpenChange={setScheduleOpen}
+          size="md"
+          isDirty={scheduleOpen}
+          title="Silver rate update schedule"
+          description="Choose the days and the time (IST) the automatic silver-rate update runs. Weekend days are allowed — note that MCX is closed on Saturdays and Sundays, so on those days the fetch may return the last traded rate or fail; manual entry stays available on this page."
+          footer={
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => setScheduleOpen(false)}>
+                Cancel
+              </Button>
+              <Button size="sm" onClick={saveSchedule} disabled={savingSchedule || schedDays.length === 0}>
+                {savingSchedule ? 'Saving…' : 'Save schedule'}
+              </Button>
+            </DialogFooter>
+          }
+        >
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label>Run on days</Label>
@@ -754,32 +756,54 @@ export default function SilverRatePage() {
                 Currently active: {autoStatus?.schedule ? describeRateSchedule(autoStatus.schedule) : '—'}
               </p>
             </div>
-            <DialogFooter>
-              <Button variant="outline" size="sm" onClick={() => setScheduleOpen(false)}>
-                Cancel
-              </Button>
-              <Button size="sm" onClick={saveSchedule} disabled={savingSchedule || schedDays.length === 0}>
-                {savingSchedule ? 'Saving…' : 'Save schedule'}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        </AppDialog>
 
-        <Dialog
+        <AppDialog
           open={schOpen}
           onOpenChange={(next) => {
             setSchOpen(next)
             if (!next) setSchError('')
           }}
+          size="lg"
+          isDirty={schOpen && (schRate !== '' || schDate !== '' || schTime !== '' || schNote !== '')}
+          title={schEditId ? 'Edit scheduled rate change' : 'Schedule a silver rate change'}
+          description="Set the rate and the exact date & time to apply it — like pressing “Approve & Update Shopify” at that moment, automatically."
+          footer={
+            <DialogFooter className="mt-2">
+              {schError ? (
+                <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{schError}</span>
+                </div>
+              ) : null}
+              <Button variant="outline" onClick={() => setSchOpen(false)}>
+                Cancel
+              </Button>
+              {schStep > 0 ? (
+                <Button variant="outline" onClick={() => setSchStep((s) => s - 1)}>
+                  Back
+                </Button>
+              ) : null}
+              {schStep < 2 ? (
+                <Button onClick={schStep === 0 ? goNextFromRate : goNextFromWhen}>
+                  {schStep === 0 ? 'Next: when' : 'Next: preview'} <ArrowRight className="h-4 w-4" />
+                </Button>
+              ) : (
+                <Button variant="success" onClick={submitSchedule} disabled={schSaving}>
+                  {schSaving ? (
+                    'Saving…'
+                  ) : schEditId ? (
+                    'Save changes'
+                  ) : (
+                    <>
+                      <CalendarClock className="h-4 w-4" /> Schedule change
+                    </>
+                  )}
+                </Button>
+              )}
+            </DialogFooter>
+          }
         >
-          <DialogContent size="2xl">
-            <DialogHeader>
-              <DialogTitle>{schEditId ? 'Edit scheduled rate change' : 'Schedule a silver rate change'}</DialogTitle>
-              <DialogDescription>
-                Set the rate and the exact date &amp; time to apply it — like pressing “Approve &amp; Update
-                Shopify” at that moment, automatically.
-              </DialogDescription>
-            </DialogHeader>
 
             <ScheduleStepper step={schStep} />
 
@@ -984,42 +1008,7 @@ export default function SilverRatePage() {
                 ) : null}
               </div>
             )}
-
-            <DialogFooter className="mt-2">
-              {schError ? (
-                <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>{schError}</span>
-                </div>
-              ) : null}
-              <Button variant="outline" onClick={() => setSchOpen(false)}>
-                Cancel
-              </Button>
-              {schStep > 0 ? (
-                <Button variant="outline" onClick={() => setSchStep((s) => s - 1)}>
-                  Back
-                </Button>
-              ) : null}
-              {schStep < 2 ? (
-                <Button onClick={schStep === 0 ? goNextFromRate : goNextFromWhen}>
-                  {schStep === 0 ? 'Next: when' : 'Next: preview'} <ArrowRight className="h-4 w-4" />
-                </Button>
-              ) : (
-                <Button variant="success" onClick={submitSchedule} disabled={schSaving}>
-                  {schSaving ? (
-                    'Saving…'
-                  ) : schEditId ? (
-                    'Save changes'
-                  ) : (
-                    <>
-                      <CalendarClock className="h-4 w-4" /> Schedule change
-                    </>
-                  )}
-                </Button>
-              )}
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        </AppDialog>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -1148,14 +1137,49 @@ export default function SilverRatePage() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent size="3xl">
-          <DialogHeader>
-            <DialogTitle>Update Silver Rate</DialogTitle>
-            <DialogDescription>
-              Set the new 92.5% silver rate. All product prices will be recomputed and previewed before syncing to Shopify.
-            </DialogDescription>
-          </DialogHeader>
+        <AppDialog
+          open={dialogOpen}
+          onOpenChange={setDialogOpen}
+          size="xl"
+          isDirty={dialogOpen && newRate !== ''}
+          title="Update Silver Rate"
+          description="Set the new 92.5% silver rate. All product prices will be recomputed and previewed before syncing to Shopify."
+          footer={
+            step < 3 ? (
+              <DialogFooter className="mt-2">
+                {error ? (
+                  <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{error}</span>
+                  </div>
+                ) : null}
+                {step === 1 ? (
+                  <>
+                    <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+                    <Button onClick={confirmChange} disabled={!rateValid}>
+                      Preview Changes <ArrowRight className="h-4 w-4" />
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
+                    <Button variant="success" onClick={approve} disabled={processing}>
+                      {processing ? (
+                        <>
+                          <RefreshCw className="h-4 w-4 animate-spin" /> Updating Shopify...
+                        </>
+                      ) : (
+                        <>
+                          <ShieldCheck className="h-4 w-4" /> Approve & Update Shopify
+                        </>
+                      )}
+                    </Button>
+                  </>
+                )}
+              </DialogFooter>
+            ) : null
+          }
+        >
 
           {step < 3 ? (
             <>
@@ -1282,37 +1306,6 @@ export default function SilverRatePage() {
                 </div>
               )}
 
-              <DialogFooter className="mt-2">
-                {error ? (
-                  <div className="mb-2 flex w-full items-start gap-2 rounded-md border border-red-200 bg-red-50/60 p-2.5 text-xs text-red-700">
-                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{error}</span>
-                  </div>
-                ) : null}
-                {step === 1 ? (
-                  <>
-                    <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
-                    <Button onClick={confirmChange} disabled={!rateValid}>
-                      Preview Changes <ArrowRight className="h-4 w-4" />
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <Button variant="outline" onClick={() => setStep(1)}>Back</Button>
-                    <Button variant="success" onClick={approve} disabled={processing}>
-                      {processing ? (
-                        <>
-                          <RefreshCw className="h-4 w-4 animate-spin" /> Updating Shopify...
-                        </>
-                      ) : (
-                        <>
-                          <ShieldCheck className="h-4 w-4" /> Approve & Update Shopify
-                        </>
-                      )}
-                    </Button>
-                  </>
-                )}
-              </DialogFooter>
             </>
           ) : (
             <div className="flex flex-col items-center gap-3 py-6 text-center">
@@ -1381,8 +1374,7 @@ export default function SilverRatePage() {
               </Button>
             </div>
           )}
-        </DialogContent>
-      </Dialog>
+        </AppDialog>
     </div>
   )
 }
