@@ -37,14 +37,7 @@ import { Badge } from '@/components/ui/badge'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { DialogFooter } from '@/components/ui/dialog'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { DataTable } from '@/components/ui/data-table'
 import {
@@ -1508,26 +1501,27 @@ export default function SalesOrdersPage() {
           ) : null}
       </AppDialog>
 
-      <Dialog open={viewDialogOpen} onOpenChange={setViewDialogOpen}>
-        <DialogContent size="sm">
-          <DialogHeader>
-            <DialogTitle>Save current view</DialogTitle>
-            <DialogDescription>
-              Stores the current search and status filter as a one-click chip above the table.
-            </DialogDescription>
-          </DialogHeader>
-          <Input
-            placeholder="View name (e.g. Today's Shopify orders)"
-            value={viewName}
-            onChange={(e) => setViewName(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
-          />
+      <AppDialog
+        open={viewDialogOpen}
+        onOpenChange={setViewDialogOpen}
+        size="sm"
+        isDirty={viewDialogOpen && viewName.trim() !== ''}
+        title="Save current view"
+        description="Stores the current search and status filter as a one-click chip above the table."
+        footer={
           <DialogFooter>
             <Button variant="outline" size="sm" onClick={() => setViewDialogOpen(false)}>Cancel</Button>
             <Button size="sm" onClick={saveView}>Save view</Button>
           </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        }
+      >
+        <Input
+          placeholder="View name (e.g. Today's Shopify orders)"
+          value={viewName}
+          onChange={(e) => setViewName(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') saveView() }}
+        />
+      </AppDialog>
 
       <ProductDialog
         open={newProductLineKey !== null}
