@@ -844,7 +844,7 @@ const [kpis, setKpis] = useState<KpiCardData[]>([])
                 <p className="mt-0.5 text-[11px] text-muted-foreground">Latest invoice, payment and sync events</p>
               </CardHeader>
               <CardContent className="p-0">
-                <div className="relative px-5 pb-5">
+                <div className="relative h-[400px] overflow-y-auto px-5 pb-5">
                   {activities.length === 0 ? (
                     <EmptyState
                       icon={Repeat}
