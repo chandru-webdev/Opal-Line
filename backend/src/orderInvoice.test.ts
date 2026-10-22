@@ -123,8 +123,8 @@ test(
       // Silver rate is the ACTUAL authoritative rate from Silver Rate Management (62)
       // ERP subtotal = 25g × 62 = 1550 (vs Shopify billed 2000)
       // Difference (1550 - 2000 = -450) does not increase discount (negative adjustment)
-      const expectedRate = 62
-      assert.equal(Number(ring.silverRate), 62, 'ring uses actual Silver Rate Management rate')
+      const _expectedRate = 62
+      assert.equal(Number(ring.silverRate), _expectedRate, 'ring uses actual Silver Rate Management rate')
       assert.equal(Number(chain.silverRate), 0, 'unknown SKU keeps weight 0, silver rate is 0')
       // Silver value = weight × actual rate = 25 × 62 = 1550
       assert.equal(Number(ring.silverRate) * Number(ring.weight), 1550, 'ring silver value = weight × actual rate')

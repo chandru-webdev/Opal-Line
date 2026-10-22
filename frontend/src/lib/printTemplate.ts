@@ -558,13 +558,14 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
       const imgCell = extras.showImages && imgSrc
         ? `<td style="padding:6px 8px;${cellBorder}width:56px;"><img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/></td>`
         : ''
+      const lineMakingValue = (Number(i.weight) || 0) * (Number(i.makingCharge) || 0)
       return `<tr style="${zebra(idx)}">
           ${imgCell}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
           ${c.showHsn ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
           ${c.showWeight ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
-          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.makingCharge)}</td>` : ''}
+          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(lineMakingValue)}</td>` : ''}
           ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(Number(i.amount) || 0)}</td>
         </tr>`
@@ -577,7 +578,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
     `<th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
-    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making (₹)</th>` : '') +
+    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
     (c.showTax ? `<th style="text-align:right;">GST</th>` : '') +
     `<th style="text-align:right;">Amount (₹)</th>`
   const footSpans =

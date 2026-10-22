@@ -295,27 +295,30 @@ export default function InvoiceDetailPage() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {invoice.items.map((item, i) => (
-                    <TableRow key={i}>
-                      <TableCell>
-                        <div className="flex items-center gap-2.5">
-                          <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
-                            <FileText className="h-3.5 w-3.5" />
+                  {invoice.items.map((item, i) => {
+                    const lineMakingValue = item.weight * item.makingCharge
+                    return (
+                      <TableRow key={i}>
+                        <TableCell>
+                          <div className="flex items-center gap-2.5">
+                            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300">
+                              <FileText className="h-3.5 w-3.5" />
+                            </div>
+                            <div>
+                              <p className="font-medium text-foreground">{item.product}</p>
+                              <p className="text-[10.5px] text-muted-foreground">{item.sku}</p>
+                            </div>
                           </div>
-                          <div>
-                            <p className="font-medium text-foreground">{item.product}</p>
-                            <p className="text-[10.5px] text-muted-foreground">{item.sku}</p>
-                          </div>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">{item.qty}</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.weight.toFixed(2)} gm</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.silverRate > 0 ? `₹${item.silverRate.toFixed(2)}/g` : '—'}</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.makingCharge > 0 ? formatCurrency(item.makingCharge) : '—'}</TableCell>
-                      <TableCell className="text-right tabular-nums text-muted-foreground">{item.tax > 0 ? formatCurrency(item.tax) : '—'}</TableCell>
-                      <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(item.amount)}</TableCell>
-                    </TableRow>
-                  ))}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">{item.qty}</TableCell>
+                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.weight.toFixed(2)} gm</TableCell>
+                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.silverRate > 0 ? `₹${item.silverRate.toFixed(2)}/g` : '—'}</TableCell>
+                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.makingCharge > 0 ? `${formatCurrency(item.makingCharge)}/g = ${formatCurrency(lineMakingValue)}` : '—'}</TableCell>
+                        <TableCell className="text-right tabular-nums text-muted-foreground">{item.tax > 0 ? formatCurrency(item.tax) : '—'}</TableCell>
+                        <TableCell className="text-right font-semibold tabular-nums text-foreground">{formatCurrency(item.amount)}</TableCell>
+                      </TableRow>
+                    )
+                  })}
                 </TableBody>
               </Table>
               <div className="flex justify-end gap-4 border-t bg-muted/30 px-5 py-3 text-xs text-muted-foreground">

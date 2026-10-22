@@ -68,7 +68,19 @@ export interface OrderEmailData {
     phone?: string
   } | null
   total: number
-  items: Array<{ title: string; sku: string; quantity: number; price: number }>
+  items: Array<{
+    title: string
+    sku: string
+    quantity: number
+    price: number
+    // ERP pricing fields (for manual orders)
+    weight?: number
+    silverRate?: number
+    makingCharge?: number
+    silverValue?: number
+    makingValue?: number
+    amount?: number
+  }>
   paymentMethod: string
   date: string
 }
@@ -773,6 +785,9 @@ export async function createInvoiceForOrderRow(
   const lineItems = Array.isArray(order.lineItems) ? (order.lineItems as OrderEmailData['items']) : []
   if (lineItems.length === 0) return null
 
+  // Detect manual orders (created via ERP, not imported from Shopify)
+  const isManualOrder = (order.tags ?? '').includes('manual-order') || !(order.shopifyId ?? '').startsWith('#')
+
   // Settings: gst rate + invoice prefix
   const [settingsRow] = await db.select().from(schema.settings).where(eq(schema.settings.id, 'app')).limit(1)
   const gstRate = Number(settingsRow?.gstRate ?? 3)
@@ -806,55 +821,113 @@ export async function createInvoiceForOrderRow(
     ])
   )
 
-  // For Shopify orders: the customer has already paid a specific price (Shopify price).
-  // The invoice is a tax document for that transaction. The component breakdown MUST use
-  // the actual Silver Rate Management rate. If the ERP-calculated subtotal differs from
-  // the Shopify billed amount, the difference is reflected as a discount/adjustment.
-  // This ensures the displayed rate equals the actual Silver Rate Management rate.
-  const items = lineItems.map((li) => {
-    const qty = Number(li.quantity ?? 0)
-    const price = Number(li.price ?? 0)
-    const amount = Math.round(price * qty * 100) / 100
-    // Product snapshot: net weight, making charge from catalogue.
-    // Silver rate comes from Silver Rate Management (authoritative source).
-    const product = productMap[String(li.sku ?? '')] ?? { netWeight: 0, makingCharge: 0 }
-    const weight = product.netWeight > 0 ? Math.round(product.netWeight * qty * 1000) / 1000 : 0
-    // Silver rate is the actual rate for items with weight > 0, 0 for zero-weight items
-    const itemSilverRate = weight > 0 ? silverRate : 0
-    return {
-      product: String(li.title ?? '').trim(),
-      sku: String(li.sku ?? ''),
-      qty,
-      weight,
-      silverRate: itemSilverRate,  // Actual Silver Rate Management rate (0 for zero-weight items)
-      makingCharge: product.makingCharge,
-      tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
-      amount,      // Shopify billed amount per line
-    }
-  })
-  const shopifySubtotal = Math.round(items.reduce((a, it) => a + it.amount, 0) * 100) / 100
+  let items: Array<{
+    product: string
+    sku: string
+    qty: number
+    weight: number
+    silverRate: number
+    makingCharge: number
+    tax: number
+    amount: number
+    silverValue?: number
+    makingValue?: number
+  }>
+  let shopifySubtotal: number
+  let erpSilverValue: number
+  let erpMakingCharge: number
+  let erpSubtotal: number
+  let silverValue: number
+  let makingCharge: number
+  let subtotal: number
+  let effectiveDiscount: number
+  let gstAmount: number
+  let grandTotal: number
   const discount = Number(order.discount ?? 0)
 
-  // ERP-calculated components using ACTUAL Silver Rate Management rate
-  const erpSilverValue = Math.round(items.reduce((a, it) => a + it.weight * it.silverRate, 0) * 100) / 100
-  const erpMakingCharge = Math.round(items.reduce((a, it) => a + it.makingCharge * it.weight, 0) * 100) / 100
-  const erpSubtotal = round2(erpSilverValue + erpMakingCharge)
+  if (isManualOrder) {
+    // Manual orders: lineItems already contain ERP components (silverValue, makingValue, amount as subtotal, weight, silverRate, makingCharge)
+    // Use them directly to ensure invoice totals match order totals exactly.
+    items = lineItems.map((li) => {
+      const qty = Number(li.quantity ?? 0)
+      const weight = Number(li.weight ?? 0)
+      const itemSilverRate = Number(li.silverRate ?? 0)
+      const itemMakingCharge = Number(li.makingCharge ?? 0)
+      const silverValue = Number(li.silverValue ?? (weight > 0 ? round2(weight * itemSilverRate) : 0))
+      const makingValue = Number(li.makingValue ?? (weight > 0 ? round2(weight * itemMakingCharge) : 0))
+      const amount = Number(li.amount ?? round2(silverValue + makingValue))
+      return {
+        product: String(li.title ?? '').trim(),
+        sku: String(li.sku ?? ''),
+        qty,
+        weight,
+        silverRate: itemSilverRate,
+        makingCharge: itemMakingCharge,
+        tax: round2((amount * gstRate) / 100),
+        amount,      // Line subtotal (ex-GST)
+        silverValue,
+        makingValue,
+      }
+    })
+    shopifySubtotal = round2(items.reduce((a, it) => a + it.amount, 0))
+    // For manual orders, ERP components come directly from stored line items
+    erpSilverValue = round2(items.reduce((a, it) => a + (it.silverValue ?? 0), 0))
+    erpMakingCharge = round2(items.reduce((a, it) => a + (it.makingValue ?? 0), 0))
+    erpSubtotal = round2(erpSilverValue + erpMakingCharge)
+    // No adjustment needed for manual orders - they were priced using the same rate
+    effectiveDiscount = discount
+    subtotal = erpSubtotal
+    const totals = invoiceTotals(subtotal, gstRate, effectiveDiscount)
+    gstAmount = totals.gstAmount
+    grandTotal = totals.grandTotal
+    silverValue = erpSilverValue
+    makingCharge = erpMakingCharge
+  } else {
+    // Shopify orders: the customer has already paid a specific price (Shopify price).
+    // The invoice is a tax document for that transaction. The component breakdown MUST use
+    // the actual Silver Rate Management rate. If the ERP-calculated subtotal differs from
+    // the Shopify billed amount, the difference is reflected as a discount/adjustment.
+    // This ensures the displayed rate equals the actual Silver Rate Management rate.
+    items = lineItems.map((li) => {
+      const qty = Number(li.quantity ?? 0)
+      const price = Number(li.price ?? 0)
+      const amount = Math.round(price * qty * 100) / 100
+      // Product snapshot: net weight, making charge from catalogue.
+      // Silver rate comes from Silver Rate Management (authoritative source).
+      const product = productMap[String(li.sku ?? '')] ?? { netWeight: 0, makingCharge: 0 }
+      const weight = product.netWeight > 0 ? Math.round(product.netWeight * qty * 1000) / 1000 : 0
+      // Silver rate is the actual rate for items with weight > 0, 0 for zero-weight items
+      const itemSilverRate = weight > 0 ? silverRate : 0
+      return {
+        product: String(li.title ?? '').trim(),
+        sku: String(li.sku ?? ''),
+        qty,
+        weight,
+        silverRate: itemSilverRate,  // Actual Silver Rate Management rate (0 for zero-weight items)
+        makingCharge: product.makingCharge,
+        tax: Math.round(((amount * gstRate) / 100) * 100) / 100,
+        amount,      // Shopify billed amount per line
+      }
+    })
+    shopifySubtotal = Math.round(items.reduce((a, it) => a + it.amount, 0) * 100) / 100
 
-  // If ERP subtotal differs from Shopify billed amount, the difference is a discount/adjustment.
-  // The invoice subtotal for tax purposes is the ERP subtotal.
-  const adjustment = round2(erpSubtotal - shopifySubtotal)
-  const effectiveDiscount = discount + (adjustment > 0 ? adjustment : 0)
-  const subtotal = erpSubtotal
-  const { gstAmount, grandTotal } = invoiceTotals(subtotal, gstRate, effectiveDiscount)
+    // ERP-calculated components using ACTUAL Silver Rate Management rate
+    erpSilverValue = Math.round(items.reduce((a, it) => a + it.weight * it.silverRate, 0) * 100) / 100
+    erpMakingCharge = Math.round(items.reduce((a, it) => a + it.makingCharge * it.weight, 0) * 100) / 100
+    erpSubtotal = round2(erpSilverValue + erpMakingCharge)
 
-  // Header totals use ERP-calculated components (no scaling)
-  const silverValue = erpSilverValue
-  const makingCharge = erpMakingCharge
+    // If ERP subtotal differs from Shopify billed amount, the difference is a discount/adjustment.
+    // The invoice subtotal for tax purposes is the ERP subtotal.
+    const adjustment = round2(erpSubtotal - shopifySubtotal)
+    effectiveDiscount = discount + (adjustment > 0 ? adjustment : 0)
+    subtotal = erpSubtotal
+    const totals = invoiceTotals(subtotal, gstRate, effectiveDiscount)
+    gstAmount = totals.gstAmount
+    grandTotal = totals.grandTotal
 
-  // Store Shopify billed amounts per line for reference, but components use actual rate
-  for (const it of items) {
-    // silverRate already set to actual Silver Rate Management rate
-    // Shopify billed amount preserved in 'amount' field
+    // Header totals use ERP-calculated components (no scaling)
+    silverValue = erpSilverValue
+    makingCharge = erpMakingCharge
   }
 
   // Customer snapshot: customer record first, then the order's addresses
