@@ -227,6 +227,138 @@ export async function levelAt(client: Client, productId: string, locationId: str
   return Math.floor(num(row?.qty))
 }
 
+/** One product that could not be fulfilled with the stock on hand. */
+export interface InsufficientStockDetail {
+  sku: string
+  name: string
+  available: number
+  requested: number
+}
+
+/**
+ * Thrown when an invoice (or any stock-deducting document) asks for more of a
+ * product than the ledger shows on hand.
+ *
+ * Carries per-product detail so the API can hand the UI a list to highlight
+ * rather than a single opaque string. The `message` follows the required
+ * wording ("Insufficient Stock — Available: X, Requested: Y.") for the common
+ * single-product case and a compact summary when several lines are short.
+ */
+export class InsufficientStockError extends Error {
+  readonly code = 'INSUFFICIENT_STOCK'
+  readonly products: InsufficientStockDetail[]
+
+  constructor(products: InsufficientStockDetail[]) {
+    const first = products[0]
+    const message =
+      products.length === 1 && first
+        ? `Insufficient Stock — Available: ${first.available}, Requested: ${first.requested}.`
+        : `Insufficient Stock — ${products.length} products exceed available stock.`
+    super(message)
+    this.name = 'InsufficientStockError'
+    this.products = products
+  }
+}
+
+export interface StockCheckItem {
+  sku: string
+  qty: number
+  /** Display name for the error payload; falls back to the SKU. */
+  name?: string
+}
+
+function roundDetailName(name: unknown, sku: string): string {
+  const value = String(name ?? '').trim()
+  return value || sku
+}
+
+/**
+ * Availability snapshot for one SKU, on a caller-supplied client so it can see
+ * an in-flight transaction's own writes.
+ *
+ * With no location this is the global rollup (products.stock); with a location
+ * it is that branch's balance. It reads the SAME ledger that applyStockMovement
+ * writes, so local and Shopify-synced stock are never counted twice — a Shopify
+ * pull lands in this ledger as a `shopify_sync` movement, not alongside it.
+ */
+export async function availableFor(
+  client: Client,
+  sku: string,
+  locationId?: string | null,
+): Promise<number> {
+  const value = String(sku ?? '').trim()
+  if (!value || !client) return 0
+  const [row] = await client
+    .select({ id: schema.products.id, stock: schema.products.stock })
+    .from(schema.products)
+    .where(eq(schema.products.sku, value))
+    .limit(1)
+  if (!row) return 0
+  if (!locationId) return Math.floor(num(row.stock))
+  return levelAt(client, row.id, locationId)
+}
+
+/**
+ * Blocks a document that would drive any product's stock negative.
+ *
+ * Aggregates the requested quantity per SKU first, so an invoice with two lines
+ * of the same product is checked against their combined demand rather than each
+ * line passing on its own. Products are locked (`FOR UPDATE`) in SKU order
+ * before the comparison, which serialises two concurrent invoices on the same
+ * SKU so neither can read the other's pre-deduction balance and oversell.
+ *
+ * Must be called inside the same transaction that will write the document and
+ * deduct the stock, so a rejection rolls the whole thing back and nothing is
+ * saved.
+ */
+export async function assertStockAvailable(
+  client: Client,
+  items: StockCheckItem[],
+  opts: { locationId?: string | null } = {},
+): Promise<void> {
+  if (!client) return
+  const locationId = opts.locationId ?? null
+
+  // Aggregate duplicate line items: two rows of SKU X demand qty twice.
+  const demand = new Map<string, { sku: string; name: string; requested: number }>()
+  for (const it of items) {
+    const sku = String(it.sku ?? '').trim()
+    const qty = Math.floor(num(it.qty))
+    if (!sku || qty <= 0) continue
+    const key = sku.toLowerCase()
+    const existing = demand.get(key)
+    if (existing) {
+      existing.requested += qty
+      if (!existing.name && it.name) existing.name = roundDetailName(it.name, sku)
+    } else {
+      demand.set(key, { sku, name: roundDetailName(it.name, sku), requested: qty })
+    }
+  }
+  if (demand.size === 0) return
+
+  // Deterministic lock order avoids deadlocks between concurrent invoices that
+  // touch the same set of products in different item order.
+  const ordered = [...demand.values()].sort((a, b) => a.sku.localeCompare(b.sku))
+  const short: InsufficientStockDetail[] = []
+
+  for (const entry of ordered) {
+    const [row] = await client
+      .select({ id: schema.products.id, stock: schema.products.stock })
+      .from(schema.products)
+      .where(eq(schema.products.sku, entry.sku))
+      .limit(1)
+      .for('update')
+    // Unknown SKU: nothing to deduct (applyStockDelta / applyStockMovement both
+    // no-op on an unknown SKU), so it cannot oversell.
+    if (!row) continue
+    const available = locationId ? await levelAt(client, row.id, locationId) : Math.floor(num(row.stock))
+    if (entry.requested <= available) continue
+    short.push({ sku: entry.sku, name: entry.name, available, requested: entry.requested })
+  }
+
+  if (short.length > 0) throw new InsufficientStockError(short)
+}
+
 /**
  * Applies one stock movement.
  *

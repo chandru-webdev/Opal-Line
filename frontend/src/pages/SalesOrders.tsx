@@ -48,10 +48,18 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { dbApi, shopifyApi, printTemplatesApi } from '@/lib/api'
+import { dbApi, shopifyApi, printTemplatesApi, formatApiError } from '@/lib/api'
+import { computeLineStockErrors, stockErrorsFromApiError } from '@/lib/orderStock'
+import {
+  findVariantById,
+  matchProductByCode,
+  productVariants,
+  variantLabel,
+  variantOptions,
+} from '@/lib/productVariants'
 import { printDocument, printDocuments, mergePrintConfig, DEFAULT_PRINT_CONFIG, type PrintDoc, type PrintDesignerConfig } from '@/lib/printTemplate'
 import { exportTable } from '@/lib/export'
-import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, SalesOrder } from '@/types'
+import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, ProductVariant, SalesOrder } from '@/types'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
 
@@ -99,6 +107,8 @@ function getFulfillmentMeta(val: string) {
 interface OrderLineItem {
   key: string
   productId: string
+  /** Selected variant, when the product has variants. */
+  variantId?: string | null
   title: string
   sku: string
   qty: number
@@ -249,6 +259,10 @@ export default function SalesOrdersPage() {
   const [note, setNote] = useState('')
   const [syncToShopify, setSyncToShopify] = useState(true)
   const [lineItems, setLineItems] = useState<OrderLineItem[]>([emptyLine()])
+  // Stock shortfalls reported by the order endpoints, keyed by line key. The
+  // live per-line check below handles the common case; this holds the
+  // server's authoritative per-location answer until the line is edited.
+  const [serverStockErrors, setServerStockErrors] = useState<Record<string, string>>({})
   const [barcodeInput, setBarcodeInput] = useState('')
   const [scanFeedback, setScanFeedback] = useState<{ ok: boolean; text: string } | null>(null)
 
@@ -441,7 +455,7 @@ export default function SalesOrdersPage() {
         setOrders((prev) => prev.map((x) => (x.id === o.id ? { ...x, invoice: result.invoiceNumber! } : x)))
         navigate(`/sales/invoices?highlight=${encodeURIComponent(result.invoiceNumber)}`)
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Could not create invoice')
+        toast.error(formatApiError(err, 'Could not create invoice'))
       } finally {
         setInvoiceSavingId(null)
       }
@@ -527,6 +541,7 @@ export default function SalesOrdersPage() {
   const startEdit = useCallback((o: SalesOrder) => {
     setEditing(o)
     setFormError('')
+    setServerStockErrors({})
     setCreated(null)
     const c = customers.find((x) => x.name === o.customer)
     setCustomerSel(c ? c.name : '__new__')
@@ -554,6 +569,7 @@ export default function SalesOrdersPage() {
   const duplicateOrder = useCallback((o: SalesOrder) => {
     setEditing(null)
     setFormError('')
+    setServerStockErrors({})
     setCreated(null)
     const c = customers.find((x) => x.name === o.customer)
     setCustomerSel(c ? c.name : '__new__')
@@ -757,6 +773,7 @@ export default function SalesOrdersPage() {
   const openDialog = () => {
     setEditing(null)
     setFormError('')
+    setServerStockErrors({})
     setCreated(null)
     setCustomerSel('')
     setCustomerName('')
@@ -780,52 +797,130 @@ export default function SalesOrdersPage() {
     [lineItems],
   )
 
+  // Live stock check per line: mirrors the order endpoints' per-line
+  // validation against the catalog already loaded, so an over-quantity shows
+  // under its own Qty field the moment it is typed. Variant lines carry the
+  // variant's own stock; flat lines fall back to the product rollup.
+  const stockByProductId = useMemo(() => new Map(products.map((p) => [p.id, p.stock])), [products])
+  const variantById = useMemo(() => {
+    const m = new Map<string, ProductVariant>()
+    for (const p of products) for (const v of productVariants(p)) m.set(v.id, v)
+    return m
+  }, [products])
+  const variantCountByProductId = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const p of products) {
+      const n = productVariants(p).length
+      if (n > 0) m.set(p.id, n)
+    }
+    return m
+  }, [products])
+  const stockCheckLines = useMemo(
+    () =>
+      lineItems.map((li) => ({
+        ...li,
+        stock: li.variantId ? (variantById.get(li.variantId)?.stock ?? undefined) : undefined,
+      })),
+    [lineItems, variantById],
+  )
+  const lineStockErrors = useMemo(() => {
+    const merged: Record<string, string> = { ...serverStockErrors }
+    for (const [key, msg] of Object.entries(computeLineStockErrors(stockCheckLines, stockByProductId))) {
+      merged[key] = msg
+    }
+    return merged
+  }, [stockCheckLines, stockByProductId, serverStockErrors])
+
+  const clearServerStockError = (key: string) => {
+    setServerStockErrors((prev) => {
+      if (!(key in prev)) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+  }
+
   const selectProduct = (key: string, productId: string) => {
     const p = products.find((x) => x.id === productId)
+    clearServerStockError(key)
+    // Multi-variant products open on their first variant so the line is
+    // immediately billable; the Variant dropdown swaps it. Flat products keep
+    // the plain product values, exactly as before.
+    const first = p ? (productVariants(p)[0] ?? null) : null
     setLineItems((prev) =>
-      prev.map((li) =>
-        li.key === key
+      prev.map((li) => {
+        if (li.key !== key) return li
+        return {
+          ...li,
+          productId,
+          variantId: first?.id ?? null,
+          title: first && p ? `${p.name} — ${variantLabel(first)}` : (p?.name ?? li.title),
+          sku: first ? first.sku : (p?.sku ?? li.sku),
+          price: first?.sellingPrice ?? p?.sellingPrice ?? li.price,
+        }
+      }),
+    )
+  }
+
+  // Swap the variant on a line of a multi-variant product: its SKU, price and
+  // (via variantById) stock all follow the selection.
+  const selectVariant = (key: string, variantId: string) => {
+    const li = lineItems.find((x) => x.key === key)
+    const p = products.find((x) => x.id === (li?.productId ?? ''))
+    const v = findVariantById(p ?? null, variantId)
+    if (!p || !v) return
+    clearServerStockError(key)
+    setLineItems((prev) =>
+      prev.map((row) =>
+        row.key === key
           ? {
-              ...li,
-              productId,
-              title: p?.name ?? li.title,
-              sku: p?.sku ?? li.sku,
-              price: p?.sellingPrice ?? li.price,
+              ...row,
+              variantId: v.id,
+              title: `${p.name} — ${variantLabel(v)}`,
+              sku: v.sku,
+              price: v.sellingPrice ?? row.price,
             }
-          : li,
+          : row,
       ),
     )
   }
 
   // Barcode scan: scanners type the code and press Enter instantly, so a plain
-  // input with an Enter handler works. Matches barcode first, then SKU (exact,
-  // case-insensitive). Re-scanning the same item bumps its quantity.
+  // input with an Enter handler works. Matches product barcode, then variant
+  // barcode, then product SKU, then variant SKU. Re-scanning the same
+  // product/variant pair bumps its quantity.
   const handleBarcodeScan = () => {
     const code = barcodeInput.trim()
-    if (!code) return
-    const p = products.find((x) => (x.barcode && x.barcode.trim() === code) || x.sku.toLowerCase() === code.toLowerCase())
+    const match = matchProductByCode(products, code)
     setBarcodeInput('')
-    if (!p) {
+    if (!match) {
       setScanFeedback({ ok: false, text: `No product matches "${code}"` })
       return
     }
-    setScanFeedback({ ok: true, text: `Added ${p.name}${p.sellingPrice ? ` · ₹${p.sellingPrice.toFixed(2)}` : ''}` })
+    const { product: p, variant } = match
+    const title = variant ? `${p.name} — ${variantLabel(variant)}` : p.name
+    const sku = variant ? variant.sku : p.sku
+    const price = variant?.sellingPrice ?? p.sellingPrice ?? 0
+    setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {
-      const existing = prev.find((li) => li.productId === p.id)
+      const existing = prev.find((li) => li.productId === p.id && (li.variantId ?? null) === (variant?.id ?? null))
       if (existing) {
         return prev.map((li) => (li.key === existing.key ? { ...li, qty: li.qty + 1 } : li))
       }
+      const fresh = { productId: p.id, variantId: variant?.id ?? null, title, sku, price, qty: 1 }
       // Fill the empty first line if it's untouched, otherwise append
       const firstEmpty = prev.length === 1 && !prev[0].productId && !prev[0].title
       if (firstEmpty) {
-        return [{ ...prev[0], productId: p.id, title: p.name, sku: p.sku, price: p.sellingPrice ?? 0, qty: 1 }]
+        return [{ ...prev[0], ...fresh }]
       }
-      return [...prev, { key: crypto.randomUUID(), productId: p.id, title: p.name, sku: p.sku, qty: 1, price: p.sellingPrice ?? 0 }]
+      return [...prev, { key: crypto.randomUUID(), ...fresh }]
     })
   }
 
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
     setLineItems((prev) => prev.map((li) => (li.key === key ? { ...li, ...patch } : li)))
+    // A changed quantity re-runs the live check; drop any stale server report.
+    if ('qty' in patch) clearServerStockError(key)
   }
 
   const createOrder = async () => {
@@ -836,9 +931,23 @@ export default function SalesOrdersPage() {
     }
     const items = lineItems
       .filter((li) => li.title.trim())
-      .map((li) => ({ title: li.title.trim(), sku: li.sku, quantity: Math.max(0, Math.floor(li.qty) || 0), price: Number(li.price) || 0 }))
+      .map((li) => ({
+        title: li.title.trim(),
+        sku: li.sku,
+        quantity: Math.max(0, Math.floor(li.qty) || 0),
+        price: Number(li.price) || 0,
+        // Shopify sync targets the exact variant; the local invoice keeps
+        // billing the variant's SKU, which the line already carries.
+        ...(li.variantId ? { variantId: li.variantId } : {}),
+      }))
     if (!editing && items.length === 0) {
       setFormError('Add at least one line item.')
+      return
+    }
+    // Block the request (and any Shopify sync) while any line asks for more
+    // than the catalog holds — the shortfall is already shown under that
+    // line's Qty field.
+    if (Object.keys(computeLineStockErrors(stockCheckLines, stockByProductId)).length > 0) {
       return
     }
     const originalItems = editing?.lineItems ?? null
@@ -852,6 +961,7 @@ export default function SalesOrdersPage() {
           })
     setSaving(true)
     setFormError('')
+    setServerStockErrors({})
     try {
       const shared = hasAddress(billingAddr) ? billingAddr : shippingAddr
       const billing = customerSel === '__new__' ? toAddressPayload(shared, customerName) : undefined
@@ -879,7 +989,14 @@ export default function SalesOrdersPage() {
       setCreated(res)
       reload()
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : 'Could not save order')
+      // The order endpoints validate stock themselves (per location); put
+      // their answer under the offending Qty field instead of the banner.
+      const stockErrors = stockErrorsFromApiError(err, lineItems)
+      if (Object.keys(stockErrors).length > 0) {
+        setServerStockErrors(stockErrors)
+      } else {
+        setFormError(err instanceof Error ? err.message : 'Could not save order')
+      }
     } finally {
       setSaving(false)
     }
@@ -1204,7 +1321,11 @@ export default function SalesOrdersPage() {
                     </p>
                   ) : null}
                   <div className="space-y-2">
-                    {lineItems.map((li) => (
+                    {lineItems.map((li) => {
+                      const stockError = lineStockErrors[li.key]
+                      const rowProduct = products.find((p) => p.id === li.productId)
+                      const rowVariants = rowProduct ? variantOptions(rowProduct) : []
+                      return (
                       <div key={li.key} className="flex items-end gap-2">
                         <div className="min-w-0 flex-1">
                           <Label className="text-xs text-muted-foreground">Product</Label>
@@ -1212,7 +1333,14 @@ export default function SalesOrdersPage() {
                             placeholder="Select product"
                             searchPlaceholder="Search products..."
                             options={[
-                              ...products.map((p) => ({ value: p.id, label: p.name, keywords: p.sku, subtitle: p.sku })),
+                              ...products.map((p) => ({
+                                value: p.id,
+                                label: p.name,
+                                keywords: p.sku,
+                                subtitle: variantCountByProductId.has(p.id)
+                                  ? `${variantCountByProductId.get(p.id)} variants`
+                                  : p.sku,
+                              })),
                               { value: '__new_product__', label: 'New product…', subtitle: 'Add it without leaving this order' },
                             ]}
                             value={li.productId}
@@ -1225,8 +1353,20 @@ export default function SalesOrdersPage() {
                               }
                               selectProduct(li.key, v)
                             }}
-                          />
+                           />
                         </div>
+                        {rowVariants.length > 0 ? (
+                          <div className="w-36">
+                            <Label className="text-xs text-muted-foreground">Variant</Label>
+                            <SearchableSelect
+                              placeholder="Select variant"
+                              searchPlaceholder="Search variants..."
+                              options={rowVariants}
+                              value={li.variantId ?? ''}
+                              onValueChange={(v) => selectVariant(li.key, v)}
+                            />
+                          </div>
+                        ) : null}
                         <div className="w-20">
                           <Label className="text-xs text-muted-foreground">Qty</Label>
                           <Input
@@ -1234,7 +1374,15 @@ export default function SalesOrdersPage() {
                             min="1"
                             value={li.qty}
                             onChange={(e) => updateLineItem(li.key, { qty: Math.max(1, Number(e.target.value)) })}
+                            className={cn(
+                              stockError &&
+                                'border-red-500 focus-visible:border-red-500 focus-visible:ring-red-500/40',
+                            )}
+                            aria-invalid={stockError ? true : undefined}
                           />
+                          {stockError ? (
+                            <p className="mt-1 text-[11px] leading-snug text-red-600 dark:text-red-400">{stockError}</p>
+                          ) : null}
                         </div>
                         <div className="w-28">
                           <Label className="text-xs text-muted-foreground">Price (?)</Label>
@@ -1259,7 +1407,8 @@ export default function SalesOrdersPage() {
                           <Trash2 className="h-4 w-4" />
                         </Button>
                       </div>
-                    ))}
+                      )
+                    })}
                   </div>
                   <div className="mt-2 flex items-center justify-between rounded-md bg-muted/50 px-3 py-2 text-sm">
                     <span className="text-muted-foreground">{editing && totalValue === 0 ? 'Order value (unchanged)' : 'Total order value'}</span>
