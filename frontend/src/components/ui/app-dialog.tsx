@@ -85,6 +85,20 @@ const SIZE_CLASS: Record<AppDialogSize, string> = {
   xl: 'max-w-[min(95vw,68.75rem)]',
 }
 
+/** Width class for a preset. Exported for tests. */
+export function appDialogSizeClass(size: AppDialogSize): string {
+  return SIZE_CLASS[size]
+}
+
+/**
+ * Whether a close request must be intercepted with a "Discard changes?" prompt.
+ * Opening (`next === true`) and clean forms (`isDirty` falsy) close straight away;
+ * only a dirty form being dismissed is guarded. Exported for tests.
+ */
+export function shouldConfirmDiscard(next: boolean, isDirty?: boolean): boolean {
+  return !next && Boolean(isDirty)
+}
+
 export function AppDialog({
   open,
   onOpenChange,
@@ -101,7 +115,7 @@ export function AppDialog({
   footerClassName,
 }: AppDialogProps) {
   const handleOpenChange = (next: boolean) => {
-    if (next || !isDirty) {
+    if (!shouldConfirmDiscard(next, isDirty)) {
       onOpenChange(next)
       return
     }
