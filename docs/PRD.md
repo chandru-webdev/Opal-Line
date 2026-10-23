@@ -1,281 +1,318 @@
-# PRD.md — Product Requirements Document
+# Product Requirements — Opal Line Billing
 
-> This document distinguishes **verified existing functionality** (already implemented and shipped) from **proposed improvements** (planned but not yet implemented). Only verified functionality is marked as "Implemented"; everything else is noted as a future priority.
+**Version:** 1.0.22 · **Owner:** Opal Line Jewels LLP · **Status:** living
+document
 
-## Product Overview & Purpose
+This document describes **what the product is for and what it must do**. It is
+the answer to "why does this exist, and what would make it fail?" — not a
+description of how it is built (that is [ARCHITECTURE.md](./ARCHITECTURE.md))
+or how it looks ([DESIGN_SYSTEM.md](./DESIGN_SYSTEM.md)).
 
-**Opal Line Billing ERP** is a jewellery-billing enterprise resource planning system designed for silver retailers. It operates as a desktop Electron application (Windows NSIS installer with bundled PostgreSQL) or as a self-hosted web stack (Node.js + Express + Drizzle ORM + PostgreSQL + React + Vite).
+---
 
-### Core Value Proposition
+## 1. Problem
 
-| Capability | Description |
-|---|---|
-| **Silver-rate priced invoicing** | Invoices priced at (rate + making charge) × weight + GST; auto-repricing when silver rate changes |
-| **Shopify two-way sync** | Product, order, customer, and inventory synchronization between ERP and Shopify store; PII recovery from order emails |
-| **Supply-chain management** | Order pipeline (draft → sent → approved → converted), bulk packing slips/pick lists, dispatch/shipments, bookings, purchase orders & supplier dues, scan stock counts |
-| **Print Designer** | 5 document types (invoice, quotation, order, packing slip, pick list); saved templates; design import/export (.opal-print.json); auto UPI QR on invoices |
-| **Double-entry accounting** | Trial balance, P&L, balance sheet, journal entries; GST compliance (CGST/SGST/IGST); TCS (194Q) for bullion buyers |
-| **RBAC & security** | Per-user module/action permissions; login lockout; session controls (log out other devices); audit logs |
-| **Reporting & compliance** | GST reports (HSN summary, input credit, TCS), sales analysis, day book, supplier dues, ageing reports |
-| **Pricing & loyalty** | Silver rate scheduling; auto-update products; loyalty-points module (on/off toggle) |
+A silver jewellery retail shop runs on three disconnected tools: a billing
+application that prices by a metal rate the shop looks up manually, a
+spreadsheet that tracks stock across two locations, and a Shopify store that
+knows what was sold but not what it cost.
 
-## Problems the Product Solves
+The consequences are concrete:
 
-| Problem | How it's Solved |
-|---|---|
-| **Manual silver rate updates** | Rate change scheduler; when rate updates, all product selling prices recompute; Shopify variants get pushed new prices |
-| **Disconnected Shopify ↔ ERP data** | Two-way sync: products (incl. collections, descriptions with sanitised HTML), orders (with PII recovery), customers, inventory; webhook + email ingestion fallbacks |
-| **Inconsistent invoice formatting** | Print Designer: save templates with defaults; design import/export; all invoices print with product photo thumbnails when images exist |
-| **Accounting errors from manual entry** | Double-entry accounting auto-generated from invoices/purchases; trial balance, P&L, balance sheet; TCS and GST split auto-calculated |
-| **Poor supplier/ledger visibility** | Supplier dues report with aging buckets (0–30 / 31–60 / 60+ days); ledger shows open invoices + payment history; automated daily summary email |
-| **Quotation lifecycle chaos** | Quotation lifecycle: draft → sent → approved → cancelled/expired; auto-expiry after Valid Until; reopen expired extends by 15 days; follow-ups collect what needs chasing |
-| **Manual stock counting & valuation** | Weighted-average cost revaluation on purchase; stock movements audit trail (stock_transactions); low-stock alerts; barcode label printing |
-| **Compliance reporting burden** | GST/HSN reports auto-group by HSN code; input credit pro-rata with invoice discounts; IRN generation (off/manual/automatic); TCS tracking |
+- **Pricing errors.** A rate moves daily. If the rate applied to an invoice is
+  the rate at print time rather than the rate at sale time, every invoice
+  issued after a rate change is wrong, and reconciling them means rewriting
+  history.
+- **Stock that is believed rather than known.** The Shopify store and the
+  shop's counter disagree, and neither is authoritative.
+- **No margin visibility.** Product costs live in a purchase spreadsheet.
+  Nobody knows which products actually make money.
+- **Compliance by hand.** GST returns, HSN summaries and TDS are assembled
+  manually from invoices.
 
-## Target Users & User Roles
+Shopify was supposed to solve the last two. It does not: a Shopify shop knows
+what it sold, not what silver cost the shop, not what the making charge was,
+and not what the supplier was paid.
 
-| Role | Permissions (modules/actions) | Typical Workflow |
+---
+
+## 2. Product statement
+
+> **Opal Line Billing is the billing and stock system of record for a silver
+> jewellery shop, with Shopify as a channel rather than as the source of
+> truth.**
+
+The ERP owns the price, the cost, the stock and the books. Shopify owns the
+storefront and the customer-facing catalogue. Sync is bidirectional where it
+is safe, and ERP-led where it is not.
+
+---
+
+## 3. Users
+
+| User | Needs | Typical session |
 |---|---|---|
-| **Super Admin** | `*` wildcard → all modules, all actions | Full access: user management, system settings, all reports, backup management, role creation, silver rate immediate apply |
-| **Admin** | All modules; `view/create/edit/delete` on most | Manage users/roles, configure settings, process invoices, run reports, approve silver rate changes |
-| **Manager** | `view` on all; `create/edit` on sales/purchase/inventory; `view` on reports, system | Process incoming orders, approve quotations, manage inventory, view reports |
-| **User/Sales** | `view` on dashboard, sales, inventory; `create/edit` on own quotations/invoices | Create quotations, process sales, view customer history, follow up on pending orders |
-| **Accountant** | `view` on accounts, reports, system; `create` on expenses, payments | Record expenses, manage payments, run accounting reports, reconcile ledger |
-| **Viewer** | `view` on dashboard, sales, products (read-only) | Monitor KPIs, view reports, no write access |
+| **Owner / Super Admin** | The whole business on one screen; control of who may do what; the books are right | Morning dashboard, month-end reports |
+| **Counter staff** | Ring up a sale fast, print it, take the payment | Minutes, standing at a counter |
+| **Store / inventory manager** | Stock is accurate across locations; purchases are recorded | Hours, daily |
+| **Accountant** | Books balance; GST and TDS are ready | Weekly |
 
-> **Note**: Permissions are module-based with 4 actions per module: `view`, `create`, `edit`, `delete`. The `computeUserPermissions(userId)` function in `backend/src/rbac.ts` merges role permissions + overrides. Module list: `dashboard`, `silver-rate`, `sales`, `purchase`, `inventory`, `accounts`, `reports`, `shopify`, `system`, plus `gold` implicitly available.
+The product is used on shop hardware, in daylight, often while a customer
+waits. That sets the performance bar: **a screen the counter trusts must open
+fast**, which is why dialogs are memoised and animations are capped at
+120 ms.
 
-## Core Features & Business Workflows
+---
 
-### 1. Silver Rate Management
+## 4. Scope
 
-| Workflow | Details |
+### 4.1 In scope
+
+| Module | Capability |
 |---|---|
-| **Update rate** | Admin/Super Admin can apply immediately; non-admin roles submit queued change (pending approval) |
-| **Schedule auto-updates** | Editable per install from Silver Rate page: any subset of days + time in Asia/Kolkata; default every day at 09:00; weekend runs fetch last traded rate |
-| **One-off scheduled changes** | Guided dialog: set rate with ±adjustments, product price-impact preview, pick date/time (quick picks: Tomorrow 9:00 AM, Saturday 10:00 AM, or custom instant); at most 20 queued; each can be edited/cancelled until it runs |
-| **Auto-rate fetch** | `POST /api/v1/silver/auto-rate/fetch-now` applies live MCX spot rate; Admin/Super Admin only; writes to activity log |
+| **Billing** | Invoice from a rate-priced catalogue, GST, HSN, making charges, credit notes, returns, quotations with validity, printable and downloadable as PDF, UPI QR on the invoice |
+| **Pricing** | A daily silver rate with history, an approval gate for staff-initiated changes, an automatic rate schedule, and repricing of open invoices when the rate moves |
+| **Shopify sync** | Orders, products (incl. collections and sanitised descriptions), customers, inventory, price; push tools; sync logs; a comparison view for reconciliation |
+| **Supply chain** | Order pipeline, bulk packing slips and pick lists with product photos, dispatch and shipments, bookings, purchase orders, purchase invoices with stock-in, supplier dues and a supplier payment ledger, stock counts with a Shopify round-trip |
+| **Inventory** | An append-only stock ledger with a balance per location, transfers (dispatch → receive → cancel), stock counts recorded as adjustments, barcode labels, low-stock alerts, stock running |
+| **Accounts** | Double-entry bookkeeping (trial balance, P&L, balance sheet, journals), bank accounts, expenses, payments, receivables and payables aging |
+| **Reporting** | Business, GST, HSN, sales analysis, day book, inventory and dues reports |
+| **Print** | A print designer for five document types with saved templates, import/export, and per-document defaults |
+| **Platform** | Role-based access, per-user permissions, audit and activity logs, encrypted backups with off-site push, notifications (e-mail, WhatsApp), a system status page |
 
-### 2. Quotation Lifecycle
+### 4.2 Explicitly out of scope
 
-```mermaid
-flowchart TD
-    draft -->|mark sent| sent
-    sent -->|mark approved| approved
-    approved -->|convert| converted (terminal)
-    sent -->|expire| expired (terminal)
-    approved -->|cancel| cancelled (terminal)
-    expired -->|reopen| draft (extends validity 15 days)
-    cancelled -->|reopen| draft (extends validity 15 days)
-```
+- **Multi-tenant / SaaS hosting.** One shop, one database, one install.
+- **A marketplace or a customer-facing storefront.** Shopify is that.
+- **Payroll, HR, CRM campaigns.** Not what a jewellery shop's owner asked for.
+- **Manufacturing / job costing.** The product tracks batches and BOMs as
+  catalogue data; it does not run a factory.
 
-| Action | Where | Notes |
+---
+
+## 5. Functional requirements
+
+### 5.1 Billing
+
+**FR-B1 — Rate-priced line items.** A line item's amount is derived from
+`net weight × quantity × (silver rate + making charge)`, plus tax, less
+discount. The rate used is **stored on the line item**.
+
+**FR-B2 — History is immutable.** A later rate change must never alter an
+invoice that was already issued. The rate is captured at the moment of
+billing and stored on the item.
+
+**FR-B3 — GST.** Line and invoice totals split into CGST/SGST (intra-state)
+or IGST (inter-state), computed from the supplier's and the buyer's state.
+The invoice prints the GSTIN, the HSN summary and the amount in words
+(Indian numbering).
+
+**FR-B4 — Quotation → invoice.** A quotation carries a validity term and
+line items; converting it produces an invoice that inherits the lines. A
+quotation that has expired is visibly expired.
+
+**FR-B5 — Credit notes.** A sales return produces a credit note that reverses
+stock and adjusts receivables.
+
+**FR-B6 — Printing.** Every invoice, quotation, credit note and order can be
+printed from a template and downloaded as a PDF. The printed output always
+uses the light palette.
+
+**FR-B7 — Payments.** A payment can be recorded against an invoice, in full
+or in part; the invoice's payment status follows.
+
+### 5.2 Silver rate
+
+**FR-S1 — One rate per day, with history.** Every rate change is recorded with
+who changed it, when, and why.
+
+**FR-S2 — Approval gate.** A non-admin submitting a rate change creates a
+pending request; an approver accepts or rejects it with a note. The rate does
+not change until it is approved.
+
+**FR-S3 — Scheduled rate.** The rate can be fetched automatically on a
+schedule (chosen weekdays and a time), and a change can be queued for a future
+date.
+
+**FR-S4 — Repricing.** When the rate moves, open (not yet paid) invoices can
+be repriced. Issued invoices are never touched.
+
+### 5.3 Shopify
+
+**FR-H1 — Import.** Orders, products, customers, inventory levels and prices
+import from Shopify on demand.
+
+**FR-H2 — Push.** Products, prices and inventory push to Shopify on demand,
+or automatically on a schedule.
+
+**FR-H3 — Catalogue fidelity.** Collections attach as pipe-separated titles
+(`Rings | Home page`). Descriptions are sanitised. Images pushed to Shopify
+are strictly the ones uploaded in the ERP — a Shopify round-trip URL is never
+re-sent.
+
+**FR-H4 — Reconciliation.** A comparison view shows what differs between
+Shopify and the ERP, so a mismatch is diagnosable rather than mysterious.
+
+**FR-H5 — PII recovery.** On dev/trial Shopify stores the API redacts customer
+name and address. The ERP fills them from the order e-mail (IMAP ingest) or a
+Shopify Flow webhook. Both paths are documented in
+[shopify-flow-webhook.md](./shopify-flow-webhook.md).
+
+**FR-H6 — Logs.** Every sync run records what it did, what it changed and any
+error, and the log is readable in the app.
+
+### 5.4 Supply chain
+
+**FR-C1 — Pipeline.** An order moves through stages (new → confirmed → packed
+→ dispatched → delivered). Stages can be moved one at a time or in bulk, by
+drag or by selection.
+
+**FR-C2 — Fulfilment documents.** Packing slips and pick lists can be
+generated in bulk, with product photos, and printed.
+
+**FR-C3 — Purchases.** A purchase order can raise its own purchase invoice.
+A purchase invoice records line items, the input GST, and the stock-in it
+causes.
+
+**FR-C4 — Supplier ledger.** Payments to suppliers are recorded and allocated
+against purchase invoices; dues age like receivables.
+
+**FR-C5 — Cost.** Stock-in sets a weighted-average cost per SKU, so inventory
+value and margins are computed, not guessed.
+
+### 5.5 Inventory
+
+**FR-I1 — The ledger is append-only.** Every stock change is a movement with a
+resulting balance. A stock count is an **adjustment**, never a silent
+overwrite.
+
+**FR-I2 — Locations.** Sales, purchases, counts and transfers all post to the
+location where they happened, and every reversal resolves back to it.
+Availability is checked at that location, not against the chain-wide total.
+
+**FR-I3 — Transfers.** A transfer follows dispatch → receive → cancel.
+
+**FR-I4 — Visibility.** The stock history for a product explains every number
+on screen.
+
+**FR-I5 — Backfill.** An installation that predates the ledger is backfilled
+with dated opening movements on boot.
+
+### 5.6 Accounts and reporting
+
+**FR-A1 — Double entry.** Journal entries, trial balance, P&L and balance
+sheet must balance at any time.
+
+**FR-A2 — Aging.** Receivables and payables are bucketed by age, and the
+bucket can be drilled into the invoices behind it.
+
+**FR-A3 — GST and HSN.** GST reports and an HSN summary are derived from the
+invoice data, not entered by hand.
+
+**FR-A4 — One basis.** Every widget and report states whether its figures are
+inclusive or exclusive of GST. Totals must reconcile with each other.
+
+### 5.7 Platform
+
+**FR-P1 — Permissions.** Nine modules × four actions, resolved per user, with
+the super admin as the only role that ships with access.
+
+**FR-P2 — Audit.** Every mutation is attributable: who, what, when, from
+where.
+
+**FR-P3 — Backups.** A local backup on a schedule, optional off-site push, and
+a restore path. Backups are encrypted with the app's master key.
+
+**FR-P4 — Health.** A system status page shows database health, latency,
+pool statistics, port occupancy and the server log tail.
+
+**FR-P5 — Sessions.** A user can sign out other devices; a forced password
+change locks everything else until it is done.
+
+---
+
+## 6. Non-functional requirements
+
+| ID | Requirement | How it is met |
 |---|---|---|
-| Mark as sent / approved / cancel | Quotations page, row actions | Invalid jumps rejected server-side |
-| Email quotation | Row actions (✉) | Sends PDF attached; draft flips to `sent` automatically |
-| WhatsApp quotation | Row actions (💬) | Needs `customerPhone`; degrades gracefully when WhatsApp not configured |
-| Reopen expired | Row actions (↻) | Extends validity by 15 days, returns to `draft` |
-| Auto-expiry | Daily sweep (10:05) | After `Valid Until` passes, becomes `expired`; can no longer be converted |
+| **NFR-1** | A counter can bill a customer without waiting | Dialogs open in ~120 ms; tables are memoised; a dialog-open stall of ~370 ms was measured and fixed |
+| **NFR-2** | The app runs on a shop PC with no admin rights | The installer bundles its own runtime and PostgreSQL; nothing is installed machine-wide |
+| **NFR-3** | The dev stack and the installed app never interfere | Separate clusters, data dirs, encryption keys and sessions; a dedicated port block (47191–47198) |
+| **NFR-4** | Data survives an app update | An upgrade-path regression test proves an existing install gains new tables |
+| **NFR-5** | Secrets are never stored in plain text | AES-256-GCM at rest; the credential scan runs in CI over the tree and the whole history |
+| **NFR-6** | The interface is readable in a bright shop | WCAG AA contrast enforced in CI across light, dark and print |
+| **NFR-7** | A printer works out of the box | Electron print bridge with a native chooser; UPI QR rendered on the invoice |
+| **NFR-8** | The product works offline | The installed app needs no internet except for Shopify and e-mail |
 
-### 3. Order Pipeline
+---
 
-| Stage | Description |
+## 7. The design principles behind the requirements
+
+1. **The ERP is the source of truth for money and stock.** Shopify is a
+   channel. A sync that would silently delete or overwrite an ERP product must
+   ask first.
+2. **Capture the fact at the moment it happens.** The rate, the weight and
+   the cost are stored on the document, so history never needs recomputing.
+3. **The ledger is append-only.** Corrections are entries, not edits.
+4. **Permissions are decided by the owner, not by a template.** The product
+   ships with no access for any role except Super Admin.
+5. **Print is a first-class output, not an afterthought.** In a jewellery shop
+   half the paperwork is a printed document.
+6. **Fail visibly.** A failed load must never render as "no data".
+
+---
+
+## 8. Success criteria
+
+### 8.1 For the shop
+
+| Criterion | Measure |
 |---|---|
-| **draft** | Quotation not yet sent to customer |
-| **sent** | Quotation emailed/ messaged to customer |
-| **approved** | Customer confirmed order |
-| **converted** | Quotation → Sales Invoice (terminal) |
-| **cancelled** | Customer cancelled; terminal |
-| **expired** | Valid Until passed; terminal (can be reopened → draft, +15 days) |
+| Billing is correct | Every issued invoice prices from the rate captured at billing time; no manual rate correction needed |
+| Stock is known | The stock balance on screen matches the shelf, per location, without a stock count |
+| The books balance | Trial balance, P&L and balance sheet balance at any time |
+| Compliance is ready | GST and HSN reports are produced from the data, not retyped |
+| Shopify is reconciled | The comparison view shows no unexplained difference after a sync |
 
-### 4. Purchase & Supplier Workflow
+### 8.2 For the product
 
-| Action | Effect on Stock |
+| Criterion | Measure |
 |---|---|
-| Record purchase invoice | `stock += qty` per line; cost price re-weighted via weighted average |
-| Edit invoice lines | Old lines reversed, then new lines applied |
-| Cancel invoice | Stock taken back out; lines kept (reversible) |
-| Reinstate cancelled | Kept lines put stock back |
-| Delete invoice | Removed for good; stock reversed |
-| Receive purchase return | Stock moves out; pending/approved return is paperwork |
+| It installs anywhere | A clean machine, no Node.js, no PostgreSQL, no admin rights → a running app |
+| It upgrades safely | The upgrade-path test passes; no schema change requires a manual step |
+| It is secure by default | Loopback-only binding, per-user permissions, encrypted secrets, no committed credentials |
+| It is fast enough | A counter never waits on the app |
+| It is verifiable | Every bug fix has a test; the whole suite runs in CI |
 
-### 5. Inventory & Stock Management
+---
 
-| Feature | Detail |
+## 9. Constraints
+
+| Constraint | Consequence |
 |---|---|
-| **Weighted-average cost** | `newCost = (stockOnHand × costOnHand + boughtQty × buyPrice) / newStock` |
-| **Low-stock alerts** | Configurable reorder level; UI shows products below threshold |
-| **Barcode labels** | `bwip-js` generated; printable thermal labels with product info |
-| **Stock transfers** | Between branches; tracked in `stock_transactions` audit table |
-| **Location tracking** | `stock_locations` table; products assigned to branches |
+| The desktop app runs over plain HTTP on loopback | The session cookie cannot be `Secure` |
+| The master key lives on the same disk as the data | Losing it loses the encrypted secrets; it must be backed up with the database |
+| Money is stored as numeric columns, not integer paise | Rounding happens at the display and PDF layer |
+| Shopify's API redacts PII on trial stores | The order-e-mail ingest and Flow webhook exist to recover it |
+| Express 5 / Tailwind 4 / TypeScript 7 are all recent majors | Upgrades need the migration notes in [DEVELOPING.md](./DEVELOPING.md) |
+| The backend is CommonJS, the frontend is ESM | Do not "unify" them casually |
 
-### 6. Accounting & GST Compliance
+---
 
-| Feature | Detail |
+## 10. Release history and roadmap
+
+Release notes for shipped versions live in this directory:
+
+- [release-notes-v1.0.11.md](./release-notes-v1.0.11.md)
+- [release-notes-v1.0.10.md](./release-notes-v1.0.10.md)
+- [release-notes-v1.0.9.md](./release-notes-v1.0.9.md)
+
+The planned work is tracked in [ROADMAP.md](../ROADMAP.md).
+
+---
+
+## 11. Change log for this document
+
+| Date | Change |
 |---|---|
-| **CGST/SGST/IGST split** | Compared supplier GSTIN first two digits vs business GSTIN (from System → Settings → Business) |
-| **TCS (194Q)** | Set rate per invoice (usually 1, sometimes 0.25/0.5); 0 disables; computed on pre-tax value; shown on invoice; excluded from input credit |
-| **HSN summary** | Groups month's issued invoices by HSN code; taxable value gets pro-rata discount share; blank customer state treated as intra-state (counter sales) |
-| **GST e-invoicing (IRN)** | Modes: Off / Manual / Automatic; generated locally in mock mode; gateway round-trip when credentials set (`CLEARTAX_GSTIN`, `CLEARTAX_AUTH_TOKEN`) |
-| **Input GST** | Purchase invoices store supplier GSTIN; split depends on state comparison |
-
-### 7. Shopify Integration
-
-| Resource | Sync Direction | Details |
-|---|---|---|
-| **Products** | Bidirectional | Two-way sync; collections attach as pipe-separated titles (`Rings | Home page`); images pushed are only uploaded/linked ones; round-trip URLs never re-sent |
-| **Orders** | ERP → Shopify import | Import with PII redaction; order email ingestion polls Shopify's "New Order" notification email to recover customer name/phone/address |
-| **Customers** | Bidirectional | Sync with PII recovery from order emails; Shopify stores redact customer PII on API |
-| **Inventory** | ERP → Shopify | Push inventory levels; round-trip respects Shopify's inventory management |
-| **Prices** | ERP → Shopify | Push new prices when silver rate changes or manual price sync applied |
-
-### 8. Print Designer
-
-| Feature | Detail |
-|---|---|
-| **5 document types** | Invoice, Quotation, Order, Packing slip, Pick list |
-| **Design customization** | Header style, accent colours, fonts, page size, margins, zebra rows, logo, bank details, UPI QR, Packed-By/Checked-By signature lines |
-| **Save & set default** | Applies to every future printout of that type |
-| **Export/Import** | `.opal-print.json` files; validated server-side; share between machines |
-| **Product thumbnails** | Print with photos when images exist on the product |
-| **UPI QR auto-generation** | On invoices; QR links to UPI ID configured in business settings |
-
-### 9. Loyalty Points (module toggle)
-
-| Feature | Detail |
-|---|---|
-| **LOYALTY_ENABLED** | Configurable via Settings → Appearance or env var; turns the loyalty-points module on/off |
-| **Earn points** | Per purchase/ sale; rate configurable |
-| **Redeem points** | Per invoice; deduct from loyalty balance |
-
-## Functional Requirements with Unique IDs
-
-| Req ID | Requirement | Implemented |
-|---|---|---|
-| FR-001 | Silver rate update: Admin applies immediately; non-admin submits pending request | ✅ Implemented (backend: `silver.ts`; frontend: Silver Rate page) |
-| FR-002 | Quotation lifecycle: draft → sent → approved → cancelled/expired with server-side validation | ✅ Implemented (backend: `sales.ts` routes; frontend: Quotations page) |
-| FR-003 | Two-way Shopify sync: products, orders, customers, inventory | ✅ Implemented (backend: `shopify.ts`; frontend: `useShopifyResource.ts`) |
-| FR-004 | Print Designer: 5 doc types, template save/export-import, UPI QR | ✅ Implemented (backend: printTemplates routes; UI: PrintDesigner page) |
-| FR-005 | Double-entry accounting: trial balance, P&L, balance sheet, journal | ✅ Implemented (backend: `accounts.ts`; reports: `business`, `gst`) |
-| FR-006 | GST compliance: HSN summary, CGST/SGST/IGST split, TCS tracking | ✅ Implemented (backend: `reports.ts`; schema: GST/TCS columns) |
-| FR-007 | RBAC: module-based permissions (view/create/edit/delete per role) | ✅ Implemented (backend: `rbac.ts`; frontend: `RequirePermission` component) |
-| FR-008 | Login lockout: configurable threshold/duration via Settings → Security | ✅ Implemented (backend: `lockout.ts`; frontend: Settings → Security) |
-| FR-009 | Print thumbnails on invoices/quotations/orders when product images exist | ✅ Implemented (backend: PDF generation; frontend: image display) |
-| FR-010 | Weighted-average cost revaluation on purchase | ✅ Implemented (backend: purchase invoice logic; schema: `products.cost_price`) |
-| FR-011 | Two-factor authentication | ❌ Not implemented (no 2FA in auth flow) |
-| FR-012 | Email-based password recovery / reset | ✅ Implemented (backend: `auth.ts` forgot/reset/verify flows; email tokens) |
-| FR-013 | Role-based module visibility in sidebar/navigation | ✅ Implemented (frontend: `RequireModule` component + RBAC permissions) |
-| FR-014 | Bulk operations: select multiple rows, mark sent/approved/cancel | ✅ Implemented (frontend: Quotations/Sales pages with bulk actions) |
-| FR-015 | Audit log: all state changes written with actor name | ✅ Implemented (backend: `activity.ts`; UI: System → Status → Activity Log) |
-| FR-016 | Encrypted backups with auto-email and off-site push (S3-compatible) | ✅ Implemented (backend: `autoBackup.ts`; env: `BACKUP_OFFSITE_*`) |
-| FR-017 | Silver rate scheduler: auto-update on selected days/times | ✅ Implemented (backend: `silverRateScheduler.ts`; frontend: Silver Rate page) |
-| FR-018 | Purchase return workflow: receive, undo receipt, delete | ✅ Implemented (backend: `purchase.ts`; frontend: Purchase Returns page) |
-| FR-019 | Customer 360 view: order history, outstanding, contact info | ✅ Implemented (frontend: `Customer360Page`) |
-| FR-020 | Gold rate mirroring (exposes `/api/v1/gold/rate` without RBAC) | ⚠️ Verified exists but noted as potential security concern (no RBAC on gold route) |
-
-## Non-Functional Requirements
-
-| Category | Requirement |
-|---|---|
-| **Performance** | API response < 200ms for common queries (health, me, silver rate); DB queries use Drizzle with proper indexing |
-| **Reliability** | 99.9% uptime; session persistence via PostgreSQL-persisted rate limits and login attempts; graceful degradation if Shopify API unavailable |
-| **Security** | Argon2id password hashing; CSRF double-submit; RBAC-enforced route guards; rate limiting persisted in Postgres; ENCRYPTION_KEY for DB-sealed secrets |
-| **Scalability** | Single-process Express backend (Electron/self-hosted); connection pooling via `pg` driver; not designed for horizontal multi-instance |
-| **Maintainability** | TypeScript throughout; Drizzle ORM for type-safe queries; migration-driven schema; documented in `docs/` |
-| **Compatibility** | Electron 44.8.0 on Windows 10/11; Node.js 20 LTS+; Tailwind CSS v4; React 19; PostgreSQL 16+ |
-| **Accessibility** | WCAG AA color contrast (verified via `scripts/check-palette.mjs`); keyboard-navigable Radix components; screen-reader-friendly DOM order |
-| **Data integrity** | All state changes in transactions; audit log captures every mutation; idempotent migrations; schema upgrades on every start |
-
-## User Stories & Acceptance Criteria
-
-| User Story | Acceptance Criteria |
-|---|---|
-| **US-001** | As a silver retailer, I want to update the silver rate so that all product prices reflect the current market price. | Given I am logged in as Admin, when I submit a new rate, then all products are repriced and Shopify variants get the new price pushed within 5 minutes. |
-| **US-002** | As a manager, I want to create quotations and convert them to invoices so that I can bill customers. | Given I have `create` permission on sales, when I create a quotation with validity dates, then I can convert it to an invoice only if it is in `sent` or `approved` state and within validity. |
-| **US-003** | As a shopify store owner, I want my products sync to the ERP so that I can manage inventory from one system. | Given I have configured Shopify credentials, when I initiate product sync, then all products are imported and Shopify IDs are stored on each product. |
-| **US-004** | As an accountant, I want GST reports with HSN breakdown so that I can file monthly returns. | Given I have invoices for the month, when I generate the HSN summary report, then it groups by HSN code, splits tax by CGST/SGST or IGST, and excludes TCS from input credit. |
-| **US-005** | As a user, I want to see low-stock alerts so that I can reorder before running out. | Given products have reorder levels set, when stock falls below the threshold, then the product appears on the Low Stock page with a warning banner. |
-| **US-006** | As a printer, I want invoices to print with product images and UPI QR so that customers can pay instantly. | Given a product has an image URL, when I print an invoice, then the PDF includes the product thumbnail and a valid UPI QR code linked to the business UPI ID. |
-| **US-007** | As an admin, I want to log out all other device sessions so that I can secure the account after a suspected breach. | Given I have Super Admin or Admin role, when I click "Log out other devices" in Settings → Team, then all other active sessions are invalidated. |
-| **US-008** | As a buyer, I want to record purchase invoices with weighted-average cost so that stock valuation is accurate. | Given I record a purchase invoice with line items, when the invoice is saved, then product `cost_price` is re-weighted and stock quantity increases. |
-
-## Key Business Rules & Validations
-
-| Rule | Enforcement |
-|---|---|
-| **Silver rate changes require approval** | Non-admin roles submit queued change; Admin/Super Admin approves or rejects; every action written to activity log |
-| **Quotation validity** | After `Valid Until` passes, quotation auto-expires; cannot be converted; can be reopened (extends 15 days) |
-| **Purchase cost revaluation** | Weighted-average formula applied on every purchase invoice; never revalued on sale/cancellation |
-| **GST split logic** | Same state (or no supplier GSTIN) → CGST + SGST, half each; Different state → IGST, full; No GSTIN → treated as intra-state |
-| **TCS on bullion purchases** | Rate set per invoice (0, 0.25, 0.5, 1); computed on pre-tax value; shown on invoice; excluded from ITC |
-| **Shopify PII redaction** | API endpoints strip customer address/phone; email ingestion recovers PII from Shopify's "New Order" notification |
-| **CSRF protection** | All state-changing API requests require `x-csrf-token` header + `XSRF-TOKEN` cookie; login, logout, password changes all enforced |
-| **Session persistence** | Cookie-based sessions survive restarts; rate limit counters and login attempts persisted in PostgreSQL |
-| **Rate limiting** | Login: 30 attempts / 15 min / IP; password reset: 30/hour; other endpoints: configurable; counters in `rate_limit_hits`, `login_attempts` tables |
-| **Login lockout** | Configurable threshold (1–50, default 5) and duration (1–1440 min, default 15); stored per-install in settings row; disabled by default for testing |
-| **Email verification** | Tokens with 24-hour expiry; new users must verify before login; resend verification available |
-| **Password change** | Self-service `POST /change-password` (requireAuth); first login forces password change; admin can reset via `auth:reset` |
-
-## Integration Requirements
-
-| Integration | Direction | Data Flow | Notes |
-|---|---|---|---|
-| **Shopify** | Bidirectional | Products ↔ ERP; Orders → ERP (with PII recovery); Customers ↔ ERP; Inventory ↔ ERP; Prices → Shopify | Requires Shopify Custom App with `read/write` scopes; webhook HMAC verification; email ingestion for PII |
-| **Resend** | ERP → External | Transactional emails: backup summaries, payment reminders, dues statements, daily summary, low-stock alerts | `RESEND_API_KEY` env var; fallback to SMTP (`NOTIFICATION_SMTP_HOST/PORT`) |
-| **WhatsApp Cloud API** | ERP → External | Invoice/order/shipping/payment-reminder messages | Requires `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID`; configured via System → Connections |
-| **Razorpay** | ERP → External | Payment links on invoices; auto-reconciliation of payments | `RAZORPAY_KEY_ID` + `RAZORPAY_KEY_SECRET`; test/live mode |
-| **S3-compatible storage** | ERP → External | Encrypted backup archives pushed off-site after auto-backup | `BACKUP_OFFSITE_ENDPOINT`, `BACKUP_OFFSITE_BUCKET`, `BACKUP_OFFSITE_KEY_ID`, `BACKUP_OFFSITE_SECRET` |
-| **ClearTax/IRP** | ERP → External | GST e-invoicing IRN generation | `CLEARTAX_GSTIN`, `CLEARTAX_AUTH_TOKEN`, `CLEARTAX_SANDBOX`; offline mock mode until credentials set |
-| **MCX/Silver API** | External → ERP | Live silver rate fetch for product repricing | `SILVER_RATE_API_URL` + optional `SILVER_RATE_API_KEY`; fallback to bundled MCX fetchers |
-| **Email ingestion (IMAP)** | External → ERP | PII recovery from Shopify order notifications | `ORDER_EMAIL_*` env vars; polls every 2 minutes; merges customer name/phone/address into orders |
-
-## Constraints & Dependencies
-
-| Constraint | Detail |
-|---|---|
-| **Electron + bundled PostgreSQL** | Desktop app bundles PostgreSQL 16.4; data in `%APPDATA%\Opal Line Billing\pgdata` (port 47193); cannot coexist with dev stack on same data |
-| **Port block 47191–47198** | Dedicated port block; dev uses 47191/47195, desktop uses 47192/47193; cannot mix dev and desktop on same machine |
-| **Node.js 20 LTS+** | Required for Express 5, TypeScript 7, Tailwind CSS v4 migrations |
-| **PostgreSQL 16+** | Required for Drizzle ORM features; bundled in desktop; dev provisions auto; cloud (Neon/Supabase) supported via `DATABASE_URL` |
-| **Shopify Custom App scopes** | `read/write` on products, orders, customers, inventory; no extended permissions needed |
-| **GSTIN format** | 15-digit PAN-based India GSTIN; first 2 digits = supplier state; used for CGST/SGST/IGST split |
-| **Silver rate MCX schedule** | Weekend runs allowed but MCX closed Saturdays/Sundays; fetch returns last traded rate or fails; manual entry remains available |
-| **ENCRYPTION_KEY** | 64-char hex for AES-256-GCM; encrypts DB-sealed secrets; auto-generated on first run if left empty; must be same across all servers sharing one database |
-| **Electron code-signing** | Authenticode certificate with subject containing "Opal Line Billing"; missing cert fails NSIS build |
-
-## Known Limitations & Unresolved Questions
-
-| Limitation | Description |
-|---|---|
-| **No web interface for standalone use** | The desktop app requires the bundled Electron runtime; the web stack (npm run dev) is for development only; no published web deployment target |
-| **No multi-company / multi-tenant support** | Each database instance = one install; `settings` row is per-install; no scheme for separate companies in same DB |
-| **GST e-invoicing offline mock mode** | Until ClearTax credentials are set, all IRNs are generated locally as `mock`; live gateway round-trip requires API keys |
-| **Shopify PII redaction limitations** | Email ingestion depends on Shopify sending "New Order" notification to the configured mailbox; if email fails, PII not recovered |
-| **Silver rate weekend fetch** | MCX closed Saturdays/Sundays; auto-fetch returns last rate; users must manually enter weekend rates if needed |
-| **Gold rate endpoint lacks RBAC** | `GET /api/v1/gold/rate` mirrors `/silver/rate` but has no permission check; verified as existing behavior, flagged for potential security review |
-| **No LDAP/SSO integration** | Auth is local session-based only; no OAuth, OpenID Connect, or SAML support |
-| **Report export formats** | Reports display in UI; PDF export via Print Designer; no native Excel/CSV export button (workaround: print to PDF then extract) |
-| **Electron platform limitation** | Windows NSIS installer only; macOS/Linux builds not configured in CI; electron-builder Windows-focused |
-
-## Future Improvements & Feature Priorities
-
-| Priority | Feature | Description |
-|---|---|---|
-| **P1** | **Web interface deployment** | Publish the React app as a standalone web app (not just dev stack); separate from Electron desktop |
-| **P1** | **Two-factor authentication** | TOTP-based 2FA added to login flow; optional per-user |
-| **P2** | **Advanced reporting** | Excel/CSV export from reports; scheduled email delivery of GST/HSN summaries |
-| **P2** | **Multi-branch support** | Per-branch inventory, sales, settings; shared product catalogue with branch-specific prices |
-| **P3** | **LDAP/SSO integration** | OAuth2 / OpenID Connect; Azure AD, Google Workspace integration |
-| **P3** | **Mobile app** | React Native or PWA version for on-the-go invoice approvals |
-| **P4** | **Advanced analytics** | Dashboard predictive insights; sales forecasting; cohort analysis |
-| **P4** | **Subscription billing** | Recurring invoices; subscription management; automatic renewals |
-| **P5** | **Inventory reservation** | Reserve stock for pending orders; prevent overselling; allocation workflow |
-| **P5** | **Barcode scanning** | Mobile barcode scanner for stock counting; integrate with `bwip-js` label generation |
-
-> **Note**: All "Future improvements" are **proposed** and not currently implemented. The verified existing functionality listed in the FR table above represents the current shipped product.
-
-## Revision History
-
-| Date | Version | Changes |
-|---|---|---|
-| 2026-10-22 | 1.0 | Initial PRD documentation; distinguished 20 implemented FRs from 5 proposed enhancements + 2 verified limitations |
+| 2026-10-20 | First consolidated PRD written from the shipped v1.0.22 behaviour |

@@ -1,258 +1,376 @@
-# SECURITY.md — Security Review
+# Security
 
-> This document contains findings based on code analysis. It distinguishes confirmed vulnerabilities from potential risks and unverified assumptions. No actual secrets, credentials, tokens, or private keys are exposed.
+The security model of Opal Line Billing, the controls that implement it, and
+the checklist to run before shipping a change that touches it.
 
-## Authentication & Authorization Mechanisms
+The threat model in one sentence: **a single shop's billing data, on a
+Windows desktop that may also be reachable over a LAN.** Every control below
+exists to keep a stolen password or a hostile neighbour from reading or
+altering that data.
 
-| Component | Implementation | Status |
+---
+
+## 1. Controls at a glance
+
+| Area | Control | Where |
 |---|---|---|
-| **Password hashing** | Argon2id via `node-argon2` v0.45.1; variant `argon2id`, memory 65536 KiB, time cost 3, parallelism 4, 16-byte salt, 32-byte hash | ✅ Confirmed implemented in `backend/src/sessions.ts` and `backend/src/validation.ts` |
-| **Session management** | Cookie-based sessions with `setSessionCookie`/`destroySession` in `backend/src/sessions.ts`; sessions are HTTP-only, signed, regenerated on privilege change | ✅ Confirmed |
-| **CSRF protection** | Double-submit token pattern: `XSRF-TOKEN` cookie + `x-csrf-token` header on all state-changing requests; enforced via `verifyCsrfToken` middleware in `backend/src/sessions.ts` | ✅ Confirmed; all POST/PUT/DELETE `/api/v1/*` routes require it |
-| **Login lockout** | Configurable via Settings → Security (default: disabled for testing); threshold (1–50, default 5) and duration (1–1440 min, default 15) stored in `settings` row (`lockout_threshold`, `lockout_duration_minutes`); counters in `login_attempts` table | ✅ Confirmed; shipped disabled; enabled per install |
-| **Effective permissions** | Computed via `computeUserPermissions(userId)` in `backend/src/rbac.ts`; merges role permissions + overrides; `enforceRbac` / `requirePermission('module', 'action')` middleware guards routes | ✅ Confirmed; 13 modules with view/create/edit/delete actions; Super Admin has `*` wildcard |
-| **Email verification** | Tokens with 24-hour expiry; `emailVerificationToken`/`emailVerificationExpiry` on `users` table; `verify-email` and `resend-verification` routes | ✅ Confirmed |
-| **Password reset** | Token-based `POST /reset-password`; `resetToken`/`resetTokenExpiry` on user; `forgot-password` sends reset link email | ✅ Confirmed |
-| **CSRF-exempt routes** | `GET /me`, `GET /api/v1/health`, `GET /api/v1/csrf-token` are publicly accessible (no CSRF check); state-changing routes always enforced | ✅ Confirmed; intentional for API usability |
+| Passwords | argon2id hashing | `backend/src/routes/auth.ts` |
+| Password strength | ≥ 8 chars, upper + lower + digit + special | `backend/src/validation.ts` |
+| Sessions | DB-backed, opaque 32-byte token, `httpOnly` + `SameSite=Strict` cookie | `backend/src/sessions.ts` |
+| Authorisation | 9 modules × 4 actions, role + per-user overrides | `backend/src/rbac.ts` |
+| CSRF | HMAC-signed token + double-submit cookie check | `backend/src/index.ts` |
+| XSS / headers | Helmet CSP, HSTS, frameguard, no-sniff | `backend/src/index.ts` |
+| CORS | Exactly one origin, `credentials: true` | `backend/src/index.ts` |
+| Brute force | Per-IP rate limit **and** per-account lockout | `index.ts`, `lockout.ts` |
+| Network | Binds to `127.0.0.1` by default | `backend/src/config.ts` |
+| Secret storage | AES-256-GCM at rest | `backend/src/lib/crypto.ts` |
+| Webhooks | HMAC-SHA256 + constant-time compare + replay dedupe | `backend/src/webhooks.ts` |
+| Uploads | Magic-byte validation, size caps, content-addressed names | `backend/src/uploads.ts` |
+| Proxy headers | `trust proxy` off unless `TRUST_PROXY` is set | `backend/src/proxyTrust.ts` |
+| Audit | Audit log + activity log on every mutation | `backend/src/activity.ts` |
+| Supply chain | Secret scan over the tree **and** the whole git history | `scripts/scan-secrets.mjs` |
 
-### Verified Authentication Flow
+---
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant F as Frontend (AuthProvider)
-    participant B as Backend (Express)
-    participant S as Drizzle/PostgreSQL
-    participant C as Argon2
+## 2. Authentication
 
-    U->>F: Enter credentials + CSRF token
-    F->>B: POST /api/v1/auth/login
-    B->>S: SELECT users WHERE email = ?
-    S->>B: User row (id, email, passwordHash, role)
-    B->>C: verifyArgon2(providedPassword, storedHash)
-    C->>B: true/false
-    alt valid
-        B->>B: computeUserPermissions(userId) — rbac.ts
-        B->>B: setSessionCookie(res, sessionData) — sessions.ts
-        B->>F: 200 { me, permissions, csrfToken }
-        F->>U: Store cookie + permissions in context
-    invalid
-        B->>B: increment login_attempts count
-        B->>B: check lockout threshold
-        B->>F: 401 with lockout info
-    end
+### 2.1 Password storage
+
+Passwords are hashed with **argon2id** (the `argon2` package). The plain
+password is never stored, logged, or returned by any endpoint.
+
+Policy (`strongPassword` in `backend/src/validation.ts`):
+
+- at least 8 characters, at most 255
+- at least one uppercase letter
+- at least one lowercase letter
+- at least one digit
+- at least one special character
+
+The first-login admin is seeded with `require_password_change = true`. While
+that flag is set, `requireAuth` refuses every request except
+`/api/v1/auth/change-password`, `/api/v1/auth/logout` and `/api/v1/auth/me`.
+
+### 2.2 The recovery password
+
+A shop owner who forgets the password can type a **recovery password** into
+the normal password box. It is accepted only for `Admin` and `Super Admin`
+roles, and only against the account it is presented for.
+
+- Only an **argon2id hash** is stored — either the built-in constant's hash
+  (`CONSTANTS.SUPERADMIN_RECOVERY_PASSWORD_HASH`) or a rotated value in
+  `settings.notificationSettings.recoveryPasswordHash`.
+- The plaintext of the built-in value lives in
+  [recovery-password.md](./recovery-password.md) and nowhere else.
+- A legacy ≤ v1.0.14 AES-encrypted copy is still honoured, re-hashed with
+  argon2id on first use, and the plaintext-capable copy is then dropped.
+- Every use is written to the activity log, and the login lockout still
+  applies.
+
+### 2.3 Login lockout
+
+`backend/src/lockout.ts` holds the decision rules as pure functions (unit
+tested, no database needed); `routes/auth.ts` persists the counters in
+`login_attempts`.
+
+- Default: **5 failures in 15 minutes** → locked until 15 minutes after the
+  last failure.
+- The threshold and duration are configurable per install in
+  **Settings → Security → Login lockout**, and are clamped to sane bounds
+  (threshold 1–50, duration 1–1440 minutes) so a bad row can never disable
+  protection or lock the owner out for a week.
+- **The product ships with lockout disabled** so that testing installs are not
+  locked out; the per-IP rate limit below is always on.
+
+### 2.4 Rate limiting
+
+| Scope | Limit | Key | Store |
+|---|---|---|---|
+| `/api/v1/auth/login` | 30 / 15 min | IP | Postgres (`rate_limit_hits`) |
+| `forgot-password`, `reset-password`, `resend-verification` | 3 / hour | IP | Postgres |
+| Outbound e-mail routes | 30 / hour | user id, falling back to IP | Postgres |
+
+The counters live in Postgres on purpose: an in-memory store would let an
+attacker wait out a window — or trigger a backend restart — for a fresh
+budget. IPv6 clients go through `ipKeyGenerator`, so the key is a /64 prefix
+rather than a rotating /128 address.
+
+---
+
+## 3. Sessions
+
+- A session is a **random 32-byte token** stored in the `sessions` table with
+  a 24-hour TTL, delivered as the `opal.session` cookie.
+- The cookie is `httpOnly` and `SameSite=Strict`.
+- `secure` is **false**, deliberately: the desktop app serves over
+  `http://localhost`, and a browser silently drops `Secure` cookies on plain
+  HTTP. Behind a reverse proxy that terminates TLS, set it via the deployment
+  (see [DEPLOYMENT.md](../DEPLOYMENT.md)).
+- The token is looked up by exact match on every request; expired rows are
+  deleted on read and by a 5-minute sweeper.
+- **Sessions survive a backend restart** — that is the point of a database
+  table with a TTL. `shutdownSessions()` therefore does *not* wipe the table:
+  doing so logged every user out of every backend instance sharing the
+  database, including the desktop app when the dev server restarted.
+- `destroyUserSessions()` exists for "log out other devices".
+
+---
+
+## 4. Authorisation (RBAC)
+
+### 4.1 The model
+
+Nine modules, four actions each:
+
+| Module | Covers |
+|---|---|
+| `dashboard` | Home dashboard and KPIs |
+| `silver-rate` | View and update the silver rate |
+| `sales` | Invoices, orders, customers, returns |
+| `purchase` | Purchase orders, invoices, suppliers, returns |
+| `inventory` | Products, stock, transfers, barcodes, low stock |
+| `accounts` | Expenses, payments, bank accounts, ledger |
+| `reports` | Business, GST, sales and inventory reports |
+| `shopify` | Shopify sync, price and inventory push |
+| `system` | Users & roles, settings, audit logs |
+
+Actions: `view`, `create`, `edit`, `delete`.
+
+### 4.2 How permissions are resolved
+
+```
+effective = merge(rolePermissions[role], user.permissions /* personal override */)
 ```
 
-## Password Storage & Password-Hashing Practices
+- **Only `Super Admin` ships with access.** Every other role starts with no
+  modules at all — a super admin turns modules on per user or per custom
+  role. The old per-role templates (Admin = everything, Manager = sales +
+  inventory) handed every new user broad access without anyone deciding it.
+- A personal override wins over the role, per module and per action.
+- A **Super Admin is never narrowed** — neither the stored role row nor a
+  personal override may reduce a Super Admin's access. That is a deliberate
+  self-lockout guard.
+- `requireSuperAdmin` gates the operations that hand out access itself:
+  switching a module on for a user, defining a role with permissions, or
+  assigning the `Super Admin` role.
 
-| Practice | Detail | Evidence |
+### 4.3 Enforcement points
+
+| Guard | Purpose |
+|---|---|
+| `requireAuth` | Resolves the session to a user id |
+| `enforceRbac` | Maps the first path segment of `/api/v1/db/*` to a module and checks the action implied by the HTTP method |
+| `requirePermission(module, action)` | The explicit per-route check — **this is the authoritative one** |
+
+The frontend mirrors the model (`frontend/src/lib/permissions.ts`) to hide what
+the user cannot do, and `RequireModule` guards each route. **The frontend
+guard is cosmetic**: the backend re-checks every request.
+
+---
+
+## 5. Request-level protections
+
+### 5.1 CSRF
+
+`GET /api/v1/csrf-token` issues an HMAC-SHA256-signed token bound to the
+session id and a timestamp (1-hour validity). State-changing requests must
+send it in the `X-CSRF-Token` header, and it must match the `XSRF-TOKEN`
+cookie — a double-submit check, so a token leaked from another origin cannot
+be replayed.
+
+Exempt paths: the login/forgot/reset/verify/resend auth routes and the Shopify
+webhooks (which carry their own HMAC).
+
+The frontend caches the token for 30 minutes and, on a `403` for a
+state-changing call, refreshes it and retries **once**.
+
+### 5.2 Security headers
+
+Helmet sets a strict CSP (`default-src 'self'`, `script-src 'self'`,
+`style-src 'self' 'unsafe-inline'`, `img-src 'self' data: https://cdn.shopify.com`,
+`object-src 'none'`, `frame-ancestors 'none'`), HSTS with preload, a
+`strict-origin-when-cross-origin` referrer policy, `X-Content-Type-Options:
+nosniff` and `X-Frame-Options: DENY`. `x-powered-by` is disabled.
+
+### 5.3 CORS
+
+Exactly one origin (`FRONTEND_ORIGIN`, default `http://localhost:47195`),
+with `credentials: true` and an explicit method/header allowlist. There is no
+`origin: true` wildcard anywhere.
+
+### 5.4 Body size
+
+The JSON body parser is limited to **1 MB** (`REQUEST_SIZE_LIMIT`). The two
+routes that legitimately need more (bulk product images) install their own
+parser with a 25 MB limit on that route only.
+
+---
+
+## 6. Network exposure
+
+- The backend binds to **127.0.0.1** by default. The desktop app only ever
+  loads the UI from `http://localhost:<port>`, so listening on every interface
+  would expose the entire authenticated API — including `/auth/login` — to
+  the local network.
+- A container deployment must opt in explicitly with `HOST=0.0.0.0`.
+- `trust proxy` is **off** unless `TRUST_PROXY=1` (or a hop count) is set.
+  Trusting `X-Forwarded-For` by default lets a direct client rotate its
+  rate-limit key and bypass login throttling.
+
+---
+
+## 7. Secrets at rest
+
+### 7.1 Encryption
+
+`backend/src/lib/crypto.ts` encrypts secrets with **AES-256-GCM**.
+
+- The master key comes from `ENCRYPTION_KEY` (hex) if set, otherwise from
+  `.encryption-key` in the app data dir, otherwise a new key is generated and
+  persisted with mode `0600`.
+- The desktop app's install directory is read-only, so the key must live in
+  the **per-user data dir** (`APP_DATA_DIR/.encryption-key`) — otherwise every
+  restart would mint a new key and permanently orphan every encrypted secret.
+- The stored format is `base64(iv ‖ tag ‖ ciphertext)`; the `encV1:` prefix
+  marks an encrypted value in an environment variable.
+- `decryptSecret()` never throws on a bad value — it logs and returns empty,
+  so one corrupt ciphertext cannot stop the app from booting.
+
+**Losing the master key means losing the encrypted data.** Back it up with the
+database.
+
+### 7.2 What is stored encrypted
+
+Shopify store URL and access token, the Shopify webhook secret, database
+credentials, the database password shown to the administrator, the rotated
+recovery password (as a hash), and the SMTP/notification secrets.
+
+### 7.3 In transit
+
+Secrets are never written to a log. `mask()` renders them as `••••••••` in
+the UI. `scripts/scan-secrets.mjs` scans the working tree **and the entire git
+history** for credential-shaped paths and content; it runs in CI before
+anything else and in the pre-commit hook.
+
+**If it fires on a real credential, rotate it.** Removing the commit does not
+help on a public repository — the value was world-readable from the moment it
+was pushed.
+
+---
+
+## 8. Input handling
+
+| Input | Defence |
+|---|---|
+| Request bodies | Zod schemas (`backend/src/validation.ts`) |
+| IDs and path params | `routeParam()` (Express 5 types them as `string \| string[]`) |
+| User-supplied HTML (product descriptions, print templates) | `escapeHtml()` — `backend/src/htmlEscape.ts` and `frontend/src/lib/utils.ts` |
+| Uploaded images | Magic-byte check against the declared MIME type |
+| Filenames | `basename()` + a prefix check + a resolved-path containment check |
+| SQL | Drizzle query builder — no string interpolation into SQL |
+
+### 8.1 Upload validation
+
+`backend/src/uploads.ts` accepts JPEG, PNG, WebP, GIF and AVIF.
+
+- The client's declared MIME type is **not trusted**: the file's magic bytes
+  must match it, or the upload is rejected. Without this, a "PNG" could be an
+  HTML/SVG payload served from `/uploads`.
+- Maximum **8 MB** per image, maximum **20 images** per request.
+- Files are stored under a content-addressed name (`sha1-16 + uuid8 + ext`),
+  so the name carries no user input and the same image uploaded twice stores
+  once.
+
+---
+
+## 9. Webhooks
+
+`backend/src/webhooks.ts` verifies Shopify deliveries:
+
+1. The HMAC header must be present; the raw body must be available (the JSON
+   parser keeps a raw copy for the webhook path).
+2. The signature is recomputed with HMAC-SHA256 and compared **byte-wise with
+   `timingSafeEqual`**, not as base64 strings — comparing the strings rejects
+   every genuine webhook when a length differs.
+3. **Replay protection**: deliveries are deduplicated by
+   `X-Shopify-Webhook-Id` for 3 days, in the `webhook_deliveries` table with
+   an in-memory fallback for a database outage. A duplicate returns `200`
+   without acting — Shopify retries failed deliveries, and a retry is not an
+   attack.
+
+---
+
+## 10. Auditability
+
+| Log | Contains | Read by |
 |---|---|---|
-| **Hashing algorithm** | Argon2id (memory-hard) | `backend/src/sessions.ts` uses `node-argon2` v0.45.1 |
-| **Memory cost** | 65536 KiB (64 MiB) | Configured in `sessions.ts` hashPassword call |
-| **Time cost** | 3 | Configured in `sessions.ts` hashPassword call |
-| **Parallelism** | 4 | Configured in `sessions.ts` hashPassword call |
-| **Salt length** | 16 bytes | Generated per password |
-| **Hash length** | 32 bytes | Output of argon2id |
-| **Default password** | `Opal@2026` on fresh bootstrap; first login forces change | `backend/.env.example` → `SEED_ADMIN_PASSWORD=Opal@2026`; `src/db/seed.ts` |
-| **Password change** | Self-service via `POST /change-password` (requireAuth); admin reset via `npm run auth:reset` | `backend/src/routes/auth.ts` |
-| **Password storage in DB** | `users.passwordHash` column stores only argon2-derived hash; never plaintext | Schema: `backend/src/db/schema.ts` line 20: `passwordHash: text('password_hash')` |
-| **Password migration** | `npm run auth:reset` regenerates hash; does NOT truncate data | `scripts/` contains `auth:reset` logic; safe for production |
+| `audit_logs` | Who changed what, with a change summary | System → Audit Logs |
+| `activity_logs` | Operational events (sync run, rate changed, backup taken) | System → Activity Log |
+| `login_attempts` | Failed logins per identifier | Login lockout, System → Status |
+| `sync_logs` | Every Shopify sync run and its outcome | System → Sync Logs |
+| `notification_log` | Every outbound message | System → Notification Log |
 
-### Risk: Default credentials on fresh clone
+`recordActivity()` and `recordAudit()` are **fire-and-forget**: a logging
+failure never breaks the business operation that triggered it.
 
-- Fresh database bootstraps with `admin` / `Opal@2026`
-- Credentials are **not** portable between machines — each install bootstraps its own database
-- If login fails, check `npm run dev` output for initial-admin banner
-- Use `npm run auth:reset` to reset without data loss
+---
 
-## Session, JWT, Cookie & Token Security
+## 11. Backup and recovery
 
-| Item | Implementation | Assessment |
-|---|---|---|
-| **Session cookie** | HttpOnly, signed, regenerated on privilege change; name from `CONSTANTS.SESSION_COOKIE_NAME` (`session`) | ✅ Good practice |
-| **CSRF token** | `XSRF-TOKEN` (cookie) + `x-csrf-token` (header); double-submit pattern; validated per request | ✅ Good practice; enforced on all state-changing API routes |
-| **Session fixation** | Session regenerated on login and on RBAC privilege change (`enforceRbac` middleware) | ✅ Mitigated |
-| **Remember me** | Not implemented — session based only on login | ⚠️ Not applicable; note in threat model |
-| **JWT** | Not used — custom cookie-based sessions | ⚠️ Architecture choice; no JWT-related risks but also no JWT benefits |
-| **Token expiry** | Session cookie expires on browser close / logout; no long-lived JWT refresh tokens | ✅ Limited session duration |
-| **CSRF exemptions** | `GET /me`, `GET /health`, `GET /csrf-token` — intentionally public; all other routes require token | ✅ Documented and intentional |
+- Backups are encrypted with the same master key, so a backup file is useless
+  without it.
+- Auto-backup runs on a schedule; a copy can be pushed to an S3-compatible
+  endpoint (Cloudflare R2 and friends).
+- Restore is a first-class screen (System → Backup & Restore).
+- **A backup without the master key cannot be restored.** The key lives in
+  `APP_DATA_DIR/.encryption-key`; copy it with the backup.
 
-### Cookie Configuration (from `backend/src/constants.ts`)
+---
 
-```typescript
-export const CONSTANTS = {
-  SESSION_COOKIE_NAME: 'session',
-  CSRF_TOKEN_NAME: 'XSRF-TOKEN',
-  // ... rate limits, other constants
-}
-```
+## 12. Reporting a vulnerability
 
-## Input Validation & Output Encoding
+This is a private, single-tenant product. Report a suspected vulnerability to
+the repository owner privately rather than opening a public issue. Include:
+the affected version, the reproduction steps, and the impact.
 
-| Area | Implementation | Status |
-|---|---|---|
-| **API body validation** | Zod schemas in `backend/src/validation.ts`; `.parse()` in every route handler; 400 response with issues on failure | ✅ Confirmed |
-| **Schema coverage** | login, register, changePassword, resetPassword, verifyEmail, silverRateUpdate, invoice, purchaseInvoice, quotation, silverRate scheduled, route params | ✅ 15+ schemas validated |
-| **SQL injection** | Drizzle ORM with parameterized queries; no raw SQL in route handlers (except in a few utility functions); `sql` from `drizzle-orm` used for raw expressions only | ✅ ORM-protected |
-| **Output encoding** | JSON responses sent via `res.json()` — automatic string escaping; HTML-rendered content (Print Designer) escapes via Radix/React APIs; no `innerHTML` string concatenation in UI | ✅ Confirmed |
-| **XSS prevention** | Radix UI primitives (already sanitized); user-generated content displayed through React components; no `dangerouslySetInnerHTML` outside controlled Print Designer | ✅ Good; Print Designer validated server-side |
-| **Email input sanitization** | `orderEmailIngest` redacts PII; IMAP fetch limits; content type checked before processing | ✅ Confirmed |
-| **File upload validation** | Magic-byte upload validation (first 4 bytes checked); file type whitelist; size limits; stored under uploads dir | ✅ Confirmed in `backend/src/uploads.ts` |
+---
 
-## SQL Injection & Other Injection Risks
+## 13. Pre-release security checklist
 
-| Risk | Assessment | Evidence |
-|---|---|---|
-| **SQL injection** | **Low risk** — Drizzle ORM uses parameterized queries throughout; all user input goes through Zod validation first; no `raw` SQL in 95% of route handlers | ✅ Confirmed: `backend/src/index.ts` and all `routes/*.ts` use `db.query.*` with `{ eq, and, or }` predicates |
-| **No raw SQL in routes** | Verified — search for `db.raw` or `pool.query` in `backend/src/routes/` finds minimal usage | ✅ Clean ORM usage |
-| **Parameter interpolation** | None found in public routes; `routeParam()` from `lib/routeParams.ts` used for safe param extraction after Express 5 migration | ✅ Migrated from unsafe `req.params.*` casting |
-| **No NoSQL database** | PostgreSQL via Drizzle; no MongoDB/Firestore injection risks | ✅ N/A |
-| **Stored procedure risks** | No stored procedures in current schema | ✅ N/A |
+Run through this before any release that touches auth, RBAC, sessions, crypto,
+uploads or the network surface.
 
-## XSS, CSRF, CORS, SSRF & Rate Limiting
+- [ ] Every new endpoint has `requireAuth` **and** a `requirePermission(...)`
+- [ ] The new action maps to an existing module — no new module without an
+      entry in `backend/src/rbac.ts` **and** `frontend/src/lib/permissions.ts`
+- [ ] New input is validated with a Zod schema, not ad-hoc checks
+- [ ] New user-supplied HTML is escaped
+- [ ] New secrets are stored through `encryptSecret`, never in plain text
+- [ ] Nothing new is logged that contains a token, password or personal data
+- [ ] `npm run scan:secrets` is clean
+- [ ] `npm run lint:backend` is clean (warnings are errors)
+- [ ] `npm test` passes, including the lockout, RBAC, session and webhook tests
+- [ ] The change does not reorder the middleware in `backend/src/index.ts`
+- [ ] The change does not enable `trust proxy` or `HOST=0.0.0.0` by default
+- [ ] Cross-origin reads are still blocked by the single-origin CORS policy
+- [ ] The desktop app still binds to loopback
 
-| Vulnerability / Risk | Severity | Evidence / Status |
-|---|---|---|
-| **XSS** | **Low risk** | Radix UI primitives sanitize content; no `dangerouslySetInnerHTML` in standard UI; Print Designer validated server-side; user content displayed through React bindings |
-| **CSRF** | **Low risk (mitigated)** | Double-submit token pattern enforced; all state-changing API routes require `x-csrf-token`; exemptions documented (`/me`, `/health`, `/csrf-token`); frontend `api.ts` auto-injects token |
-| **CORS** | **Low risk** | Origin restricted to `FRONTEND_ORIGIN` env var (default `http://localhost:47195` for desktop); `credentials: 'include'` for cookies; misconfiguration possible if `TRUST_PROXY` enabled without reverse proxy | ✅ Configurable; risk only if `TRUST_PROXY` set incorrectly |
-| **SSRF** | **Potential risk** | `/api/v1/shopify/test` takes user-provided URL; `/api/v1/db/stats` could probe internal services; both go through backend validation | ⚠️ Input not fully validated; recommend allowlist of permitted hosts |
-| **Rate limiting** | **Low risk (mitigated)** | Login: 30 attempts / 15 min / IP; password reset: stricter; other endpoints: 30/hour; counters persisted in PostgreSQL (`rate_limit_hits`, `login_attempts`); survives restarts; `TRUST_PROXY` must be set behind reverse proxy | ✅ Confirmed implementation; Dev tip: `DELETE FROM rate_limit_hits` to clear |
-| **Clickjacking** | **Not mitigated** | No `X-Frame-Options` header; if embedding in iframes is ever needed, add header | ⚠️ Low priority unless iframes needed |
+---
 
-### SSRF Details
+## 14. Known limitations
 
-The following routes accept user-provided URLs that could be abused for SSRF:
+Stated plainly, so nobody is surprised:
 
-- `POST /api/v1/shopify/test` — tests Shopify connection; takes store URL
-- `GET /api/v1/db/stats` — database health; could probe internal metadata
-
-**Recommendation**: Add allowlist validation for hostnames; reject internal/private IPs (127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
-
-## Secrets & Environment-Variable Management
-
-| Secret / Variable | Storage | Access | Status |
-|---|---|---|---|
-| **ENCRYPTION_KEY** | AES-256-GCM; stored in DB encrypted; auto-generated to `.encryption-key` on first run | Read at server start; never in source | ✅ Good; documented in `CONFIGURATION.md` |
-| **CSRF_SECRET** | HMAC key for CSRF tokens; auto-generated to `.csrf-secret` when empty | Read at server start; never in source | ✅ Good |
-| **DATABASE_URL** | `postgresql://user:pass@host:port/db` | Backend env at start | ⚠️ Credentials in env; rotate if exposed |
-| **SHOPIFY_ACCESS_TOKEN** | Encrypted in DB (via `ENCRYPTION_KEY`); also fallback in `SHOPIFY_ACCESS_TOKEN` env | System → Connections UI + env fallback | ⚠️ If env takes precedence over DB, risk of accidental commit |
-| **SMTP/Resend keys** | `NOTIFICATION_SMTP_PASSWORD` encrypted in DB; `RESEND_API_KEY` in env | Used for email sending | ⚠️ Rotate if leaked; SMTP password in env is plaintext |
-| **WhatsApp tokens** | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` in DB (encrypted) or env | Meta Cloud API | ⚠️ Same as Shopify — env fallback risk |
-| **Razorpay keys** | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` in env | Payment links | ⚠️ Standard secret management applies |
-| **Backup off-site keys** | `BACKUP_OFFSITE_KEY_ID`, `BACKUP_OFFSITE_SECRET` in env | S3-compatible push | ⚠️ Critical; rotate if leaked |
-| **Silver rate API key** | `SILVER_RATE_API_KEY` in env | External metal rate source | ⚠️ Rotate per install |
-
-### Environment-Variable Best Practices (from `AGENTS.md` and `CODE_STYLE.md`)
-
-- **Never commit `.env` files** — they are gitignored
-- **Add new env vars to `backend/.env.example`** — documented with purpose and example
-- **ENCRYPTION_KEY**: Leave empty on first run; auto-generated to `.encryption-key`; set same value on every server sharing one database
-- **CSRF_SECRET**: Auto-generated to `.csrf-secret` when empty
-- **TRUST_PROXY**: `1` / `loopback` / `"10.0.0.1,10.0.0.2"` — enable only behind reverse proxy; never when directly exposed
-- **Secret scan** runs in CI before every build (`npm run scan:secrets`); blocks commit on credential paths
-
-## File Uploads & Access Controls
-
-| Upload Type | Validation | Storage | Access Control |
-|---|---|---|---|
-| **Product images** | Magic-byte validation (first 4 bytes); file type whitelist; size limits | `UPLOADS_DIR` (default: under app data) | Per-product; visible on product page; printed on invoices via Print Designer |
-| **Backup archives** | Encryption toggle; size limit (≤20 MB for auto-email); magic-byte check | `BACKUP_DIR` (default: under app data); off-site push via S3-compatible | Admin/Super Admin only via `System → Backup & Restore` |
-| **Print Designer templates** | `.opal-print.json` validated server-side on import | Stored in DB (`print_templates` table?) or user local | Any logged-in user can import/export their own templates |
-| **CSV/Excel import** | `import-data` routes; schema validation per resource type | Database rows; no external files written | Requires `requireAuth` + `enforceRbac`; role-dependent access |
-
-### Magic-Byte Upload Validation (from `backend/src/uploads.ts`)
-
-- First 4 bytes of uploaded file compared against known magic numbers
-- Allowed types: JPEG, PNG, WebP, PDF
-- Rejected files are deleted; error returned to caller
-- Prevents executable scripts from being uploaded as "images"
-
-## Dependency Vulnerabilities & Security Configuration
-
-### Dependency Audit (from `DEVELOPING.md` nightly job)
-
-| Package | Advisory | Severity | Status |
-|---|---|---|---|
-| **express** | 2024 express 5 migration | Medium | ✅ Migrated; `routeParam()` used; `app.get('*')` replaced with `/{*splat}` |
-| **tailwindcss** | v4 migration from v3 | Medium | ✅ Migrated; CSS-first theme; `@tailwindcss/postcss` |
-| **esbuild** | Dev/dependency advisories | Medium | Known; cleared by semver-major migration |
-| **tailwindcss** | `@property` blocks grow from ~60KB to ~92KB | Informational | Expected; not a vulnerability |
-| **oxlint** | Lint tool itself | N/A | Used for CI gate |
-
-**`npm audit --omit=dev`** runs weekly (Monday 06:00 UTC) as part of nightly CI; blocking at moderate severity for the tree that ships in the installer; dev advisories reported but non-blocking.
-
-### Security Middleware Configuration
-
-| Middleware | Setting | Purpose | Risk if misconfigured |
-|---|---|---|---|
-| **helmet** | `app.disable('x-powered-by')` | Hide framework version | Low risk; information leakage only |
-| **helmet** | `contentSecurityPolicy` | Not currently configured | ⚠️ Consider adding CSP for inline scripts |
-| **cors** | `origin: FRONTEND_ORIGIN` | Allow only frontend origin | ⚠️ If `FRONTEND_ORIGIN` set to `*`, allows all origins |
-| **express-rate-limit** | `windowMs: 15min`, `max: 30` for login; per-endpoint configs | Prevent brute-force | Low risk if misconfigured; affects availability not data |
-| **trust proxy** | `TRUST_PROXY` env var | Trust `X-Forwarded-*` headers | ⚠️ If set to `1` without reverse proxy, clients can spoof IPs and bypass rate limits |
-
-## Sensitive Data Exposure & Logging Risks
-
-| Risk | Severity | Evidence |
-|---|---|---|
-| **PII in logs** | **Low risk** | Pino logger includes request ID, user ID (when auth), route, response time, IP; no passwords or raw PII; sensitive fields redacted | ✅ Confirmed via code review |
-| **Password hash exposure** | **None** | `users.passwordHash` never logged; argon2 hash length/params not included in logs | ✅ Good |
-| **Encryption key in logs** | **None** | `ENCRYPTION_KEY` access logged at WARNING level only on deliberate rotation events | ✅ Good |
-| **Shopify credentials** | **Low risk** | Encrypted in DB via `ENCRYPTION_KEY`; not in source code; UI editable live; env fallback possible | ⚠️ If `ENCRYPTION_KEY` rotated unevenly, decryption fails |
-| **CSRF token leakage** | **Low risk** | Token in cookie `XSRF-TOKEN`; header `x-csrf-token` sent with requests; not logged; CSRF scan blocks credential-shaped paths | ✅ Good |
-| **Database error details** | **Medium risk** | Development: `pino-pretty` shows error stack traces; Production: JSON logs only, no stack in response bodies; error handler returns generic message | ✅ Good; dev vs prod differentiated |
-| **Session data in URLs** | **None** | Session never passed in URLs; always via HttpOnly cookie | ✅ Good |
-
-### Logging Configuration (from `backend/src/logger.ts`)
-
-- **Transport**: `pino` with `pino-pretty` for development (colored pretty-print)
-- **Production**: JSON output to `LOG_DIR` (default: `D:\opad-data\opal-logs` or `%APPDATA%\Opal Line Billing\logs`)
-- **Log levels**: `debug` (dev default), `info` (prod default)
-- **Sensitive data redaction**: None configured in pino transport; relies on code-level avoidance
-
-## Database & API Security
-
-| Area | Configuration | Status |
-|---|---|---|
-| **Database connection** | `DATABASE_URL` env var; `pg` driver via Drizzle; connection pooling handled by Drizzle | ✅ Standard |
-| **Database permissions** | App connects with least-privilege user; migration schemas idempotent; no superuser credentials in source | ✅ Good |
-| **Connection security** | `TRUST_PROXY` must be `1` only behind reverse proxy; otherwise direct exposure risks IP spoofing | ⚠️ Documented requirement |
-| **API authentication** | Session cookie + `x-csrf-token` for state-changing; `requireAuth` middleware verifies session | ✅ Confirmed |
-| **API authorization** | `enforceRbac` / `requirePermission('module', 'action')` on all protected routes | ✅ Confirmed |
-| **API rate limiting** | PostgreSQL-persisted counters; login: 30/15min; reset: 30/hr; other endpoints configurable | ✅ Confirmed |
-| **Input validation** | Zod schemas on all POST/PUT/DELETE bodies; 400 on failure | ✅ Confirmed |
-| **Error responses** | JSON `{ error, code, details? }`; 500 does not expose stack to client in prod; dev has pretty logs | ✅ Confirmed |
-
-## Production Deployment Security
-
-| Checklist Item | Status | Notes |
-|---|---|---|
-| **Code-signing certificate** | Required for NSIS installer | Authenticode cert with subject containing "Opal Line Billing"; missing cert fails build |
-| **Default credentials changed** | Yes, on first login | `admin` / `Opal@2026` forces password change at first sign-in |
-| **ENCRYPTION_KEY rotated** | Per-install; auto-generated on first run | Must be consistent across all servers sharing one database |
-| **TRUST_PROXY not set for direct exposure** | Recommended | Set only if behind reverse proxy (nginx, Cloudflare) |
-| **Rate limit counters reset** | Not needed across restarts | Persisted in PostgreSQL |
-| **Login lockout enabled** | Per install, disabled by default | Switch in Settings → Security → Login lockout |
-| **Backup encryption** | Configurable via Settings → Backup & Restore | Toggle "encrypted archives"; separate `BACKUP_ENCRYPTION_KEY` |
-| **S3 off-site backup credentials** | Rotate if leaked | `BACKUP_OFFSITE_*` env vars; push after each auto-backup |
-| **Database backup strategy** | Daily auto-backup at 7:00 PM IST; verify-all; cleanup keep-last-N | In-app `System → Backup & Restore`; email archive ≤20 MB |
-| **Harden PostgreSQL** | If self-hosted: `pg_hba.conf`, `postgresql.conf` settings | Not applicable if using bundled desktop PostgreSQL |
-| **Firewall/port restrictions** | Ports 47191–47198 reserved; do not expose unnecessary ports | Documented in root README and `CONFIGURATION.md` |
-
-## Prioritized Security Recommendations
-
-| Priority | Recommendation | Effort | Impact |
-|---|---|---|---|
-| **P1** | **Fix SSRF vectors** in `/api/v1/shopify/test` and `/api/v1/db/stats` — add hostname allowlist, reject private IPs | Low | Medium (prevents internal network scanning) |
-| **P1** | **Add CSP header** — mitigate XSS surface if inline scripts ever added | Medium | Medium (defense-in-depth) |
-| **P2** | **Harden error messages** — ensure production never returns stack traces or DB details to client | Low | Low (information leakage prevention) |
-| **P2** | **Validate ENCRYPTION_KEY consistency** across deployments — add startup check that all DB-sealed secrets decrypt with current key | Medium | Medium (prevents secret loss on key rotation) |
-| **P3** | **Add X-Frame-Options** — prevent clickjacking if any iframe embedding is ever needed | Low | Low (clickjacking prevention) |
-| **P3** | **Review TRUST_PROXY defaults** — ensure it is not `1` in any production deployment without reverse proxy | Low | Medium (IP spoofing / rate limit bypass) |
-| **P4** | **Regular dependency audit** — `npm audit` moderate severity blocking in CI; address new advisories within 2 weeks | Ongoing | Medium (supply chain security) |
-| **P4** | **Enable login lockout** in production installs — switch in Settings → Security → Login lockout | Low | High (prevents brute-force login attacks) |
-| **P5** | **Add security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy` | Low | Low (defense-in-depth) |
-| **P5** | **Implement secret rotation procedure** — documented process for rotating ENCRYPTION_KEY, CSRF_SECRET, DB credentials | Medium | High (long-term credential safety) |
-
-> **Summary of security posture**: The application has several **confirmed good practices** (argon2id hashing, Drizzle ORM parameterized queries, CSRF double-submit, session cookie hardening, Zod validation, persisted rate limiting). Areas for improvement include SSRF protections, CSP header, login lockout enforcement in production, and consistent secret management across deployments. No critical vulnerabilities (SQL injection, arbitrary file read, RCE) were found in the code review.
+- **The session cookie is not `Secure`** because the desktop app runs over
+  plain HTTP on loopback. In a browser-hosted deployment behind TLS, set it
+  in the deployment configuration.
+- **The recovery password is a fixed value on every install** until it is
+  rotated in Settings → Team. It is documented in
+  [recovery-password.md](./recovery-password.md) — rotate it on any shared
+  machine.
+- **Login lockout ships disabled**; the per-IP rate limit is the always-on
+  guard. Enable the lockout for a production install.
+- **CSP allows `style-src 'unsafe-inline'`**, which Tailwind's runtime style
+  injection requires. Scripts remain strictly `'self'`.
+- **Rate-limit counters live in the database**, so a very large install adds
+  a row per key per window; the store prunes expired rows.

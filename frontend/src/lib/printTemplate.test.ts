@@ -145,7 +145,10 @@ test('per-line GST prints as money, never as a percentage, and unknown snapshots
   // Order-raised items carry no silver-rate snapshot: 0 renders as the same
   // dash the invoice screen shows, not a fake ₹0.00.
   assert.ok(!html.includes('₹0.00'), 'unknown rate/making snapshots must not print as ₹0.00')
-  assert.ok(html.includes('₹45.00'), 'the real making charge must still print')
+  // A real making charge prints as the per-line "Making Value"
+  // (10 g × ₹45/g = ₹450.00), the same breakdown the invoice screen
+  // shows as "₹45.00/g = ₹450.00".
+  assert.ok(html.includes('₹450.00'), 'the real making value must still print')
 
   // Percentage labels in the totals box are the GST rate halves only.
   assert.ok(html.includes('CGST @ 1.5%'))

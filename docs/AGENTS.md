@@ -1,166 +1,273 @@
-# AGENTS.md — AI Coding Agent Instructions
+# AGENTS.md
 
-This file provides project-specific instructions for AI coding agents working on the Opal Line Billing ERP.
+Operating guide for an AI agent (or a new contributor) working in this
+repository. It assumes you can read code but does not assume you know this
+project.
 
-## Repository Structure
+**Read this before your first change.** Most of the mistakes that happen here
+are not coding mistakes — they are "did not know the app runs on loopback with
+its own database" mistakes.
 
-```
-Opal-Line/
-├── docs/                     # This directory — documentation index + guides
-├── frontend/                 # React + Vite + Tailwind CSS v4 SPA
-│   ├── src/                  # TypeScript source (1278+ type defs)
-│   │   ├── pages/            # 60+ page components (lazy-loaded)
-│   │   ├── components/       # UI layout + primitives + RequirePermission
-│   │   ├── auth/             # AuthProvider, AuthContext
-│   │   ├── lib/              # API clients, theme, permissions, utils
-│   │   ├── types/            # 1278+ TypeScript interfaces
-│   │   ├── hooks/
-│   │   └── config/
-│   ├── vite.config.ts        # Vite dev server, /api → localhost:47191 proxy
-│   ├── tsconfig*.json        # 4 TS project references; @/* → ./src/*
-│   ├── .oxlintrc.json        # oxlint config
-│   ├── postcss.config.js     # Tailwind CSS 4 + @theme CSS-first block
-│   └── package.json
-├── backend/                  # Express + Drizzle ORM + PostgreSQL (TS)
-│   ├── src/                  # TypeScript source (~97 route + lib files)
-│   │   ├── index.ts          # App entry (450+ lines, full route registration)
-│   │   ├── routes/           # 24 route modules (auth, rbac, silver, shopify, etc.)
-│   │   ├── db/               # Drizzle client, schema (100+ tables), migrations, seed
-│   │   ├── types/
-│   │   ├── lib/              # Utility libs (routeParams, crypto, pgRateLimitStore, etc.)
-│   │   ├── validation/       # Zod validation schemas
-│   │   ├── constants.ts      # Application constants (rate limits, cookie names)
-│   │   ├── logger.ts         # Pino logger config
-│   │   ├── sessions.ts       # Session management (create/destroy/verify)
-│   │   ├── rbac.ts           # Role-based access control computation
-│   │   ├── activity.ts       # Activity/audit logging
-│   │   ├── lockout.ts        # Login lockout management
-│   │   └── 97+ other feature files
-│   ├── drizzle.config.ts     # Drizzle-kit migration config
-│   ├── package.json          # Dependencies: argon2, drizzle-orm, express, helmet,
-│   │                           express-rate-limit, postgres, qrcode, resend, pdfkit,
-│   │                           zod, aws4fetch, cookie-parser, cors
-│   ├── tsconfig.json         # module: preserve, moduleResolution: bundler, target ES2022
-│   └── .env.example          # All environment variables with examples
-├── electron/                 # Electron desktop app (v44.8.0, NSIS installer)
-│   ├── dist-electron/        # Built installer resources
-│   └── scripts/              # Build/packaging scripts
-├── e2e/                      # Playwright end-to-end tests (53 tests)
-├── scripts/                  # 50+ automation scripts
-├── shopify-templates/        # Shopify liquid templates
-└── .github/workflows/        # CI/CD configurations
-```
+---
 
-## Coding Rules & Naming Conventions
+## 1. What this repository is
 
-| Category | Convention | Example |
-|---|---|---|
-| **TypeScript interfaces** | PascalCase interface name, prefixed if domain-specific | `interface UserSession { ... }` |
-| **Functions** | camelCase, verb-noun order where applicable | `computeUserPermissions()` |
-| **Components** | PascalCase, file name matches | `AppShell.tsx`, `RequirePermission.tsx` |
-| **Route handlers** | camelCase, grouped by feature | `authRouter`, `silverRateRouter` |
-| **Variables** | camelCase, descriptive | `DATABASE_URL`, `csrfToken` |
-| **Constants** | UPPER_SNAKE_CASE (TS) or pascalCase (exported const) | `CONSTANTS` object, `MAX_LOGIN_ATTEMPTS` |
-| **Database tables** | snake_case (SQL) | `users`, `roles`, `products` |
-| **Migration files** | YYYY_MM_DD_description.ts | `2024_01_15_add_users_table.ts` |
-| **Env variables** | UPPER_SNAKE_CASE | `DATABASE_URL`, `PORT`, `SEED_ADMIN_PASSWORD` |
-| **Aliases/imports** | `@/` prefix resolves to `./src/` | `import { db } from '@/db/client'` |
+Opal Line Billing — a jewellery-billing ERP for silver retailers. React +
+Vite frontend, Express + Drizzle + PostgreSQL backend, packaged as a signed
+Windows desktop app (Electron) and also runnable as a web stack.
 
-### Import Organization (TypeScript)
+- Product overview: [PRD.md](./PRD.md)
+- Architecture: [ARCHITECTURE.md](./ARCHITECTURE.md)
+- Conventions: [CODE_STYLE.md](./CODE_STYLE.md)
+- UI rules: [DESIGN_SYSTEM.md](./DESIGN_SYSTEM.md)
+- Security model: [SECURITY.md](./SECURITY.md)
+- Tests: [TESTING.md](./TESTING.md)
 
-1. Built-in Node.js modules (always first)
-2. Third-party packages (alphabetical)
-3. Internal project imports (alphabetical by path, `@/`-preferred)
-4. Type imports separated from value imports when using `import type`
+---
 
-```typescript
-// Good
-import express from 'express'
-import { db, schema } from '@/db/client'
-import type { User } from '@/types'
+## 2. Ground rules
 
-// Avoid — mixed default+value from same module without type:
-import { db } from '@/db/client'  // use import type for selectors only
+1. **Never weaken a check to make a test pass.** Fix the cause. If a guard is
+   correct and a test is wrong, fix the test — and say so in the commit.
+2. **Never commit a credential.** `npm run scan:secrets` runs in CI over the
+   working tree *and* the whole git history. If it fires on a real value,
+   rotate it — deleting the commit does not help on a public repository.
+3. **Never write to a real database.** The desktop app's cluster is on
+   `47193` (`opal_line`), the dev stack's on `47194` (`opal_line_dev`). Both
+   hold shop data. Use a scratch database.
+4. **Never reorder the middleware in `backend/src/index.ts`.** The order *is*
+   the security contract.
+5. **Never bypass the permission model.** A new endpoint without
+   `requirePermission(...)` is a vulnerability.
+6. **Comments explain the why.** A comment that restates the code is noise; a
+   comment that records a past bug is the most valuable line in the file.
+7. **Report what you actually ran.** Say "typecheck and unit tests pass" — not
+   "it works". Distinguish *read*, *typechecked* and *executed*.
+
+---
+
+## 3. Setup
+
+```bash
+npm ci                # installs both workspaces (hoisted to the root)
+npm run dev           # provisions a dev PostgreSQL on 47194, starts API + UI
 ```
 
-## Commands
+`npm run dev` on its first run provisions a **dev-only** PostgreSQL cluster
+and writes `backend/.env`. Nothing external is needed.
 
-| Command | What it does | Location |
+**Verify the stack is up:**
+
+```bash
+curl http://127.0.0.1:47191/api/v1/health
+# → {"database":{"configured":true,"healthy":true,"latencyMs":1,...}}
+```
+
+**Login:** a fresh clone has an `admin` user with password `Opal@2026` and a
+forced password change. After `npm run db:seed` the demo user is
+`arjun` / `Opal@2026`. Credentials do **not** travel between machines —
+every checkout bootstraps its own database.
+
+Enable the pre-commit secret guard once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+---
+
+## 4. The commands that matter
+
+| Command | What it does | When |
 |---|---|---|
-| `npm ci` | Installs both workspaces (root hoisted) | Root |
-| `npm run dev` | Backend + frontend with hot reload (first run provisions PostgreSQL + `backend/.env`) | Root |
-| `npm test` | Backend unit tests (237+ passing via `tsx`) | Root / backend/ |
-| `npm run typecheck` | Backend `tsc --noEmit` | Root |
-| `npm run lint` | Frontend oxlint | Root / frontend/ |
-| `npm run build` | Frontend production build (`tsc -b && vite build`) | Root |
-| `npm run electron:dev` | Desktop window (Electron) on dev stack | Root |
-| `npm run electron:build` | NSIS installer → `dist-electron/` | Root |
-| `npm run db:push` | Push schema to dev PostgreSQL (port 47194) | Root |
-| `npm run db:generate` | Generate Drizzle migrations from schema | Root |
-| `npm run scan:secrets` | Run secret-scan before every push | Root |
-| `npm run test:e2e` | Playwright against running app | Root |
-| `npm run auth:reset` | Reset admin password / lockout counters | Root |
+| `npm run dev` | Backend + frontend with hot reload | Day-to-day work |
+| `npm run dev:server` / `npm run dev:web` | One side only | Isolating a bug |
+| `npm run lint` | Frontend oxlint | Before every commit |
+| `npm run lint:backend` | Backend oxlint, `--max-warnings 0` | Before every commit |
+| `npm run typecheck` | Backend `tsc --noEmit` | Before every commit |
+| `npm test` | Backend unit tests | Before every commit |
+| `npm run build` | Frontend `tsc -b && vite build` | Before every commit |
+| `npm run scan:secrets` | Credential scan | Before every push |
+| `npm run test:e2e` | Playwright (needs the stack running) | UI changes |
+| `npm run electron:dev` | Desktop window over the dev stack | Desktop-only behaviour |
+| `npm run electron:build` | Signed NSIS installer | Release work |
+| `npm run db:push` | Drizzle schema push | Schema changes in dev |
+| `npm run db:generate` | Generate SQL migrations | Schema changes |
 
-### Development Workflow
+**The CI gate is exactly:** `scan:secrets` → `lint` → `lint:backend` →
+`check-palette` → `typecheck` → `test` → `upgrade-path test` → `build`. A
+change is not done until all of it is green locally.
 
-1. `npm ci` — install dependencies (root-level hoisted workspace)
-2. `npm run dev` — starts backend (`tsx watch src/index.ts` on port 47191) + frontend (`vite` on port 47195)
-3. First run: `backend/.env` is written automatically; dev PostgreSQL on port 47194 is provisioned
-4. Login: `admin` / `Opal@2026` (first login forces password change)
-5. Run `npm run db:seed` for demo data (creates `arjun` user, sample roles, settings row)
-6. Access UI at `http://127.0.0.1:47195`, API at `http://localhost:47191`
+---
 
-## Architecture Rules & Module Boundaries
+## 5. Repository map
 
-| Boundary | Rule | Rationale |
-|---|---|---|
-| **Frontend ↔ Backend** | All API calls go through `frontend/src/lib/api.ts` — never direct fetch to backend port | Centralizes base URL, error handling, CSRF token injection |
-| **Backend routes** | Each route file exports an Express router; register in `index.ts` via `app.use('/api/v1/<feature>', <router>)` | Ensures consistent `/api/v1/` prefix for all endpoints |
-| **RBAC enforcement** | Use `requireAuth` middleware (session check) + `enforceRbac` / `requirePermission` (module/action check) on route handlers | `requirePermission('silver-rate', 'edit')` guards specific actions |
-| **Database access** | All queries go through Drizzle ORM (`backend/src/db/client.ts`); raw SQL only in migrations | Type safety, migration-driven schema evolution |
-| **Session storage** | Cookie-based sessions with `setSessionCookie`/`destroySession`; Argon2 password hashing | Persisted across requests, CSRF-protected, secure password storage |
-| **CSRF protection** | Double-submit token: `XSRF-TOKEN` cookie + `x-csrf-token` header on state-changing requests | Prevents cross-site request forgery; enforced on all POST/PUT/DELETE `/api/v1/*` |
+```
+backend/src/
+  index.ts              app assembly — middleware order, CSRF, static, routes
+  routes/               one router per domain
+  db/schema.ts          53 tables (Drizzle)
+  db/bootstrap.ts       DDL + role seeding + first admin (runs every boot)
+  lib/                  pure helpers with unit tests
+  *.ts                  domain modules (shopify, purchases, stock, …)
+frontend/src/
+  pages/                63 page components (lazy-loaded)
+  components/ui/        the design-system primitives
+  components/           feature components
+  lib/api/              typed API client
+  auth/                 AuthProvider
+  types/                shared types
+electron/               main process, preload bridge, print, updater
+e2e/                    Playwright specs
+scripts/                build, packaging, audit utilities
+docs/                   this documentation set
+```
 
-### Safe File-Editing Practices
+**Read `backend/src/index.ts` first** if you are new: it shows how the app is
+assembled and where every guard sits.
 
-- **Never edit `backend/.env`** after bootstrapping unless rotating secrets — each environment has its own database.
-- **Never commit `.env` files** or any credential-shaped files. The `.githooks/pre-commit` hook blocks credential paths.
-- **Always run `npm run typecheck`** after adding new routes or modifying schema types.
-- **Always run `npm test`** after adding or modifying backend feature logic; 237+ unit tests must pass.
-- **Never hardcode API base URLs** — use the proxy `/api` → `localhost:47191` in dev, or `VITE_API_PROXY` env var in production.
-- **When adding new env vars**, add to `backend/.env.example` and document in `docs/CONFIGURATION.md`.
-- **Database migrations**: run `npm run db:generate` to create migration file, then `npm run db:push` to apply. Never hand-write SQL outside migrations.
+---
 
-## Database Migration Rules
+## 6. Common tasks
 
-- **Generate**: `npm run db:generate` — creates migration file in `backend/drizzle/` (or `backend/src/db/migrations/`)
-- **Push**: `npm run db:push` — applies migration to the active PostgreSQL instance
-- **Never edit migration SQL files directly** after generation — use `npm run db:generate` for changes
-- **Seed data**: `npm run db:seed` creates demo users, roles, and a settings row. Never run on production.
-- **First-run bootstrap**: `npm run dev` provisions dev PostgreSQL (port 47194), writes `backend/.env`, runs `db:push` + `db:seed` automatically.
-- **Migration idempotency**: Schema additions are idempotent and applied on every start (`purchase_invoice_items`, `purchase_order_items`, etc.)
+### Add an API endpoint
 
-## Security Requirements
+1. Decide the module. If it is new, add it to `backend/src/rbac.ts`
+   (`MODULES`) **and** `frontend/src/lib/permissions.ts` — they must agree.
+2. Add the route in the matching `backend/src/routes/*.ts` with an explicit
+   `requirePermission(module, action)`.
+3. Validate the body with a Zod schema in `backend/src/validation.ts` and the
+   `validate(schema)` middleware.
+4. Handle `db === null` (`requireDb(res)`) and answer `503`, not `500`.
+5. Add the client method in `frontend/src/lib/api/<domain>.ts`.
+6. Add a test.
 
-- **Argon2id** password hashing: memory 65536 KiB, time cost 3, parallelism 4, 16-byte salt, 32-byte hash (`node-argon2` v0.45.1)
-- **CSRF double-submit** on all state-changing API requests (`x-csrf-token` header + `XSRF-TOKEN` cookie)
-- **Login lockout** configurable via Settings → Security (default: 5 attempts / 15 min, stored in `login_attempts` table)
-- **Rate limiting** persisted in PostgreSQL (`rate_limit_hits`, `login_attempts`) — survives restarts
-- **Session cookies** are HTTP-only, signed, and regenerated on login
-- **ENCRYPTION_KEY** (64-char hex) AES-256-GCM for DB-sealed secrets (Shopify tokens, SMTP, WhatsApp)
-- **Never store plaintext passwords** — `users.passwordHash` is always argon2-derived
-- **Secrets never in source** — all credentials via `backend/.env` or database encryption
-- **Secret scan** runs in CI before every build (`scripts/scan-secrets.mjs`); blocks commit on credential paths
+### Add a page
 
-## Rules Agents Must Follow Before Modifying Existing Features
+1. Create `frontend/src/pages/<Name>.tsx` with a **default export** (lazy
+   loading needs one).
+2. Add the route in `frontend/src/App.tsx` wrapped in `guarded('module', …)`.
+3. Add a sidebar entry in `frontend/src/config/navigation.ts`.
+4. Use `PageHeader`, `DataTable`, `EmptyState` and the format helpers.
 
-1. **Run `npm run typecheck`** — ensure TypeScript compilation succeeds
-2. **Run `npm test`** — ensure all 237+ existing unit tests still pass
-3. **Check RBAC implications** — if adding a new module/action, update `rbac.ts` permission computation and ensure route guards are consistent
-4. **Check CSRF requirements** — state-changing routes require `x-csrf-token` header; ensure frontend client sends it
-5. **Check session/scope impact** — if modifying auth flow, verify `sessions.ts` and `auth-provider.tsx` changes are consistent
-6. **Run `npm run scan:secrets`** — ensure no credentials are exposed in new code
-7. **Update `docs/CONFIGURATION.md`** if adding new env vars
-8. **Update `docs/AGENTS.md`** if coding rules change
-9. **Never modify `backend/.env`** directly after bootstrap — use the bootstrap process or `npm run auth:reset` for password changes
-10. **If adding a new API endpoint**, add route handler in `backend/src/routes/`, export router, and register in `index.ts` under `/api/v1/`
+### Change the schema
+
+1. Edit `backend/src/db/schema.ts`.
+2. `npm run db:push` for the dev database.
+3. If the change needs Drizzle cannot express (triggers, partial indexes),
+   add it to `backend/src/db/bootstrap.ts` — **and** make sure
+   `backend/src/db/upgrade.test.ts` proves an existing install gains it.
+4. `npm run db:generate` to produce the SQL migration.
+
+### Change a design token
+
+1. Edit `frontend/src/index.css` (light and `.dark`) and/or
+   `frontend/src/theme.css` (the Tailwind mapping). **Both must agree.**
+2. Run `node scripts/check-palette.mjs` — contrast is enforced in CI.
+3. Tailwind 4 drops tokens it cannot find **silently**; check that
+   `--primary`, `--radius` and the `.dark` block still reach the built CSS.
+
+---
+
+## 7. Traps
+
+These are the ones that actually bite.
+
+- **A stale backend holds the dev port.** A leftover `node` process on 47191
+  silently serves the wrong database. Kill the listener before testing.
+- **Login is rate limited** to 30 attempts / 15 minutes / IP. Repeated local
+  runs produce HTTP 429. Wait, or clear the counters:
+  `DELETE FROM rate_limit_hits WHERE key LIKE 'auth:%';`
+- **`npm ci` deletes and reinstalls `node_modules`.** A dev server running
+  from it breaks mid-install — stop `npm run dev` first. The installed
+  desktop app ships its own bundled copy and is unaffected.
+- **The Playwright suite logs in once**, in `e2e/global-setup.ts`. Tests must
+  not log in individually.
+- **Express 5 wildcards must be named**: `/{*splat}`, not `/*splat` and not
+  `*`. A bare `*` throws at startup.
+- **Express 5 types `req.params.*` as `string | string[]`.** Use
+  `routeParam()` from `backend/src/lib/routeParams.ts`.
+- **Timestamps are stored without a time zone, in IST.** Use
+  `backend/src/lib/dbtime.ts`; never `new Date(column)` on a raw timestamp.
+- **Zod strips unknown keys.** A field missing from the schema never reaches
+  the handler — it disappears silently.
+- **The session cookie is not `Secure`** (the app runs over plain HTTP on
+  loopback). Do not "fix" it without changing the deployment model.
+- **The master key must live in the app data dir**, not the install
+  directory — Program Files is read-only, and a regenerated key permanently
+  orphans every encrypted secret.
+- **The dev stack and the installed app are separate.** Logging into one does
+  not log you out of the other, and a dev migration never touches the desktop
+  database.
+- **`backend/src/index.ts` is not a dumping ground.** It is the assembly
+  point. Business logic goes in a domain module.
+
+---
+
+## 8. Working with the git history
+
+```bash
+git diff          # review what you changed
+git log --oneline -10
+```
+
+Commit style: `type(scope): summary`, lowercase, imperative — for example
+`fix(purchases): bump the last digit run when recreating a purchase invoice`.
+
+Allowed scopes: `dashboard`, `purchases`, `shopify`, `sales`, `inventory`,
+`accounts`, `print`, `auth`, `desktop`, `docs`, `backend`, `frontend`.
+
+One logical change per commit. A refactor and a behaviour change in the same
+commit make the bisect useless.
+
+---
+
+## 9. Verifying your work
+
+Before you report a task complete:
+
+- [ ] `npm run lint`, `npm run lint:backend`, `npm run typecheck` — clean
+- [ ] `npm test` — green
+- [ ] `npm run build` — succeeds
+- [ ] The change was **exercised**, not just compiled. Open the screen, call
+      the endpoint, click the button. A green build is not evidence.
+- [ ] For UI work: `npm run test:e2e` (or the relevant spec)
+- [ ] For schema work: the upgrade-path test
+- [ ] For colour work: `node scripts/check-palette.mjs`
+- [ ] `npm run scan:secrets` — clean
+- [ ] Report honestly what you ran, what you only typechecked, and what you
+      only read
+
+---
+
+## 10. When you are stuck
+
+1. **Read the code near the failure**, including the comments — they usually
+   record the past bug that motivated the current shape.
+2. **Search for the behaviour, not the string.** `code_search` for the
+   function name, not for a message you half-remember.
+3. **Check `docs/CONFIGURATION.md`** for the configuration knob you are
+   looking for; most "the app ignores my setting" problems are a missing env
+   var or a stale `.env`.
+4. **Check `docs/DEVELOPING.md`** for the dependency-major migration notes
+   (Express 5, Tailwind 4, TypeScript 7, dotenv 18) — those explain several
+   confusing type errors.
+5. **Look at `progress.md`** at the repository root for work in flight and the
+   owner's decisions about it.
+
+---
+
+## 11. Reference
+
+| Need | Document |
+|---|---|
+| What the product must do | [PRD.md](./PRD.md) |
+| How it is built | [ARCHITECTURE.md](./ARCHITECTURE.md) |
+| How to write code here | [CODE_STYLE.md](./CODE_STYLE.md) |
+| How to style the UI | [DESIGN_SYSTEM.md](./DESIGN_SYSTEM.md) |
+| The security model | [SECURITY.md](./SECURITY.md) |
+| How to test | [TESTING.md](./TESTING.md) |
+| Every configuration knob | [CONFIGURATION.md](./CONFIGURATION.md) |
+| Setup, CI, releases, dependency migrations | [DEVELOPING.md](./DEVELOPING.md) |
+| Production deployment | [DEPLOYMENT.md](../DEPLOYMENT.md) |
+| Planned work | [ROADMAP.md](../ROADMAP.md) |
