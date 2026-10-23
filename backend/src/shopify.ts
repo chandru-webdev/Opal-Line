@@ -408,10 +408,22 @@ async function attachInventoryToProducts() {
     const id = raw.inventory_item_id
     availableByItem.set(id, (availableByItem.get(id) ?? 0) + (raw.available ?? 0))
   }
-  store.products = store.products.map((p) => ({
-    ...p,
-    inventoryQuantity: availableByItem.get(p.inventoryItemId) ?? 0,
-  }))
+  store.products = store.products.map((p) => {
+    // The parent quantity is the SUM of its variants' levels — the same
+    // rollup normalizeProduct() builds from the REST payload and the same
+    // model as the local products.stock column. p.inventoryItemId points at
+    // the FIRST variant's item, so using it directly replaced the rollup with
+    // just the first variant's count and every multi-variant product pulled
+    // from Shopify landed with a wrong stock.
+    const itemIds = (p.variants ?? [])
+      .map((v) => v.inventoryItemId)
+      .filter((id) => Number.isFinite(id) && id > 0)
+    const quantity =
+      itemIds.length > 1
+        ? itemIds.reduce((sum, id) => sum + (availableByItem.get(id) ?? 0), 0)
+        : availableByItem.get(p.inventoryItemId) ?? 0
+    return { ...p, inventoryQuantity: quantity }
+  })
   const nameById = new Map((await fetchLocations()).map((l) => [l.id, l.name]))
   store.inventory = levels.map((raw: any) => ({
     inventoryItemId: raw.inventory_item_id,
