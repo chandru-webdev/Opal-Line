@@ -574,7 +574,7 @@ export interface ProductVariant {
   compareAtPrice?: number | null
   costPrice?: number | null
   grossWeight?: number | null
-  stock: number | null
+  stock?: number | null
   reorderLevel?: number | null
   status?: string | null
   createdAt?: string | null

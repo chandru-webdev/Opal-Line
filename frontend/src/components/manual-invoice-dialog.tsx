@@ -184,7 +184,7 @@ export function ManualInvoiceDialog({
     <AppDialog
       open={open}
       onOpenChange={(next) => { if (!next) onOpenChange(false) }}
-      size="2xl"
+      size="xl"
       title="New Sales Invoice"
       description="Bill a walk-in or phone sale directly — no sales order needed. The invoice number is minted automatically; each line with a SKU deducts stock."
       footer={

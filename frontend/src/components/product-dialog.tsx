@@ -429,7 +429,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         setVariants(
           (rows ?? []).map((v) => ({
             id: v.id,
-            title: v.title,
+            title: v.title ?? '',
             optionValues: Array.isArray(v.optionValues) ? v.optionValues : [],
             sku: v.sku ?? '',
             barcode: v.barcode ?? '',
