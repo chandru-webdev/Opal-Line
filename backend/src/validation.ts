@@ -73,6 +73,7 @@ export const createOrderSchema = z.object({
   items: z.array(z.object({
     title: z.string().min(1).max(255),
     sku: z.string().max(100).optional(),
+    productSku: z.string().max(100).optional(),
     quantity: z.number().int().min(1),
     price: z.number().min(0),
     // Shopify ProductVariant id (numeric or gid:// form) when the line was

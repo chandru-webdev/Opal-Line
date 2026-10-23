@@ -6,9 +6,11 @@ import cookieParser from 'cookie-parser'
 import { randomBytes, randomUUID, createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq, ne, or, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
 import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { round2 } from './routes/db'
+import { invoiceTotals } from './invoiceTotals'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { applyStockMovement, resolveMovementLocation, levelAt } from './stock'
@@ -1768,11 +1770,87 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
   const payment = rawPayment === 'Online' || rawPayment === 'online' ? 'paid' : (rawPayment ?? 'pending')
   const fulfillment = rawFulfillment === 'pending' ? 'unfulfilled' : (rawFulfillment ?? 'unfulfilled')
 
-  const value = items.reduce((sum: number, li: { price: number; quantity: number }) => sum + (Number.isFinite(li.price) ? li.price : 0) * li.quantity, 0)
-  const itemCount = items.reduce((sum: number, li: { quantity: number }) => sum + li.quantity, 0)
+  // Get the current applied silver rate from Silver Rate Management
+  const latestRate = await getLatestSilverRate()
+  if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+    return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before creating orders.' })
+  }
+  const silverRate = latestRate.rate
+
+  if (!db) {
+    return res.status(503).json({ error: 'Database unavailable' })
+  }
+
+  // Calculate item prices using the current silver rate and product data
+  // Load product data (netWeight, makingCharge) keyed by SKU
+  const productData = await db
+    .select({
+      sku: schema.products.sku,
+      netWeight: schema.products.netWeight,
+      makingCharge: schema.products.makingCharge,
+    })
+    .from(schema.products)
+    .where(inArray(schema.products.sku, items.map((li: { sku?: string; productSku?: string }) => String(li.productSku ?? li.sku ?? '')).filter(Boolean)))
+  const productMap = Object.fromEntries(
+    productData.map((p) => [
+      p.sku,
+      {
+        netWeight: Number(p.netWeight ?? 0),
+        makingCharge: Number(p.makingCharge ?? 0),
+      },
+    ])
+  )
+
+  // Calculate prices using the authoritative silver rate
+  // Canonical formula (same as invoices):
+  //   silverValue = sum(netWeight * qty * silverRate)
+  //   makingCharge = sum(netWeight * qty * makingChargePerGram)
+  //   subtotal = round2(silverValue + makingCharge)
+  //   gstAmount = round2(subtotal * gstRate / 100)
+  //   grandTotal = round2(subtotal + gstAmount - discount)
+  // This ensures order totals match invoice totals exactly.
+  const gstRate = 3 // standard GST rate for silver jewellery
+  const itemsWithCalculatedPrice = items.map((li: { sku?: string; productSku?: string; quantity: number; price: number }) => {
+    const sku = String(li.productSku ?? li.sku ?? '').trim()
+    const product = productMap[sku] ?? { netWeight: 0, makingCharge: 0 }
+    const netWeight = product.netWeight
+    const makingChargePerGram = product.makingCharge
+    const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
+    const weight = netWeight > 0 ? round2(netWeight * qty) : 0
+    const itemSilverRate = weight > 0 ? silverRate : 0
+    const itemMakingCharge = weight > 0 ? makingChargePerGram : 0
+    const silverValue = weight > 0 ? round2(weight * itemSilverRate) : 0
+    const makingValue = weight > 0 ? round2(weight * itemMakingCharge) : 0
+    const amount = round2(silverValue + makingValue) // line subtotal (ex-GST)
+    return {
+      ...li,
+      price: amount, // Store line subtotal (ex-GST) for consistency with invoice line items
+      netWeight,
+      makingCharge: makingChargePerGram,
+      weight,
+      silverRate: itemSilverRate,
+      silverValue,
+      makingValue,
+      amount,
+    }
+  })
+
+  // Aggregate totals using canonical invoice calculation
+  const totalSilverValue = round2(itemsWithCalculatedPrice.reduce((sum: number, li: { silverValue: number }) => sum + (Number.isFinite(li.silverValue) ? li.silverValue : 0), 0))
+  const totalMakingCharge = round2(itemsWithCalculatedPrice.reduce((sum: number, li: { makingValue: number }) => sum + (Number.isFinite(li.makingValue) ? li.makingValue : 0), 0))
+  const subtotal = round2(totalSilverValue + totalMakingCharge)
+  const { gstAmount: _gstAmount, grandTotal } = invoiceTotals(subtotal, gstRate, 0)
+  const value = grandTotal
+  const itemCount = itemsWithCalculatedPrice.reduce((sum: number, li: { quantity: number }) => sum + li.quantity, 0)
 
   const now = new Date()
   const internalId = `MO-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}-${now.getTime().toString().slice(-6)}`
+
+  // For Shopify draft order, we need GST-inclusive prices
+  const shopifyLineItems = itemsWithCalculatedPrice.map((li: typeof itemsWithCalculatedPrice[0]) => ({
+    ...li,
+    price: round2(li.amount * 1.03), // Convert line subtotal to GST-inclusive price
+  }))
 
   let draft: { ok: boolean; draftId?: string; name?: string; customerId?: string; errors: string[]; message?: string } | null = null
   let shopifyId = internalId
@@ -1787,7 +1865,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       shippingAddress,
       note: note ?? `Manual order created from Opal Line ERP (${internalId})`,
       tags: 'manual-order',
-      lineItems: items,
+      lineItems: shopifyLineItems,
     })
     if (draft.ok && draft.name) shopifyId = draft.name
   }
@@ -1805,7 +1883,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // Where this order was rung up. Absent means the default store, which is
       // where such orders already went before locations existed.
       const locationId = await resolveMovementLocation(reqLocation as string | undefined, tx as never)
-      for (const li of items) {
+      for (const li of itemsWithCalculatedPrice) {
         const sku = String(li.sku ?? '').trim()
         const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
         if (!sku || qty <= 0) continue
@@ -1839,7 +1917,7 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
           tags: 'manual-order',
           currency: 'INR',
           discount: 0,
-          lineItems: items,
+          lineItems: itemsWithCalculatedPrice,
           billingAddress: billingAddress ?? null,
           shippingAddress: shippingAddress ?? null,
           locationId,
