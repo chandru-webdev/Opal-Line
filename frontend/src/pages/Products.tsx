@@ -1,4 +1,4 @@
-import { toast } from '@/components/ui/confirm'
+import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Search,
   Tags,
+  Trash2,
   Upload,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
@@ -123,12 +124,10 @@ export default function ProductsPage() {
     dbApi
       .getProducts()
       .then((p) => {
-        // Show newest-added first by default. created_at is a date column
-        // (YYYY-MM-DD) with no time-of-day and product ids are random UUIDs,
-        // so ordering is newest-day-first; products added the same day tie
-        // and fall back to the API's name-ordered sequence (stable, so the
-        // list never reorders on re-render). A timestamped created_at would
-        // let same-day rows be ordered too.
+        // Show newest-added first by default. created_at is a full
+        // timestamp, so this sort is deterministic down to the second (ties
+        // fall back to the API's stable sequence, so the list never reorders
+        // on re-render); the API itself orders newest-first too.
         const withTime = p.map((product, index) => ({
           product,
           index,
@@ -259,6 +258,34 @@ export default function ProductsPage() {
     }
   }, [load])
 
+  const deleteProduct = useCallback(async (p: Product) => {
+    const confirmed = await confirmDialog({
+      title: `Delete "${p.name}"?`,
+      description: `${p.sku} is removed from the catalog and will not appear in new invoices. Past invoices, stock movements and batches keep their records.`,
+      danger: true,
+      confirmLabel: 'Delete product',
+    })
+    if (!confirmed) return
+    try {
+      await dbApi.remove('products', p.id)
+      load()
+      // Undo re-creates with the SAME id: the generic create route honours a
+      // client-supplied id, so stock levels, movements and variants reattach
+      // to the restored product instead of pointing at a ghost row.
+      toast.undoable('Product deleted', async () => {
+        try {
+          await dbApi.create('products', { ...p })
+          load()
+          toast.success('Delete undone — product restored')
+        } catch {
+          toast.error('Could not restore product')
+        }
+      })
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to delete product')
+    }
+  }, [load])
+
   const columns = useMemo<ColumnDef<Product>[]>(
     () => [
       {
@@ -318,24 +345,6 @@ export default function ProductsPage() {
             return <span className="text-[11px] text-muted-foreground">not set</span>
           }
           return <span className="tabular-nums text-muted-foreground">{formatCurrency(cost)}</span>
-        },
-      },
-      {
-        id: 'margin',
-        header: 'Margin',
-        meta: { align: 'right' as const },
-        cell: ({ row }) => {
-          const cost = row.original.costPrice
-          const sell = row.original.sellingPrice
-          if (cost == null || !Number.isFinite(cost) || cost <= 0 || !sell) {
-            return <span className="text-[11px] text-muted-foreground">—</span>
-          }
-          const pct = ((sell - cost) / sell) * 100
-          return (
-            <span className={cn('tabular-nums', pct < 10 ? 'text-warning-600' : 'text-success-600')}>
-              {pct.toFixed(1)}%
-            </span>
-          )
         },
       },
       { accessorKey: 'stock', header: 'Stock', cell: ({ row }) => {
@@ -431,8 +440,8 @@ export default function ProductsPage() {
                   {row.original.status === 'inactive' ? 'Activate' : 'Deactivate'}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => toggleStatus(row.original)}>
-                  {row.original.status === 'inactive' ? 'Activate product' : 'Deactivate product'}
+                <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => void deleteProduct(row.original)}>
+                  <Trash2 className="h-3.5 w-3.5" /> Delete product
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -441,7 +450,7 @@ export default function ProductsPage() {
         ),
       },
     ],
-    [pushProducts, pushing, toggleStatus, duplicateProduct],
+    [pushProducts, pushing, toggleStatus, duplicateProduct, deleteProduct],
   )
 
   return (
