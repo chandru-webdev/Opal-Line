@@ -990,7 +990,8 @@ export async function applyLiveCatalog(
         trackInventory: true,
         // Set chargeOnTax from the product data (first sync) or preserve existing
         chargeOnTax: p.chargeOnTax ?? true,
-        createdAt: new Date().toISOString().slice(0, 10),
+        // Full timestamp: pulled products sort newest-first down to the second.
+        createdAt: new Date().toISOString(),
       }
       const inserted = await io.insert(values)
       created++

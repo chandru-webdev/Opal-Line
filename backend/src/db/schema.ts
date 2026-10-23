@@ -83,7 +83,10 @@ export const products = pgTable('products', {
    */
   options: jsonb('options'),
   branchId: text('branch_id'),
-  createdAt: date('created_at'),
+  // Timestamp (not date): the products list is ordered newest-first and
+  // same-day creations must not tie. Existing date values upgrade to midnight
+  // through the idempotent bootstrap ALTER.
+  createdAt: timestamp('created_at', { mode: 'string' }),
 }, (table) => ({
   skuIdx: uniqueIndex('products_sku_idx').on(table.sku),
   shopifyIdIdx: index('products_shopify_id_idx').on(table.shopifyId),

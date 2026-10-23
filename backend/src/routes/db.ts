@@ -243,7 +243,10 @@ function orderedColumn(orderCol: any): any {
   if (!orderCol) return undefined
   if (orderCol.direction) return orderCol
   const colName = String(orderCol.name ?? '')
-  return /(date|time|timestamp|created|updated|_at)$/i.test(colName) ? desc(orderCol) : orderCol
+  // NULLS LAST: Postgres defaults DESC to NULLS FIRST, which floats rows
+  // with no date to the top of the list (every legacy row above the newest
+  // data). drizzle 0.45 has no descNullsLast helper, so spell it out.
+  return /(date|time|timestamp|created|updated|_at)$/i.test(colName) ? sql`${orderCol} DESC NULLS LAST` : orderCol
 }
 
 async function paginate(table: any, query: any, orderCol: any, req: Request) {
@@ -286,7 +289,9 @@ const oneOf = (table: any, idCol: any) =>
 
 const s = schema
 
-dbRouter.get('/products', listOf(s.products, s.products.name))
+// Newest products first: orderedColumn descends *_at columns automatically,
+// so the list opens on the latest creations (column headers still re-sort).
+dbRouter.get('/products', listOf(s.products, s.products.createdAt))
 
 // Barcode / QR Code labels (must be before /products/:id to avoid param capture)
 dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), (_req, res) => {
@@ -1226,7 +1231,9 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
             chargeOnTax: true,
-            createdAt: new Date().toISOString().slice(0, 10),
+            // Full timestamp: the products list orders newest-first and
+            // same-day products must not tie.
+            createdAt: new Date().toISOString(),
           }
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
           bySku.set(skuKey, { id: row.id, sku })
@@ -1382,7 +1389,9 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
             chargeOnTax: true,
-            createdAt: new Date().toISOString().slice(0, 10),
+            // Full timestamp: the products list orders newest-first and
+            // same-day products must not tie.
+            createdAt: new Date().toISOString(),
           }
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
           bySku.set(skuKey, { id: row.id, sku })
@@ -3839,6 +3848,10 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     delete body.stock
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     if (!body.id) body.id = randomUUID()
+    // Every creation path stamps the time — the products list is ordered
+    // newest-first down to the second, and NULLs would float to the top of a
+    // DESC sort.
+    if (!body.createdAt) body.createdAt = new Date().toISOString()
 
     // Identifier uniqueness: sku also has a DB unique index; barcode only has
     // this check. Either way, respond with the conflicting product so the UI

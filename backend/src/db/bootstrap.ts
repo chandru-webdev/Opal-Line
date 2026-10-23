@@ -316,7 +316,7 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
         tags text,
         track_inventory boolean NOT NULL DEFAULT true,
         charge_on_tax boolean NOT NULL DEFAULT true,
-        created_at date,
+        created_at timestamp,
         updated_at timestamp
       )`)
     await tx.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS products_sku_idx ON products (sku)`)
@@ -1328,6 +1328,18 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS lockout_duration_minutes integer DEFAULT 15`,
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS rate_schedule jsonb`,
     `ALTER TABLE settings ADD COLUMN IF NOT EXISTS scheduled_rate_changes jsonb`,
+    // products.created_at was a DATE, which tied every product created the
+    // same day and made "newest first" meaningless within a day. Upgrade it
+    // to a full timestamp (existing rows become midnight); guarded by the
+    // column's current type so the statement is a no-op once migrated.
+    `DO $$ BEGIN
+       IF EXISTS (
+         SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'products' AND column_name = 'created_at' AND data_type = 'date'
+       ) THEN
+         ALTER TABLE products ALTER COLUMN created_at TYPE timestamp USING created_at::timestamp;
+       END IF;
+     END $$`,
     `INSERT INTO inventory_locations (id, name, type) VALUES ('LOC-DEFAULT', 'Main Store', 'store') ON CONFLICT DO NOTHING`,
       `CREATE TABLE IF NOT EXISTS loyalty_transactions (
         id text PRIMARY KEY,

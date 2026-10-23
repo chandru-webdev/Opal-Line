@@ -126,6 +126,9 @@ test.describe('product codes & variants', () => {
     // ── 4. List + detail show the variants and the rolled-up stock ───────
     const row = page.locator('table tbody tr', { hasText: PRODUCT_NAME }).first()
     await expect(row).toBeVisible({ timeout: 10000 })
+    // The products list opens newest-first: the just-created product is the
+    // top row.
+    await expect(page.locator('table tbody tr').first()).toContainText(PRODUCT_NAME)
     await expect(row.getByText('2 variants')).toBeVisible()
 
     await row.getByRole('link', { name: PRODUCT_NAME }).first().click()

@@ -18,7 +18,6 @@ import {
 } from '@/lib/productCodes'
 import type { Product, ProductOption, Supplier } from '@/types'
 import { cn, safeImageUrl } from '@/lib/utils'
-import { todayIST } from '@/lib/format'
 import { SupplierPicker } from '@/components/ui/supplier-picker'
 
 const API_ORIGIN = (import.meta.env.VITE_API_BASE ?? '').replace(/\/api\/v1$/, '') || ''
@@ -742,7 +741,9 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           hsn: '71131130',
           shopifyStatus: 'not-listed',
           status: 'active',
-          createdAt: todayIST(),
+          // Full timestamp, not just the date: the products list is ordered
+          // newest-first and same-day creations must not tie.
+          createdAt: new Date().toISOString(),
         })
       }
       // Shopify-style variants: replace-all save of the option definitions +
