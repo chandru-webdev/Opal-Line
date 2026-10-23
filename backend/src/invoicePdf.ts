@@ -33,6 +33,8 @@ export interface InvoiceData {
   cgst: number
   sgst: number
   totalGst: number
+  /** GST rate (%, e.g. 3) the totalGst was computed from — drives the printed CGST/SGST rate labels. */
+  gstRate?: number
   grandTotal: number
   amountInWords: string
   businessName: string
@@ -90,6 +92,19 @@ export function numberToIndianWords(num: number): string {
   return result
 }
 
+/**
+ * Currency text safe for PDF drawing.
+ *
+ * The standard PDF fonts (Helvetica/WinAnsi) have no rupee glyph - pdfkit
+ * writes U+20B9 as two stray bytes that render as a superscript-one, turning
+ * every money value into unreadable noise. The PDFs therefore print "Rs."
+ * while the exported formatCurrency (used by API/UI code and asserted in
+ * tests) keeps the rupee sign.
+ */
+function pdfCurrency(amount: number): string {
+  return formatCurrency(amount).replace(String.fromCharCode(0x20b9), 'Rs.')
+}
+
 export function formatCurrency(amount: number): string {
   return '\u20B9' + amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
@@ -112,18 +127,26 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
     const items = await client.unsafe(`SELECT * FROM sales_invoice_items WHERE invoice_id = $1`, [invoiceId])
     const [settings] = await client.unsafe(`SELECT * FROM settings LIMIT 1`) as any[]
 
-    // HUID lookup: join through SKU so printed invoices carry hallmark numbers
+    // HUID + HSN lookup: join through SKU so printed invoices carry hallmark
+    // numbers and the product's real HSN code (the items table stores neither).
     const skus = items.map((item: any) => String(item.sku || '')).filter(Boolean)
     const huidBySku = new Map<string, string>()
+    const hsnBySku = new Map<string, string>()
     if (skus.length > 0) {
-      const prods = await client.unsafe(`SELECT sku, huid FROM products WHERE sku = ANY($1)`, [skus]) as any[]
-      for (const p of prods) if (p.sku && p.huid) huidBySku.set(p.sku, p.huid)
+      const prods = await client.unsafe(`SELECT sku, huid, hsn FROM products WHERE sku = ANY($1)`, [skus]) as any[]
+      for (const p of prods) {
+        if (!p.sku) continue
+        if (p.huid) huidBySku.set(p.sku, p.huid)
+        if (p.hsn) hsnBySku.set(p.sku, p.hsn)
+      }
     }
 
     const itemData: InvoiceItem[] = items.map((item: any) => ({
-      name: item.name || item.product_name || 'Item',
-      hsn: item.hsn || '7113',
-      quantity: Number(item.quantity || 1),
+      // sales_invoice_items.product holds the product name; name/product_name
+      // are legacy aliases kept only for rows from older schemas.
+      name: item.product || item.name || item.product_name || 'Item',
+      hsn: item.hsn || hsnBySku.get(String(item.sku || '')) || '7113',
+      quantity: Number(item.qty || item.quantity || 1),
       grossWeight: Number(item.gross_weight || 0),
       netWeight: Number(item.net_weight || item.weight || 0),
       silverRate: Number(item.silver_rate || item.rate || 0),
@@ -134,8 +157,11 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
 
     const subtotal = Number(inv.subtotal || 0)
     const discount = Number(inv.discount || 0)
-    const gstRate = Number(settings?.gst_rate || 3)
-    const totalGst = Number(inv.total_gst || inv.gst || (subtotal - discount) * gstRate / 100)
+    // sales_invoices carries `gst` (the rate, e.g. 3) and `gst_amount` (the
+    // money). Use the stored amount; the legacy fallback recomputes it the
+    // same way the invoice was raised — GST on the subtotal, pre-discount.
+    const gstRate = Number(inv.gst || settings?.gst_rate || 3)
+    const totalGst = Number(inv.gst_amount || inv.total_gst || subtotal * gstRate / 100)
     const cgst = Math.round((totalGst / 2) * 100) / 100
     const sgst = Math.round((totalGst / 2) * 100) / 100
     const grandTotal = Number(inv.grand_total || subtotal - discount + totalGst)
@@ -151,17 +177,18 @@ export async function generateInvoicePDF(invoiceId: string): Promise<Buffer | nu
 
     const data: InvoiceData = {
       id: inv.id,
-      invoiceNumber: inv.invoice_number || inv.id,
+      invoiceNumber: inv.number || inv.invoice_number || inv.id,
       date: inv.date ? new Date(inv.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
       customerName: inv.customer_name || inv.customer || 'Walk-in Customer',
       customerPhone: inv.customer_phone || inv.phone || undefined,
       customerEmail: inv.customer_email || inv.email || undefined,
       customerAddress: inv.customer_address || inv.address || undefined,
-      customerGstin: inv.customer_gstin || inv.gstin || undefined,
+      // sales_invoices.buyer_gstin is the customer's GSTIN on the row.
+      customerGstin: inv.buyer_gstin || inv.customer_gstin || undefined,
       customerState: inv.customer_state || 'Maharashtra',
       customerStateCode: inv.customer_state_code || '27',
       items: itemData,
-      subtotal, discount, cgst, sgst, totalGst, grandTotal,
+      subtotal, discount, cgst, sgst, totalGst, gstRate, grandTotal,
       amountInWords: numberToIndianWords(hasTds ? adjustedTotal : grandTotal),
       businessName: settings?.business_name || 'Opal Line Jewels LLP',
       businessAddress: settings?.address || 'Shop 4, Nariman Point, Mumbai - 400021',
@@ -301,9 +328,9 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
       { label: 'HSN', x: left + 150, w: 45, align: 'center' as const },
       { label: 'Qty', x: left + 198, w: 35, align: 'center' as const },
       { label: 'Net Wt (g)', x: left + 236, w: 55, align: 'right' as const },
-      { label: 'Rate (\u20B9/g)', x: left + 294, w: 55, align: 'right' as const },
-      { label: 'Making (\u20B9)', x: left + 352, w: 60, align: 'right' as const },
-      { label: 'Amount (\u20B9)', x: left + 416, w: 80, align: 'right' as const },
+      { label: 'Rate (Rs./g)', x: left + 294, w: 55, align: 'right' as const },
+      { label: 'Making (Rs.)', x: left + 352, w: 60, align: 'right' as const },
+      { label: 'Amount (Rs.)', x: left + 416, w: 80, align: 'right' as const },
     ]
 
     doc.fontSize(7.5).font('Helvetica-Bold').fillColor(COLORS.headerText)
@@ -336,9 +363,13 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
       doc.text(item.hsn, cols[1].x, rowY, { width: cols[1].w, align: cols[1].align })
       doc.text(String(item.quantity), cols[2].x, rowY, { width: cols[2].w, align: cols[2].align })
       doc.text(item.netWeight.toFixed(2), cols[3].x, rowY, { width: cols[3].w, align: cols[3].align })
-      doc.text(formatCurrency(item.silverRate), cols[4].x, rowY, { width: cols[4].w, align: cols[4].align })
-      doc.text(formatCurrency(item.makingCharge), cols[5].x, rowY, { width: cols[5].w, align: cols[5].align })
-      doc.font('Helvetica-Bold').text(formatCurrency(item.amount), cols[6].x, rowY, { width: cols[6].w, align: cols[6].align })
+      // Order-imported items carry no rate/making snapshot; 0 there means
+      // "unknown", so print a dash instead of a misleading Rs.0.00.
+      const rateText = item.silverRate > 0 ? pdfCurrency(item.silverRate) : '-'
+      const makingText = item.makingCharge > 0 ? pdfCurrency(item.makingCharge) : '-'
+      doc.text(rateText, cols[4].x, rowY, { width: cols[4].w, align: cols[4].align })
+      doc.text(makingText, cols[5].x, rowY, { width: cols[5].w, align: cols[5].align })
+      doc.font('Helvetica-Bold').text(pdfCurrency(item.amount), cols[6].x, rowY, { width: cols[6].w, align: cols[6].align })
       doc.font('Helvetica')
 
       doc.y = rowY + rowH
@@ -363,16 +394,21 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
     const valX = totalsX + totalsW - 10
     let ty = totalsY + 8
 
-    const gstRateHalf = data.subtotal > 0 ? ((data.totalGst / (data.subtotal - data.discount)) * 100 / 2).toFixed(1) : '1.5'
+    // GST is charged on the subtotal (the items-table total), so the printed
+    // Taxable Value IS the subtotal and the CGST/SGST rate labels are half the
+    // stored GST rate — the same business values the invoice screen shows.
+    // The discount is listed separately (exactly once) above the persisted
+    // grand total, so the printed rows add up to the printed grand total.
+    const gstRateHalf = String(Math.round((Number(data.gstRate) || 0) / 2 * 100) / 100)
 
     doc.fontSize(8).font('Helvetica').fillColor(COLORS.text)
-    doc.text('Taxable Value', labelX, ty, { width: 140 }); doc.text(formatCurrency(data.subtotal - data.discount), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
-    doc.text(`CGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(formatCurrency(data.cgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
-    doc.text(`SGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(formatCurrency(data.sgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
+    doc.text('Taxable Value', labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.subtotal), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
+    doc.text(`CGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.cgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
+    doc.text(`SGST @ ${gstRateHalf}%`, labelX, ty, { width: 140 }); doc.text(pdfCurrency(data.sgst), valX - 80, ty, { width: 80, align: 'right' }); ty += 14
 
     if (data.discount > 0) {
       doc.fillColor('#dc2626').text('Discount', labelX, ty, { width: 140 })
-      doc.text(`- ${formatCurrency(data.discount)}`, valX - 80, ty, { width: 80, align: 'right' }); ty += 14
+      doc.text(`- ${pdfCurrency(data.discount)}`, valX - 80, ty, { width: 80, align: 'right' }); ty += 14
     }
 
     // Grand total — highlighted
@@ -381,20 +417,20 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
     ty += 4
     doc.fontSize(11).font('Helvetica-Bold').fillColor(COLORS.primary)
     doc.text('GRAND TOTAL', labelX, ty, { width: 140 })
-    doc.fillColor(COLORS.accent).text(formatCurrency(data.grandTotal), valX - 80, ty, { width: 80, align: 'right' })
+    doc.fillColor(COLORS.accent).text(pdfCurrency(data.grandTotal), valX - 80, ty, { width: 80, align: 'right' })
 
     if (hasTds) {
       ty += 18
       const label = data.tdsType === 'TDS' ? `TDS (${data.tdsSection || '194Q'})` : `TCS (${data.tdsSection || '206C'})`
       doc.fontSize(9).font('Helvetica').fillColor(COLORS.text)
       doc.text(label, labelX, ty, { width: 140 })
-      doc.fillColor('#dc2626').text(`+ ${formatCurrency(data.tdsAmount!)}`, valX - 80, ty, { width: 80, align: 'right' })
+      doc.fillColor('#dc2626').text(`+ ${pdfCurrency(data.tdsAmount!)}`, valX - 80, ty, { width: 80, align: 'right' })
       ty += 16
       doc.save().moveTo(labelX, ty - 2).lineTo(valX, ty - 2).lineWidth(1).stroke(COLORS.accent).restore()
       ty += 4
       doc.fontSize(10).font('Helvetica-Bold').fillColor(COLORS.primary)
       doc.text('TOTAL PAYABLE', labelX, ty, { width: 140 })
-      doc.fillColor(COLORS.accent).text(formatCurrency(data.adjustedTotal!), valX - 80, ty, { width: 80, align: 'right' })
+      doc.fillColor(COLORS.accent).text(pdfCurrency(data.adjustedTotal!), valX - 80, ty, { width: 80, align: 'right' })
     }
 
     doc.y = Math.max(doc.y, ty + 20)
@@ -403,13 +439,18 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
     // AMOUNT IN WORDS
     // ══════════════════════════════════════════════════════════════
     doc.y += 4
-    drawRoundedRect(doc, left, doc.y, contentW, 20, 2, '#fef3c7')
+    // Banner grows with the words so long amounts never spill outside the band.
+    const wordsWidth = contentW - 110
+    const wordsHeight = doc.heightOfString(data.amountInWords, { width: wordsWidth })
+    const bannerH = Math.max(20, wordsHeight + 10)
+    const bannerY = doc.y
+    drawRoundedRect(doc, left, bannerY, contentW, bannerH, 2, '#fef3c7')
     doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#92400e')
-      .text('Amount in Words:', left + 8, doc.y + 5)
+      .text('Amount in Words:', left + 8, bannerY + 5)
     doc.fontSize(7.5).font('Helvetica').fillColor('#78350f')
-      .text(data.amountInWords, left + 95, doc.y + 5 - 14, { width: contentW - 110 })
+      .text(data.amountInWords, left + 95, bannerY + 5, { width: wordsWidth })
 
-    doc.y += 28
+    doc.y = bannerY + bannerH + 8
 
     // ══════════════════════════════════════════════════════════════
     // DECLARATION + SIGNATURES
@@ -452,7 +493,7 @@ export async function createPDFBuffer(data: InvoiceData): Promise<Buffer> {
         drawRoundedRect(doc, qrX, qrY, qrSize, qrSize, 2, '#f0f0f0')
         doc.fontSize(7).font('Helvetica').fillColor(COLORS.text)
           .text(`UPI: ${data.upiId}`, qrX + 4, qrY + 30, { width: qrSize - 8, align: 'center' })
-        doc.text(`₹${data.grandTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, qrX + 4, qrY + 44, { width: qrSize - 8, align: 'center' })
+        doc.text(`Rs.${data.grandTotal.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`, qrX + 4, qrY + 44, { width: qrSize - 8, align: 'center' })
       }
 
       // Label below QR
@@ -480,8 +521,11 @@ export async function emailInvoicePDF(invoiceId: string, recipientEmail: string)
   const client = getRawClient()
   if (!client) return false
 
-  const [inv] = await client.unsafe(`SELECT invoice_number FROM sales_invoices WHERE id = $1`, [invoiceId]) as any[]
-  const invNumber = inv?.invoice_number || invoiceId
+  // sales_invoices stores the document number in `number` — there is no
+  // invoice_number column — so the emailed subject/filename must read it from
+  // there, otherwise the query fails and the email never sends.
+  const [inv] = await client.unsafe(`SELECT number FROM sales_invoices WHERE id = $1`, [invoiceId]) as any[]
+  const invNumber = inv?.number || invoiceId
 
   return sendEmail({
     to: recipientEmail,

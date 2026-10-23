@@ -1,5 +1,5 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
 import { Copy, Download, Eye, FileText, Loader2, MessageCircle, MoreHorizontal, Pencil, Plus, Printer, Search, Undo2, X } from 'lucide-react'
@@ -182,12 +182,16 @@ export default function SalesInvoicesPage() {
   // Stable DataTable row handlers: inline lambdas would change identity every
   // render and defeat the table memo, re-rendering all rows on each keystroke
   // in the view dialog (felt as input lag).
+  // The ref remembers which invoice the dialog is showing so a slower item
+  // fetch for a previously opened invoice can never overwrite it.
+  const openInvoiceIdRef = useRef<string | null>(null)
   const openInvoice = useCallback((inv: Invoice) => {
+    openInvoiceIdRef.current = inv.id
     setViewInvoice(inv)
     setInvoiceItems(inv.items ?? [])
     if (!inv.items?.length) {
       dbApi.getInvoiceById(inv.id).then((full) => {
-        if (full) setInvoiceItems(full.items ?? [])
+        if (openInvoiceIdRef.current === inv.id) setInvoiceItems(full?.items ?? [])
       }).catch(() => {})
     }
   }, [])

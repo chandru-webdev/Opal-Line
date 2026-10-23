@@ -62,6 +62,7 @@ import { exportTable } from '@/lib/export'
 import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, ProductVariant, SalesOrder } from '@/types'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
+import { calculateJewelleryPrice } from '@/lib/utils'
 
 const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'purple' }> = {
   imported: { label: 'Imported', variant: 'info' },
@@ -113,6 +114,9 @@ interface OrderLineItem {
   sku: string
   qty: number
   price: number
+  // Product fields needed for price recalculation
+  netWeight?: number
+  makingCharge?: number
 }
 
 interface CreateResult {
@@ -265,6 +269,8 @@ export default function SalesOrdersPage() {
   const [serverStockErrors, setServerStockErrors] = useState<Record<string, string>>({})
   const [barcodeInput, setBarcodeInput] = useState('')
   const [scanFeedback, setScanFeedback] = useState<{ ok: boolean; text: string } | null>(null)
+  const [silverRate, setSilverRate] = useState<number | null>(null)
+  const [silverRateLoading, setSilverRateLoading] = useState(false)
 
   const [viewOrder, setViewOrder] = useState<SalesOrder | null>(null)
   const [printConfig, setPrintConfig] = useState<unknown>(null)
@@ -562,7 +568,18 @@ export default function SalesOrdersPage() {
         ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
         : [emptyLine()],
     )
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }, [customers])
 
   /** Clone a past order into a fresh draft — same customer/items, today's date, nothing synced. */
@@ -590,7 +607,18 @@ export default function SalesOrdersPage() {
         ? o.lineItems.map((li) => ({ key: crypto.randomUUID(), productId: '', title: li.title, sku: li.sku ?? '', qty: li.quantity, price: li.price }))
         : [emptyLine()],
     )
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }, [customers])
 
   const columns = useMemo<ColumnDef<SalesOrder>[]>(
@@ -789,7 +817,18 @@ export default function SalesOrdersPage() {
     setNote('')
     setSyncToShopify(true)
     setLineItems([emptyLine()])
+    setSilverRate(null)
     setDialogOpen(true)
+    // Fetch the current applied silver rate from Silver Rate Management
+    setSilverRateLoading(true)
+    dbApi.getSilverRate()
+      .then((rate) => {
+        setSilverRate(rate.rate)
+        setSilverRateLoading(false)
+      })
+      .catch(() => {
+        setSilverRateLoading(false)
+      })
   }
 
   const totalValue = useMemo(
@@ -842,11 +881,20 @@ export default function SalesOrdersPage() {
 
   const selectProduct = (key: string, productId: string) => {
     const p = products.find((x) => x.id === productId)
+    if (!p) return
     clearServerStockError(key)
     // Multi-variant products open on their first variant so the line is
     // immediately billable; the Variant dropdown swaps it. Flat products keep
     // the plain product values, exactly as before.
-    const first = p ? (productVariants(p)[0] ?? null) : null
+    const first = productVariants(p)[0] ?? null
+    const price = silverRate && p.netWeight > 0
+      ? calculateJewelleryPrice({
+          silverRatePerGram: silverRate,
+          netWeightPerUnit: p.netWeight,
+          makingChargePerGram: p.makingCharge,
+          quantity: 1,
+        }).finalPrice
+      : first?.sellingPrice ?? p.sellingPrice
     setLineItems((prev) =>
       prev.map((li) => {
         if (li.key !== key) return li
@@ -856,7 +904,9 @@ export default function SalesOrdersPage() {
           variantId: first?.id ?? null,
           title: first && p ? `${p.name} — ${variantLabel(first)}` : (p?.name ?? li.title),
           sku: first ? first.sku : (p?.sku ?? li.sku),
-          price: first?.sellingPrice ?? p?.sellingPrice ?? li.price,
+          price: price ?? li.price,
+          netWeight: p.netWeight,
+          makingCharge: p.makingCharge,
         }
       }),
     )
@@ -878,7 +928,16 @@ export default function SalesOrdersPage() {
               variantId: v.id,
               title: `${p.name} — ${variantLabel(v)}`,
               sku: v.sku,
-              price: v.sellingPrice ?? row.price,
+              price: silverRate && p.netWeight > 0
+                ? calculateJewelleryPrice({
+                    silverRatePerGram: silverRate,
+                    netWeightPerUnit: p.netWeight,
+                    makingChargePerGram: p.makingCharge,
+                    quantity: row.qty,
+                  }).finalPrice
+                : v.sellingPrice ?? row.price,
+              netWeight: p.netWeight,
+              makingCharge: p.makingCharge,
             }
           : row,
       ),
@@ -900,14 +959,42 @@ export default function SalesOrdersPage() {
     const { product: p, variant } = match
     const title = variant ? `${p.name} — ${variantLabel(variant)}` : p.name
     const sku = variant ? variant.sku : p.sku
-    const price = variant?.sellingPrice ?? p.sellingPrice ?? 0
+    const price = silverRate && p.netWeight > 0
+      ? calculateJewelleryPrice({
+          silverRatePerGram: silverRate,
+          netWeightPerUnit: p.netWeight,
+          makingChargePerGram: p.makingCharge,
+          quantity: 1,
+        }).finalPrice
+      : variant?.sellingPrice ?? p.sellingPrice ?? 0
     setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {
       const existing = prev.find((li) => li.productId === p.id && (li.variantId ?? null) === (variant?.id ?? null))
       if (existing) {
-        return prev.map((li) => (li.key === existing.key ? { ...li, qty: li.qty + 1 } : li))
+        // When incrementing qty, recalculate price for the new quantity
+        const newQty = existing.qty + 1
+        let newPrice = existing.price
+        if (silverRate && existing.netWeight && existing.netWeight > 0) {
+          const result = calculateJewelleryPrice({
+            silverRatePerGram: silverRate,
+            netWeightPerUnit: existing.netWeight,
+            makingChargePerGram: existing.makingCharge ?? 0,
+            quantity: newQty,
+          })
+          newPrice = result.finalPrice
+        }
+        return prev.map((li) => (li.key === existing.key ? { ...li, qty: newQty, price: newPrice } : li))
       }
-      const fresh = { productId: p.id, variantId: variant?.id ?? null, title, sku, price, qty: 1 }
+      const fresh = {
+        productId: p.id,
+        variantId: variant?.id ?? null,
+        title,
+        sku,
+        price,
+        qty: 1,
+        netWeight: p.netWeight,
+        makingCharge: p.makingCharge,
+      }
       // Fill the empty first line if it's untouched, otherwise append
       const firstEmpty = prev.length === 1 && !prev[0].productId && !prev[0].title
       if (firstEmpty) {
@@ -918,7 +1005,21 @@ export default function SalesOrdersPage() {
   }
 
   const updateLineItem = (key: string, patch: Partial<OrderLineItem>) => {
-    setLineItems((prev) => prev.map((li) => (li.key === key ? { ...li, ...patch } : li)))
+    setLineItems((prev) =>
+      prev.map((li) => {
+        if (li.key !== key) return li
+        const updated = { ...li, ...patch }
+        if (patch.qty !== undefined && patch.qty !== li.qty && silverRate && li.netWeight && li.netWeight > 0) {
+          updated.price = calculateJewelleryPrice({
+            silverRatePerGram: silverRate,
+            netWeightPerUnit: li.netWeight,
+            makingChargePerGram: li.makingCharge ?? 0,
+            quantity: patch.qty,
+          }).finalPrice
+        }
+        return updated
+      }),
+    )
     // A changed quantity re-runs the live check; drop any stale server report.
     if ('qty' in patch) clearServerStockError(key)
   }
@@ -938,7 +1039,12 @@ export default function SalesOrdersPage() {
         price: Number(li.price) || 0,
         // Shopify sync targets the exact variant; the local invoice keeps
         // billing the variant's SKU, which the line already carries.
-        ...(li.variantId ? { variantId: li.variantId } : {}),
+        ...(li.variantId
+          ? {
+              variantId: li.variantId,
+              productSku: products.find((product) => product.id === li.productId)?.sku,
+            }
+          : {}),
       }))
     if (!editing && items.length === 0) {
       setFormError('Add at least one line item.')
@@ -1291,6 +1397,33 @@ export default function SalesOrdersPage() {
                     <Plus className="h-3.5 w-3.5" /> Add Item
                   </Button>
                 </div>
+                {/* Silver rate indicator */}
+                {silverRateLoading ? (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+                    <span className="animate-pulse">Loading current silver rate…</span>
+                  </div>
+                ) : silverRate ? (
+                  <div className="mb-2 flex items-center justify-between text-xs">
+                    <span className="text-success-700">Current Silver Rate: ₹{silverRate.toFixed(2)}/g (from Silver Rate Management)</span>
+                    <Button variant="ghost" size="icon-sm" onClick={() => {
+                      setSilverRateLoading(true)
+                      dbApi.getSilverRate()
+                        .then((rate) => {
+                          setSilverRate(rate.rate)
+                          setSilverRateLoading(false)
+                        })
+                        .catch(() => {
+                          setSilverRateLoading(false)
+                        })
+                    }} disabled={silverRateLoading} title="Refresh silver rate">
+                      <RefreshCw className={`h-3.5 w-3.5 ${silverRateLoading ? 'animate-spin' : ''}`} />
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-destructive">
+                    <span>Silver rate unavailable — prices will be calculated after fetching rate</span>
+                  </div>
+                )}
                 {!editing ? (
                   <div className="mb-3">
                     <div className="flex items-end gap-2">
@@ -1393,6 +1526,16 @@ export default function SalesOrdersPage() {
                             value={li.price}
                             onChange={(e) => updateLineItem(li.key, { price: Number(e.target.value) })}
                           />
+                          {/* Show price breakdown when calculated from silver rate */}
+                          {li.netWeight && li.netWeight > 0 && li.makingCharge && li.makingCharge > 0 && silverRate && (
+                            <div className="mt-1 text-[10px] text-muted-foreground space-y-0.5">
+                              <div>Silver: {silverRate.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(silverRate * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>Making: {li.makingCharge.toFixed(2)} × {li.netWeight} × {li.qty} = ₹{(li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>Subtotal: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty).toFixed(2)}</div>
+                              <div>GST (3%): ₹{((silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
+                              <div className="font-medium">Total: ₹{(silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty + (silverRate * li.netWeight * li.qty + li.makingCharge * li.netWeight * li.qty) * 0.03).toFixed(2)}</div>
+                            </div>
+                          )}
                         </div>
                         <div className="w-28 pb-0.5 text-right text-sm font-semibold tabular-nums text-foreground">
                           {formatCurrency((Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0))}
