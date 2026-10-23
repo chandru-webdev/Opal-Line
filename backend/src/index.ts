@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { and, desc, eq, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
-import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
+import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
 import { applyStockMovement, resolveMovementLocation, levelAt } from './stock'
@@ -1017,6 +1017,13 @@ app.post('/api/v1/silver/update', requirePermission('silver-rate', 'edit'), vali
     const message = err instanceof Error ? err.message : 'Unknown error'
     res.status(502).json({ error: message })
   }
+})
+
+// Live progress of an in-flight silver-rate apply — the Silver Rate page
+// polls this while its update request is running, so the wizard shows which
+// phase (sync → reprice → match → push) is running instead of a frozen spinner.
+app.get('/api/v1/silver/update/progress', requirePermission('silver-rate', 'view'), (_req, res) => {
+  res.json(getSilverRateProgress())
 })
 
 // ─── Silver rate approval workflow: staff submit, Admin/Super Admin decide ───

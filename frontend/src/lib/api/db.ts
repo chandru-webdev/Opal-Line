@@ -10,6 +10,7 @@ import type {
   SilverRateRequestsResponse,
   SilverRateRow,
   SilverRateSubmitResponse,
+  SilverRateProgress,
   Quotation,
   SalesFollowUpsResponse,
   EInvoiceStatus,
@@ -32,6 +33,8 @@ import type {
   Payment,
   PaymentStatusSegment,
   Product,
+  ProductOption,
+  ProductVariant,
   PurchaseInvoice,
   PurchaseInvoiceDetail,
   PurchaseInvoiceInput,
@@ -112,6 +115,8 @@ export const dbApi = {
    * disabled, otherwise queues a request for admin approval. */
   submitSilverRateRequest: (rate: number, syncFirst = false): Promise<SilverRateSubmitResponse> =>
     request('/silver/requests', { method: 'POST', body: JSON.stringify({ rate, syncFirst }) }),
+  /** Live progress of an in-flight silver-rate apply (polled while it runs). */
+  getSilverRateProgress: (): Promise<SilverRateProgress> => request('/silver/update/progress'),
   getSilverRateRequests: (status?: 'pending' | 'approved' | 'rejected' | 'all'): Promise<SilverRateRequestsResponse> =>
     request(`/silver/requests${status ? `?status=${status}` : ''}`),
   approveSilverRateRequest: (id: string, note?: string): Promise<{ ok: boolean; request: SilverRateRequestRow }> =>
@@ -432,10 +437,44 @@ export const dbApi = {
       `/db/products/${encodeURIComponent(productId)}/stock`,
       { method: 'PATCH', body: JSON.stringify(locationId ? { stock, locationId } : { stock }) },
     ),
+  /**
+   * Shopify-style variants: the option definitions on the parent plus one row
+   * per option-value combination. Saving is replace-all (the product dialog
+   * owns the whole set) and the backend rolls the stock difference into the
+   * parent's ledger as a count correction.
+   */
+  getProductVariants: (productId: string) =>
+    request<{ options: ProductOption[]; variants: ProductVariant[] }>(
+      `/db/products/${encodeURIComponent(productId)}/variants`,
+    ),
+  saveProductVariants: (
+    productId: string,
+    body: {
+      options: ProductOption[]
+      variants: Array<
+        Pick<ProductVariant, 'title' | 'optionValues' | 'sku' | 'stock'> &
+          Partial<Pick<ProductVariant, 'id' | 'barcode' | 'sellingPrice' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
+      >
+    },
+  ) =>
+    request<{ options: ProductOption[]; variants: ProductVariant[]; stock: number }>(
+      `/db/products/${encodeURIComponent(productId)}/variants`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
   createInvoiceForOrder: (orderId: string) =>
     request<{ created: boolean; invoiceNumber: string | null }>(`/db/sales-orders/${encodeURIComponent(orderId)}/create-invoice`, {
       method: 'POST',
     }),
+  /**
+   * Cancel an order's current invoice and raise a fresh one from its line
+   * items. The route resolves the order by the invoice number passed in the
+   * path, so the caller only needs the invoice it is looking at.
+   */
+  reinvoiceOrder: (invoiceNumber: string) =>
+    request<{ ok: boolean; cancelled: string; invoiceNumber: string }>(
+      `/db/sales-orders/by-invoice/${encodeURIComponent(invoiceNumber)}/reinvoice`,
+      { method: 'POST' },
+    ),
   duplicateInvoice: (id: string) =>
     request<Invoice>(`/db/invoices/${encodeURIComponent(id)}/duplicate`, { method: 'POST' }),
   createPOsFromReorder: (ids?: string[]) =>
@@ -516,6 +555,11 @@ export const dbApi = {
   /** Permanently remove a purchase invoice, reversing any stock it added. */
   deletePurchaseInvoice: (id: string): Promise<{ ok: boolean; id: string }> =>
     request(`/db/purchase-invoices/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Cancel a purchase invoice and recreate it from scratch with a new number. */
+  recreatePurchaseInvoice: (
+    id: string,
+  ): Promise<{ ok: boolean; cancelled: string; invoice: string } & PurchaseInvoice> =>
+    request(`/db/purchase-invoices/${encodeURIComponent(id)}/recreate`, { method: 'POST' }),
   /** Purchase returns with their line items. */
   getPurchaseReturnsWithLines: (): Promise<PurchaseReturn[]> => list('/db/purchase-returns/with-lines', PAGED),
   /** Record a return; stock only leaves when status is `received`. */

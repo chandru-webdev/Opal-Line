@@ -30,7 +30,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ProductDialog } from '@/components/product-dialog'
 import { productImageGallery } from '@/lib/product-image'
 import { dbApi, shopifyApi } from '@/lib/api'
-import type { Product, SilverRate } from '@/types'
+import type { Product, ProductVariant, SilverRate } from '@/types'
 import { formatCurrency, formatDate, formatWeight } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
@@ -44,6 +44,18 @@ export default function ProductDetailPage() {
   const [notice, setNotice] = useState('')
   const [syncing, setSyncing] = useState(false)
   const [galleryIdx, setGalleryIdx] = useState(0)
+  // Shopify-style variant rows (loaded only when the product has options).
+  const [variants, setVariants] = useState<ProductVariant[]>([])
+
+  const loadVariants = (p: Product | null) => {
+    if (!p?.id || !Array.isArray(p.options) || p.options.length === 0) {
+      queueMicrotask(() => setVariants([]))
+      return
+    }
+    dbApi.getProductVariants(p.id)
+      .then(({ variants: rows }) => setVariants(rows ?? []))
+      .catch(() => setVariants([]))
+  }
 
   useEffect(() => {
     // Defer out of the effect body: setLoading fires synchronously
@@ -54,6 +66,7 @@ export default function ProductDetailPage() {
       dbApi.getProductById(id ?? '')
         .then((p) => {
           setProduct(p ?? null)
+          loadVariants(p ?? null)
           setLoading(false)
         })
         .catch((e) => {
@@ -167,6 +180,7 @@ export default function ProductDetailPage() {
         product={product}
         onSaved={(saved, pushed) => {
           setProduct(saved)
+          loadVariants(saved)
           setNotice(pushed
             ? `Updated "${saved.name}" and pushed it to Shopify (content, images and price where changed).`
             : `Updated "${saved.name}".`)
@@ -205,6 +219,44 @@ export default function ProductDetailPage() {
         <QuickFact label="Net Silver Weight" value={formatWeight(product.netWeight)} sub={`Gross ${formatWeight(product.grossWeight)} · Stone ${formatWeight(product.stoneWeight)}`} tint="green" />
         <QuickFact label="Available Stock" value={`${stock} pcs`} sub={`Reorder level ${reorderLevel} pcs`} tint={stock <= reorderLevel ? 'red' : 'blue'} />
       </div>
+
+      {variants.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Variants</CardTitle>
+            <CardDescription>
+              {product.options?.map((o) => o.name).join(' × ') ?? 'Options'} — {variants.length} combination
+              {variants.length === 1 ? '' : 's'}, each with its own SKU, barcode, price and stock.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Variant</TableHead>
+                    <TableHead>SKU</TableHead>
+                    <TableHead>Barcode</TableHead>
+                    <TableHead className="text-right">Price</TableHead>
+                    <TableHead className="text-right">Stock</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {variants.map((v) => (
+                    <TableRow key={v.id}>
+                      <TableCell className="font-medium text-foreground">{v.title}</TableCell>
+                      <TableCell className="font-mono text-xs">{v.sku}</TableCell>
+                      <TableCell className="font-mono text-xs">{v.barcode ?? '—'}</TableCell>
+                      <TableCell className="text-right tabular-nums">{formatCurrency(v.sellingPrice ?? 0)}</TableCell>
+                      <TableCell className="text-right tabular-nums">{Math.floor(Number(v.stock) || 0)} pcs</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Tabs defaultValue="overview">
         <TabsList className="w-full justify-start overflow-x-auto bg-transparent p-0 shadow-none sm:w-auto sm:bg-muted/70 sm:p-1">

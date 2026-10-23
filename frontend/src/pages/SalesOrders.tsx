@@ -1,5 +1,6 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { ProductDialog } from '@/components/product-dialog'
+import { ManualInvoiceDialog } from '@/components/manual-invoice-dialog'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { ColumnDef } from '@/lib/table'
@@ -276,6 +277,17 @@ export default function SalesOrdersPage() {
   const [invoiceSavingId, setInvoiceSavingId] = useState<string | null>(null)
   const [syncingOrders, setSyncingOrders] = useState(false)
   const [syncMsg, setSyncMsg] = useState<{ ok: boolean; text: string } | null>(null)
+
+  // Manual invoice creation — the same dialog the Sales Invoices page uses, so
+  // a walk-in / phone sale can be billed from either screen. The row action
+  // seeds the buyer from the order it was opened on.
+  const [manualInvoiceOpen, setManualInvoiceOpen] = useState(false)
+  const [manualInvoiceOrder, setManualInvoiceOrder] = useState<SalesOrder | null>(null)
+
+  const openManualInvoice = useCallback((order: SalesOrder | null) => {
+    setManualInvoiceOrder(order)
+    setManualInvoiceOpen(true)
+  }, [])
 
   const reload = useCallback(() => {
     dbApi.getSalesOrders().then(setOrders).catch(() => {})
@@ -622,6 +634,31 @@ export default function SalesOrdersPage() {
         ),
       },
       {
+        // What was actually ordered — titles/SKUs from the order's line items,
+        // not just the money. Falls back to a dash for header-only rows.
+        id: 'products',
+        header: 'Products',
+        meta: { headerClassName: 'min-w-[180px]' },
+        cell: ({ row }) => {
+          const items = row.original.lineItems ?? []
+          if (items.length === 0) return <span className="text-xs text-muted-foreground">—</span>
+          const first = items[0]
+          return (
+            <div className="min-w-0 max-w-[280px]">
+              <p className="truncate text-[12.5px] text-foreground">
+                <span className="font-medium">{first.title || first.sku || 'Item'}</span> ×{first.quantity ?? 1}
+              </p>
+              {items.length > 1 ? (
+                <p className="truncate text-[11px] text-muted-foreground">
+                  {items.slice(1, 4).map((li) => `${li.title || li.sku || 'Item'} ×${li.quantity ?? 1}`).join(', ')}
+                  {items.length > 4 ? ` +${items.length - 4} more` : ''}
+                </p>
+              ) : null}
+            </div>
+          )
+        },
+      },
+      {
         accessorKey: 'value',
         header: 'Order Value',
         meta: { align: 'right' as const },
@@ -734,6 +771,9 @@ export default function SalesOrdersPage() {
                 </DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={() => openManualInvoice(row.original)}>
+                <FileText className="h-3.5 w-3.5" /> New invoice for this customer
+              </DropdownMenuItem>
               <DropdownMenuItem className="text-red-600 dark:text-red-400 focus:text-red-600 dark:text-red-400" onClick={() => cancelOrder(row.original)}>Cancel Order</DropdownMenuItem>
             </DropdownMenuContent>
             </DropdownMenu>
@@ -742,7 +782,7 @@ export default function SalesOrdersPage() {
         ),
       },
     ],
-    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder],
+    [navigate, cancelOrder, createInvoiceFor, viewOnShopify, refreshFromShopify, invoiceSavingId, startEdit, duplicateOrder, openManualInvoice],
   )
 
   const snapshotForm = () =>
@@ -1028,6 +1068,9 @@ export default function SalesOrdersPage() {
             </Button>
             <Button size="sm" className="gap-1.5" onClick={openDialog}>
               <Plus className="h-4 w-4" /> Manual Order
+            </Button>
+            <Button size="sm" className="gap-1.5" onClick={() => openManualInvoice(null)}>
+              <FileText className="h-4 w-4" /> New Invoice
             </Button>
           </>
         }
@@ -1585,6 +1628,27 @@ export default function SalesOrdersPage() {
                   value={formatCurrency(viewOrder.lineItems.reduce((sum, li) => sum + (li.price ?? 0) * (li.quantity ?? 0), 0))}
                 />
               ) : null}
+              {/* The actual products on the order — title/SKU/qty/line total. */}
+              {viewOrder.lineItems && viewOrder.lineItems.length > 0 ? (
+                <div className="border-b border-border/60 py-2">
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-muted-foreground">Line Items</span>
+                    <span className="text-[11px] text-muted-foreground">{viewOrder.lineItems.length} product(s)</span>
+                  </div>
+                  <div className="space-y-1">
+                    {viewOrder.lineItems.map((li, i) => (
+                      <div key={i} className="flex items-center justify-between gap-3 text-xs">
+                        <span className="min-w-0 flex-1 truncate">
+                          <span className="font-medium text-foreground">{li.title || 'Item'}</span>
+                          {li.sku ? <span className="ml-1.5 font-mono text-muted-foreground">{li.sku}</span> : null}
+                        </span>
+                        <span className="shrink-0 tabular-nums text-muted-foreground">{li.quantity ?? 1} × {formatCurrency(li.price ?? 0)}</span>
+                        <span className="shrink-0 tabular-nums font-medium text-foreground">{formatCurrency((li.price ?? 0) * (li.quantity ?? 0))}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
               <DetailRow label="Payment" value={getPaymentMeta(viewOrder.payment).label} />
               <DetailRow label="Fulfillment" value={getFulfillmentMeta(viewOrder.fulfillment).label} />
               <DetailRow label="Invoice" value={viewOrder.invoice ?? 'Not raised'} />
@@ -1619,36 +1683,19 @@ export default function SalesOrdersPage() {
                   </div>
                 </div>
               ) : null}
-              {viewOrder.lineItems && viewOrder.lineItems.length > 0 ? (
-                <div className="border-b border-border/60 py-2">
-                  <div className="mb-1.5 flex items-center justify-between">
-                    <span className="text-muted-foreground">Line Items</span>
-                    <span className="text-[11px] text-muted-foreground">{viewOrder.lineItems.length} product(s)</span>
-                  </div>
-                  <div className="space-y-1">
-                    {viewOrder.lineItems.map((li, i) => (
-                      <div key={i} className="flex items-center justify-between gap-3 text-xs">
-                        <span className="min-w-0 flex-1 truncate">
-                          <span className="font-medium text-foreground">{li.title}</span>
-                          {li.sku ? <span className="ml-1.5 font-mono text-muted-foreground">{li.sku}</span> : null}
-                        </span>
-                        <span className="shrink-0 tabular-nums text-muted-foreground">
-                          {li.quantity} × {formatCurrency(li.price)}
-                        </span>
-                        <span className="shrink-0 tabular-nums font-medium text-foreground">
-                          {formatCurrency((li.price ?? 0) * li.quantity)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
               <Customer360Card customer={viewOrder.customer} />
               <Order360Section orderId={viewOrder.id} />
               <OrderTimeline orderId={viewOrder.id} />
             </div>
           ) : null}
       </AppDialog>
+
+      <ManualInvoiceDialog
+        open={manualInvoiceOpen}
+        onOpenChange={setManualInvoiceOpen}
+        initialCustomer={manualInvoiceOrder?.customer ?? ''}
+        initialCustomerPhone={manualInvoiceOrder?.customerPhone ?? ''}
+      />
 
       <AppDialog
         open={viewDialogOpen}

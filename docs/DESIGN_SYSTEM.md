@@ -1,265 +1,352 @@
-# DESIGN_SYSTEM.md — UI/UX Design System
+# Design System
 
-## UI Framework & Styling Technology
+The visual language of Opal Line Billing: the tokens, the primitives, and the
+page patterns. Everything here already exists in the codebase — this document
+explains how to use it and, more importantly, how **not** to fight it.
 
-| Aspect | Detail |
+---
+
+## 1. The brand in one line
+
+**Midnight navy + gold.** Navy carries the interface because it stays legible
+behind dense data tables, where a lighter brand hue washes out at small sizes.
+Gold is the accent and is used sparingly — on the active nav item and primary
+actions — because gold at large areas reads cheap rather than premium.
+
+That single decision governs everything else on this page.
+
+---
+
+## 2. Where the tokens live
+
+Tailwind 4 is **CSS-first**: there is no `tailwind.config.js`. The tokens are
+split across two files, and both must agree.
+
+```mermaid
+flowchart LR
+  IDX["index.css<br/>:root and .dark<br/>raw HSL channel triples"] -->|referenced by| THEME["theme.css<br/>@theme block<br/>maps channels to Tailwind colours"]
+  THEME --> UTIL["Tailwind utilities<br/>bg-card, text-muted-foreground"]
+```
+
+| File | Holds |
 |---|---|
-| **UI framework** | React 19.3.1 |
-| **Styling** | Tailwind CSS 4.3.3 (CSS-first, no `tailwind.config.js`) |
-| **Theme source** | `frontend/src/theme.css` — `@theme` CSS block with CSS custom properties (tokens) |
-| **Dark mode** | `class` based: `<html class="dark">` toggled via theme toggle in AppShell; `@custom-variant dark (&:where(.dark, .dark *))` |
-| **CSS reset/preflight** | Tailwind `@tailwind base;` + `@tailwind components;` + `@tailwind utilities;` (via PostCSS) |
-| **PostCSS plugin** | `@tailwindcss/postcss` (v4 replaces `tailwindcss` + `autoprefixer` pair) |
-| **CSS variables** | Defined in `frontend/src/theme.css`; read by Tailwind via `@theme` block; exposed as `var(--token-name)` |
-| **Component library** | @radix-ui/react-* ( primitives: Dialog, DropdownMenu, Table, Input, Button, Switch, Slider, Tooltip, SwitchRoot, Separator, Sheet, Progress, Popover, Collapse, Alert, Progress, RadioGroup, CheckboxGroup, Sheet, Tooltip, TreeView) + lucide-react for icons |
-| **Custom components** | Built on top of Radix primitives + Tailwind utilities; no separate design system repo |
-| **Responsive breakpoints** | Tailwind v4 default + project overrides in `theme.css` |
-| **CSS-first theme** | All tokens in `theme.css` as `--token-name` variables; Tailwind reads these via `@theme` block |
+| `frontend/src/index.css` | The runtime variables — `:root` (light) and `.dark` — as bare HSL channel triples, plus the `@media print` block |
+| `frontend/src/theme.css` | The `@theme` block that maps each variable to a Tailwind colour, plus radii, shadows, fonts and animations |
 
-### Theme CSS Structure (`frontend/src/theme.css`)
+A token is a **triple** (`222 64% 28%`), not a colour, because the utilities
+consume it through `hsl(var(--token))`. Writing `hsl(var(--primary))` yourself
+in a component is a bug — use `bg-primary`.
 
-```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+> **Tailwind 4 silently drops tokens it cannot find.** It does not error. After
+> editing the theme, verify that `--primary`, `--radius` and the `.dark` block
+> still reach the built CSS.
 
-/* =========================================================
-   CSS Tokens — these are the design system's single source of truth
-   ========================================================= */
+---
 
-/* Color palette */
-:root {
-  --color-primary: #18181b;
-  --color-primary-foreground: #fafafa;
-  --color-secondary: #e5e5e7;
-  --color-secondary-foreground: #18181b;
-  --color-accent: #005fcc;
-  --color-success: #22c55e;
-  --color-warning: #eab308;
-  --color-error: #ef4444;
-  --color-muted: #737373;
-  --color-muted-foreground: #a3a3a3;
-}
+## 3. Colour
 
-/* Light mode */
-html:not(.dark) {
-  --background: #ffffff;
-  --foreground: #18181b;
-  --card: #ffffff;
-  --card-foreground: #18181b;
-  --popover: #ffffff;
-  --popover-foreground: #18181b;
-}
+### 3.1 Semantic tokens
 
-/* Dark mode */
-html.dark {
-  --background: #0a0a0f;
-  --foreground: #fafafa;
-  --card: #18181b;
-  --card-foreground: #fafafa;
-  --popover: #18181b;
-  --popover-foreground: #fafafa;
-}
+Use these in components. Never reach for a raw palette colour to express
+meaning.
 
-/* Typography */
-:root {
-  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Noto Sans", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  --font-size-xs: 0.75rem;     /* 12px */
-  --font-size-sm: 0.875rem;   /* 14px */
-  --font-size-md: 1rem;        /* 16px */
-  --font-size-lg: 1.125rem;   /* 18px */
-  --font-size-xl: 1.25rem;    /* 20px */
-  --font-size-2xl: 1.5rem;    /* 24px */
-  --font-size-3xl: 1.875rem;  /* 30px */
-  --font-weight-normal: 400;
-  --font-weight-medium: 500;
-  --font-weight-bold: 700;
-  --leading-relaxed: 1.625;
-  --tracking-tight: -0.025em;
-}
+| Token | Tailwind class | Use for |
+|---|---|---|
+| `background` / `foreground` | `bg-background`, `text-foreground` | Page canvas, default text |
+| `card` / `card-foreground` | `bg-card`, `text-card-foreground` | Surfaces: cards, panels, inputs |
+| `popover` | `bg-popover` | Menus, dropdowns, tooltips |
+| `primary` | `bg-primary`, `text-primary` | Primary actions, active state |
+| `secondary` | `bg-secondary` | Secondary surfaces |
+| `muted` / `muted-foreground` | `text-muted-foreground` | Secondary text, help copy |
+| `accent` | `bg-accent` | Hover/active highlight surfaces |
+| `destructive` | `bg-destructive` | Delete, danger |
+| `border` / `input` / `ring` | `border-border`, `ring-ring` | Borders, focus rings |
+| `success`, `warning`, `info` | `bg-success-50`, `text-success-700` | Status semantics (each has a 50/100/700 ramp) |
+| `gold` | `bg-gold`, `text-gold` | The premium accent — active nav item, brand moments |
+| `sidebar*` | `bg-sidebar`, `text-sidebar-muted` | The left navigation |
 
-/* =========================================================
-   Component Tokens
-   ========================================================= */
+### 3.2 Status ramps
 
-/* Buttons */
-.btn {
-  @apply inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2;
-}
-.btn-primary {
-  @apply btn bg-primary text-primary-foreground hover:bg-primary/90;
-}
-.btn-secondary {
-  @apply btn bg-secondary text-secondary-foreground hover:bg-secondary/80;
-}
-.btn-danger {
-  @apply btn bg-error text-error hover:bg-error/90;
-}
+Success, warning and info each ship a three-step ramp used consistently:
 
-/* Inputs */
-.input {
-  @apply block w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2;
-}
-
-/* Cards */
-.card {
-  @apply rounded-lg border bg-card shadow-card text-card-foreground;
-}
-
-/* Modals / Dialogs */
-.dialog {
-  @apply fixed inset-0 z-50;
-}
-.dialog-content {
-  @apply bg-card w-full max-w-lg rounded-lg p-6 shadow-lg;
-}
-
-/* Tables */
-.table {
-  @apply w-full rounded-md border-collapse;
-}
-.table th {
-  @apply p-3 text-left text-sm font-medium text-muted-foreground border-b;
-}
-.table td {
-  @apply p-3 text-sm text-foreground border-b align-middle;
-}
-
-/* Navigation */
-.nav-link {
-  @apply relative inline-flex items-center rounded-md px-2 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/10;
-}
-.nav-link.active {
-  @apply bg-primary/10;
-}
-
-/* Accessibility */
-.visually-hidden {
-  @apply absolute w-1 h-1 overflow-hidden bg-transparent border-0 px-0 py-0:
-  clip-path: inset(50%);
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-  width: 1px;
-  height: 1px;
-}
+```
+bg-success-50  text-success-700   → a green badge / soft chip
+bg-success-100                   → a stronger chip background
+bg-success                      → a solid green fill (button)
 ```
 
-### Color Palette (from `theme.css`)
+The `Badge` component exposes this as `variant="success" | "warning" | "info" |
+"danger"`. Use the badge, not hand-built colour classes.
 
-| Token | Light | Dark | Usage |
-|---|---|---|---|
-| `--color-primary` | `#18181b` | `#18181b` | Main background, nav bars |
-| `--color-primary-foreground` | `#fafafa` | `#fafafa` | Text on primary |
-| `--color-secondary` | `#e5e5e7` | `#e5e5e7` | Surfaces, dividers |
-| `--color-secondary-foreground` | `#18181b` | `#18181b` | Text on secondary |
-| `--color-accent` | `#005fcc` | `#005fcc` | Primary actions, links |
-| `--color-success` | `#22c55e` | `#22c55e` | Success states, save buttons |
-| `--color-warning` | `#eab308` | `#eab308` | Warnings, caution UI |
-| `--color-error` | `#ef4444` | `#ef4444` | Error states, delete buttons |
-| `--color-muted` | `#737373` | `#737373` | Disabled text, secondary labels |
-| `--color-muted-foreground` | `#a3a3a3` | `#a3a3a3` | Muted secondary text |
+### 3.3 The gold ramp
 
-### Typography (from `theme.css`)
+Deliberately not a full ramp — only four values exist:
 
-| Token | Value | Usage |
+| Token | Use |
+|---|---|
+| `--gold` | The active sidebar item, brand highlights |
+| `--gold-foreground` | Text on a gold fill |
+| `--gold-muted` | A soft gold surface |
+| `--gold-border` | A gold hairline |
+
+### 3.4 Light, dark and print
+
+- Dark mode is class-based: the `dark` class on `<html>`, toggled by
+  `frontend/src/lib/theme.ts` and persisted in `localStorage` under
+  `opal-theme`.
+- Dark mode is declared as
+  `@custom-variant dark (&:where(.dark, .dark *))` in `theme.css` (the v4
+  equivalent of v3's `darkMode: ['class']`).
+- **Print always uses the light palette.** The `@media print` block in
+  `index.css` re-declares the light values over `html.dark`. A dark-mode
+  invoice printing with a dark background is a bug, not a preference.
+- `scripts/check-palette.mjs` measures WCAG AA contrast across light, dark and
+  print in CI. A colour tweak that fails the contrast gate fails the build.
+
+### 3.5 Contrast
+
+Text on its background must reach **4.5:1** (normal text) or **3:1** (large
+text and UI borders). The palette in `index.css` is tuned for this; run
+`node scripts/check-palette.mjs` after any colour edit rather than eyeballing
+it.
+
+---
+
+## 4. Typography
+
+| Role | Class | Notes |
 |---|---|---|
-| `--font-size-sm` | `0.875rem` (14px) | Body text, captions |
-| `--font-size-md` | `1rem` (16px) | Default paragraph text |
-| `--font-size-lg` | `1.125rem` (18px) | Section headings |
-| `--font-size-xl` | `1.25rem` (20px) | Page headings |
-| `--font-size-2xl` | `1.5rem` (24px) | Dashboard KPI labels |
-| `--font-size-3xl` | `1.875rem` (30px) | Page titles |
-| `--leading-relaxed` | `1.625` | Line height for readability |
-| `--tracking-tight` | `-0.025em` | Tighter lettering for headers |
+| Page title | `text-xl font-bold tracking-tight` | `PageHeader` |
+| Card title | `font-semibold leading-none tracking-tight` | `CardTitle` |
+| Body | `text-sm` | The default in most of the app |
+| Secondary body | `text-sm text-muted-foreground` | Subtitles, help text |
+| Label / meta | `text-xs` | Column headers, badges, captions |
+| KPI value | `text-[22px] font-bold tracking-tight` | `StatCard` |
+| Tiny | `text-2xs` | `--text-2xs: 0.6875rem` — used sparingly |
 
-### Spacing & Sizing
+Font stack: **Inter**, falling back to the system stack
+(`--font-sans` in `theme.css`). Monospace is `ui-monospace, SFMono-Regular,
+Menlo, Consolas, monospace` (`--font-mono`) — used for SKUs, GSTINs and
+barcodes.
 
-| Token | Value | Usage |
+> Do not set font sizes inline with arbitrary values. If a size is missing,
+> add it to `theme.css` and use it everywhere.
+
+---
+
+## 5. Spacing, radius and elevation
+
+- **Radius**: `--radius: 0.5rem` (8px) is the base. `theme.css` derives
+  `sm` (base − 4px), `md` (base − 2px), `lg` (base) and `xl` (base + 4px).
+  Cards and panels use `rounded-lg`; inputs and buttons use `rounded-md`;
+  badges use `rounded-md`; pills use `rounded-full`.
+- **Elevation**: `--shadow-card` (subtle), `--shadow-card-hover` (lifted),
+  `--shadow-popover` (menus), `--shadow-kpi` (stat cards). Use the token —
+  `shadow-card`, `shadow-popover` — not an arbitrary shadow.
+- **Spacing**: Tailwind's default scale. Page gutters are `px-4 lg:px-6`;
+  the content column is `max-w-[1100px]` where a page needs a hard edge.
+
+---
+
+## 6. Motion
+
+| Token | Duration | Use |
 |---|---|---|
-| `--space-1` | `0.25rem` (4px) | Tight padding/margin |
-| `--space-2` | `0.5rem` (8px) | Standard spacing |
-| `--space-3` | `0.75rem` (12px) | Card padding |
-| `--space-4` | `1rem` (16px) | Component margin |
-| `--space-6` | `1.5rem` (24px) | Section gap |
-| `--space-8` | `2rem` (32px) | Large gap between sections |
-| `--space-12` | `3rem` (48px) | Page-level margin |
+| `--animate-fade-in` | 0.2s | Lists, panels appearing |
+| `--animate-scale-in` | 0.15s | Popovers, small surfaces |
+| `--animate-dialog-in` | 0.12s | Dialogs |
+| `--animate-overlay-in` | 0.12s | Dialog overlays |
+| `--animate-slide-in-right` | 0.25s | Toasts, slide-over panels |
 
-### Breakpoints (Tailwind CSS v4)
+**Dialogs must feel instant.** The `dialog-in` keyframes animate opacity and
+scale only — **no translate**. The dialog is centred with Tailwind's
+`-translate-x-1/2 -translate-y-1/2`, which sets the standalone `translate`
+property; a `transform: translate(-50%, -50%)` inside the keyframes would
+*stack* on top of it and shift the dialog to the top-left for the length of
+the animation. Scale composes after the translate and scales around the
+centred box, so it is safe.
 
-| Breakpoint | CSS media query | Usage |
+Keep animations under 0.25s. Anything longer feels sluggish on a desktop app
+running on shop hardware.
+
+---
+
+## 7. Components
+
+All primitives live in `frontend/src/components/ui/`. They are built on Radix
+UI with CVA variants and Tailwind tokens.
+
+### 7.1 The primitives
+
+| Component | Variants | Notes |
 |---|---|---|
-| `sm` | `@media (min-width: 640px)` | Small screens, mobile landscape |
-| `md` | `@media (min-width: 768px)` | Tablets |
-| `lg` | `@media (min-width: 1024px)` | Laptops, small desktops |
-| `xl` | `@media (min-width: 1280px)` | Desktops |
-| `2xl` | `@media (min-width: 1536px)` | Large desktops |
+| `Button` | `default`, `secondary`, `outline`, `ghost`, `link`, `destructive`, `success`, `soft-primary`, `soft-danger` × sizes `default`, `sm`, `lg`, `icon`, `icon-sm` | `asChild` renders the child element with the button's classes |
+| `Card` | — | `CardHeader`, `CardTitle`, `CardDescription`, `CardContent`, `CardFooter` |
+| `Badge` | `default`, `solid`, `secondary`, `outline`, `success`, `warning`, `danger`, `info`, `muted`, `purple` + `dot` | `dot` renders a status dot |
+| `Input` | — | `h-9`, `border-input`, `bg-card`, focus ring |
+| `Dialog` | — | Radix; `app-dialog.tsx` is the app-specific wrapper |
+| `DataTable` | — | TanStack Table v9 with sorting, filtering, selection, column visibility |
+| `StatCard` | accents `purple`, `green`, `orange`, `red`, `blue`, `slate` | KPI tile with trend arrow, delta and label |
+| `PageHeader` | — | Title, subtitle, actions |
+| `EmptyState` | — | Icon, title, description, action |
+| `Select`, `SearchableSelect`, `CreatableSelect` | — | Radix Select / listbox variants |
+| `Tabs`, `Switch`, `Progress`, `Tooltip`, `Avatar`, `Separator`, `Skeleton`, `Label`, `Textarea` | — | Thin wrappers over Radix |
+| `confirm.tsx` + `confirm-hosts.tsx` | — | The app's confirm dialog and toast host, mounted once in `App.tsx` |
 
-### Responsive Behavior
+### 7.2 Button choice
 
-- **Mobile-first**: Base styles apply to all widths; breakpoints add enhancements
-- **AppShell**: Sidebar collapses to hamburger menu below `md` (1024px)
-- **Tables**: Horizontal scroll on mobile; stacked cell layout on narrow screens
-- **Images**: `max-width: 100%; height: auto;` — never overflow container
-- **Forms**: Full-width inputs on mobile; compact layout on lg+
-- **Modals**: Open full-width; on small screens, `max-w-sm` applies
+| Intent | Variant |
+|---|---|
+| The one action on the page | `default` |
+| A second action | `outline` or `secondary` |
+| A destructive action | `destructive` |
+| A tertiary/icon action | `ghost` |
+| A navigation link | `link` |
+| A positive completion | `success` |
 
-### Component Variants & Interaction States
+Do not put two `default` buttons next to each other. If a page seems to need
+two, one of them is `outline`.
 
-| Component | Variants | States |
-|---|---|---|
-| **Button** | `primary`, `secondary`, `danger`, `link`, `ghost` | `default`, `hover`, `active`, `focus`, `disabled`, `loading` |
-| **Input** | `default`, `error`, `success` | `default`, `focus`, `disabled`, `with-icon` |
-| **Card** | `default`, `elevated`, `bordered` | `default`, `hover`, `selected` |
-| **Table** | `default`, `compact`, `striped` | `default`, `hover-row`, `selected-row` |
-| **Dialog/Modal** | `default`, `full-width`, `confirm` | `open`, `closing`, `closed` |
-| **Navigation link** | `active`, `inactive`, `divider` | `hover`, `focus`, `active` |
-| **Switch/Toggle** | `on`, `off`, `disabled` | `checked`, `unchecked`, `focus` |
-| **Avatar** | `initials`, `image`, `group` | `hover`, `selected` |
+### 7.3 Tables
 
-### Accessibility Standards
+`DataTable` handles sorting, column filters, column visibility, row selection
+and the empty/loading states. Pages configure columns and stop there.
 
-| Area | Standard | Implementation |
-|---|---|---|
-| **WCAG compliance** | AA for color contrast | `scripts/check-palette.mjs` validates light + dark + print; all tokens meet AA |
-| **Keyboard navigation** | All interactive elements reachable via Tab | Radix primitives handle focus management |
-| **Focus indicators** | `focus-visible` rings via Tailwind | `focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2` |
-| **ARIA labels** | Descriptive labels for form controls | `aria-label`, `aria-described-used` used where placeholder alone is unclear |
-| **Screen reader** | Logical DOM order; meaningful link/text | Confirm/ToastHost announcements via React Context |
-| **Color contrast** | Minimum 4.5:1 for normal text, 3:1 for large text | Verified via palette check script; `--color-primary` on `--color-primary-foreground` meets 8.5:1 |
-| **Reduced motion** | Respect `prefers-reduced-motion` | Transition durations scaled; no auto-playing carousels |
-| **Touch target minimum** | 44×44dp minimum | Button/padding sizes ensure >= 44px hit area |
-
-### Design Tokens & CSS Variables
-
-All design tokens are defined in `frontend/src/theme.css` as CSS custom properties (`.js` `var()`-compatible). The `@theme` block in the same file maps these to Tailwind's internal system.
-
-```css
-/* Example token usage */
-:root {
-  --primary: #18181b;
-  --primary-foreground: #fafafa;
-  --radius: 0.5rem;
-}
-
-/* Tailwind reads these via @theme */
-@theme inline {
-  --color-primary: var(--primary);
-  --color-primary-foreground: var(--primary-foreground);
-  --border-radius: var(--radius);
-}
+```tsx
+<DataTable
+  columns={columns}
+  data={rows}
+  onRowClick={handleOpen}
+  emptyMessage="No invoices in this range"
+/>
 ```
 
-### Current UI Inconsistencies & Recommendations
+Column alignment goes through the column meta:
 
-| Issue | Current | Recommendation |
-|---|---|---|
-| **Button radius inconsistency** | Some buttons use `.5rem`, others `0.75rem` | Standardize on `--radius` token (currently `0.5rem`); update all via build codemod |
-| **Input height variance** | `py-2` vs `py-3` used across forms | Enforce `py-2` + `--space-3` (`0.75rem`) vertical rhythm consistently |
-| **Card shadow values** | `shadow-sm`, `shadow`, `shadow-lg` used | Define `shadow-card` token in `theme.css`; use consistently across card-like components |
-| **Focus ring contrast** | Some focus rings use `var(--color-primary)` on light background | Ensure `focus-visible:ring-ring` references the correct token; verify contrast on dark mode |
-| **Deprecated Tailwind v3 patterns** | Occasional `flex`/`grid` without `gap` | Migrate to Tailwind v4 `gap-y-6` etc.; the build still compiles but v4 syntax preferred |
-| **Hardcoded color strings** | A few components use `#18181b` directly instead of `var(--color-primary)` | Replace with token references; run a codemod to find `color-primary` → `var(--color-primary)` |
-| **Responsive-hidden patterns** | `hidden sm:block` used in some places | Standardize on `hidden sm:block` (consistent order) across codebase |
-| **Dialog padding** | Some modals use `p-4`, others `p-6` | Standardize on `p-6` for content modals, `p-4` for small inline dialogs |
-| **Text ellipsis** | Mixed `line-clamp-2` vs `-line-clamp-2` | Use `line-clamp-2` (no space) consistently; PostCSS/sorting handles it |
+```ts
+columnMeta: { align?: 'left' | 'right' | 'center'; headerClassName?: string }
+```
+
+Right-align every numeric column. Money and weights are compared by position,
+not by reading.
+
+### 7.4 Empty and loading states
+
+Every table and list has three states, and all three are designed:
+
+- **Loading** — a `Skeleton` matching the final layout, not a spinner over an
+  empty box.
+- **Empty** — `EmptyState` with an icon, a sentence saying *why* it is empty
+  and, where useful, the action that fills it.
+- **Error** — the error is stated; a failed load never renders as "no data".
+
+### 7.5 Confirmations
+
+Destructive and irreversible actions go through the shared confirm host, not a
+bare `window.confirm`. `confirmDialog` resolves to a boolean; `promptDialog`
+resolves to a string or `null`:
+
+```ts
+import { confirmDialog } from '@/components/ui/confirm'
+
+const ok = await confirmDialog({
+  title: 'Delete this invoice?',
+  description: 'This cannot be undone.',
+  confirmLabel: 'Delete',
+})
+
+if (!ok) return
+```
+
+Toasts go through the same module's `toast` helper (`toast.success(...)`,
+`toast.error(...)`), which the `ToastHost` renders. Both hosts are mounted
+once in `App.tsx`, so a page never renders its own toast container.
+
+---
+
+## 8. Page anatomy
+
+Every page follows the same skeleton:
+
+```mermaid
+flowchart TD
+  PH["PageHeader<br/>title · subtitle · actions"]
+  BODY["Body"]
+  BODY --> TOOLBAR["Toolbar / filters / search"]
+  BODY --> TABLE["DataTable or Card grid"]
+  BODY --> FORM["Form dialog"]
+  DLG["Dialog is rendered by the page, opened imperatively"]
+```
+
+- **Title** — the noun, plural where it is a list ("Sales Invoices").
+- **Subtitle** — the scope or a one-line explanation, in
+  `text-muted-foreground`.
+- **Actions** — on the right, in `PageHeader`'s `actions` slot.
+- **Filters** — a toolbar above the table, left-aligned, with the range
+  selector first when one applies.
+
+### 8.1 Spacing rhythm
+
+| Gap | Use |
+|---|---|
+| `gap-2` | Between controls in a toolbar |
+| `gap-3` | Between form fields |
+| `gap-4` | Between sections of a page |
+| `space-y-4` / `space-y-6` | Vertical rhythm between stacked blocks |
+
+### 8.2 Responsiveness
+
+The app is used on shop desktops and laptops, but the layout still holds at
+tablet width. Use the `lg:` breakpoint for the sidebar collapse and for
+page-gutter changes. Do not design a separate mobile layout — there isn't one.
+
+---
+
+## 9. Iconography
+
+- `lucide-react` only. One icon set across the app.
+- Icons are `h-4 w-4` inside buttons, `h-5 w-5` in nav items, `h-6 w-6` in
+  `EmptyState`.
+- Icons in buttons inherit `text-current` and are sized by the button's own
+  `[&_svg]:size-4` rule — do not add a size class on the icon.
+- An icon never carries meaning alone. Icon-only buttons need an
+  `aria-label` or a tooltip.
+
+---
+
+## 10. Accessibility
+
+- Every interactive element is reachable by keyboard and has a visible focus
+  ring (`focus-visible:ring-2 focus-visible:ring-ring`).
+- Disabled controls use `disabled:pointer-events-none disabled:opacity-50` so
+  they still announce as disabled.
+- Colour is never the only signal — a status badge has text, a trend has an
+  arrow, a chart has a legend.
+- Contrast is measured in CI (`scripts/check-palette.mjs`), not eyeballed.
+
+---
+
+## 11. Charts
+
+`recharts`, with the shared theme in
+`frontend/src/components/charts/chart-theme.ts` and the shared tooltip in
+`chart-tooltip.tsx`. Use those rather than hand-rolling a chart style, so
+every chart in the app reads as one family.
+
+Chart colours come from the same semantic tokens as the rest of the UI, and a
+chart must state its unit and its range in the surrounding card.
+
+---
+
+## 12. Do / Don't
+
+| Do | Don't |
+|---|---|
+| Use `bg-card`, `text-muted-foreground` | Use `bg-white`, `text-gray-500` |
+| Use the `Badge` variant for status | Hand-build a coloured pill |
+| Use `DataTable` for tabular data | Build a `<table>` by hand |
+| Use `formatCurrency` / `formatWeight` | Call `toFixed()` inline |
+| Use `PageHeader` | Repeat the header markup per page |
+| Merge classes with `cn()` | Concatenate strings |
+| Use `EmptyState` | Render an empty `<div>` |
+| Keep the gold accent rare | Use gold as a button fill everywhere |

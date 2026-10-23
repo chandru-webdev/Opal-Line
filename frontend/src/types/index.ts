@@ -35,6 +35,17 @@ export interface AppSettings {
   loginLockoutEnabled?: boolean
   lockoutThreshold?: number
   lockoutDurationMinutes?: number
+  /**
+   * Settings → Product codes: auto-generation rules consumed by
+   * src/lib/productCodes.ts. Undefined/empty means the shipped house style
+   * (prefix SLV, template {PREFIX}-{CATEGORY}-{SEQ}, 5-digit sequence,
+   * EAN-13 barcode prefix 890).
+   */
+  skuPrefix?: string | null
+  skuSuffix?: string | null
+  skuFormat?: string | null
+  skuSeqLength?: number | null
+  barcodePrefix?: string | null
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }
@@ -356,6 +367,17 @@ export type SilverRateSubmitResponse =
   | ({ direct: true } & SilverRateUpdateResult)
   | { direct: false; ok: true; request: SilverRateRequestRow; message: string }
 
+/** Live progress of an in-flight silver-rate apply (polled by the wizard). */
+export interface SilverRateProgress {
+  running: boolean
+  phase: 'idle' | 'syncing' | 'repricing' | 'matching' | 'pushing' | 'done'
+  label: string
+  done: number
+  total: number
+  startedAt: string | null
+  error: string | null
+}
+
 export interface SilverRateAutoStatus {
   enabled: boolean
   nextRunAt: string
@@ -510,27 +532,52 @@ export interface Product {
   trackInventory?: boolean
   chargeOnTax?: boolean
   /**
+   * Shopify-style option definitions: [{ name: 'Size', values: ['Small', 'Large'] }].
+   * Each option-value combination is a ProductVariant row; null/empty = simple product.
+   */
+  options?: ProductOption[] | null
+  /**
    * Variants of this product, when the product-variant feature has expanded
    * the product. Absent or empty means the flat single-SKU product that the
    * rest of the ERP still assumes; consumers must treat that as "no variants".
+   * Invoice/order flows read this through lib/productVariants, which
+   * normalizes defensively; catalog screens read `options` + the variant rows.
    */
   variants?: ProductVariant[] | null
   createdAt: string
 }
 
+/** One option definition on a product (Shopify's product options, max 3). */
+export interface ProductOption {
+  name: string
+  values: string[]
+}
+
 /**
- * One variant of a product. Populated by the product-variant feature; invoice
- * and order flows only need the trade facts — which SKU to bill, at what
- * price, with how much stock, and which Shopify variant to sync to.
+ * One option-value combination of a product, with its own codes and stock.
+ * Fields the invoice-flow adapter (lib/productVariants) does not supply are
+ * optional so a normalized foreign wire shape satisfies this type too.
  */
 export interface ProductVariant {
   id: string
-  /** Option summary (e.g. "16in / Gold"); falls back to the SKU when absent. */
+  /** Parent product id on catalog rows; absent on foreign wire shapes. */
+  productId?: string | null
+  /** "Small / Red" — the option values joined in option-definition order. */
+  title?: string | null
+  /** Option summary (e.g. "16in / Gold"); falls back to the SKU when absent. Legacy alias of `title`. */
   name?: string | null
+  /** Aligned with Product.options: ['Small', 'Red']. */
+  optionValues?: string[] | null
   sku: string
-  sellingPrice?: number | null
-  stock?: number | null
   barcode?: string | null
+  sellingPrice?: number | null
+  compareAtPrice?: number | null
+  costPrice?: number | null
+  grossWeight?: number | null
+  stock: number | null
+  reorderLevel?: number | null
+  status?: string | null
+  createdAt?: string | null
   /** Shopify ProductVariant id (numeric or gid:// form) for order sync. */
   shopifyVariantId?: string | number | null
 }

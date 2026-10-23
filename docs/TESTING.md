@@ -1,315 +1,395 @@
-# TESTING.md — Testing Documentation
-
-> This document describes the existing testing frameworks, tools, strategies, and commands verified against the project's package scripts, configuration, and source code. Commands that have not been tested are clearly identified.
-
-## Testing Frameworks & Tools
-
-| Layer | Framework | Purpose | Configuration |
-|---|---|---|---|
-| **Backend unit tests** | `vitest` (via `tsx` runner) | 237+ unit tests for route handlers, DB logic, RBAC, silver rate, Shopify sync, products, customers, inventory, lockout, GST, PDF generation, stock, etc. | `package.json` scripts: `npm test` runs `node --import tsx --test` on `src/**/*.test.ts` |
-| **End-to-end tests** | Playwright | 53 tests against running installed app; auth flow, security, sales orders, UI, recovery login, bulk fulfilment, port card, features, app dialog | `npm run test:e2e`; requires signed installer + bundled PostgreSQL |
-| **Palette contrast check** | Custom `scripts/check-palette.mjs` | WCAG AA validation for light + dark + print color modes | `npm run palette:contrast` (or `node scripts/check-palette.mjs`) |
-| **Type checking** | `typescript` via `tsc --noEmit` | Backend type safety; `npm run typecheck` | `backend/tsconfig.json`; `module: preserve` + `moduleResolution: bundler` |
-| **Linting** | `oxlint` (frontend + backend) | Fast Rust-based linting; CI gate: "Lint, typecheck, test, build" | `.oxlintrc.json`; `npm run lint` front; custom oxconfig for backend |
-| **Secret scan** | `scripts/scan-secrets.mjs` | Path/shape check + git history check for credentials | `npm run scan:secrets`; runs in CI before every build |
-
-## Current Test Directory Structure
-
-### Backend Unit Tests (`backend/src/**/*.test.ts`)
-
-```
-src/
-├── dashboard/          # Dashboard KPI, financials, silver history, low-stock, security tests
-├── rbac/               # Permission computation tests
-├── silver/             # Silver rate, auto-rate, scheduled changes tests
-├── shopify/            # Sync, webhook, product push tests
-├── sales/              # Invoices, orders, quotations, follow-ups tests
-├── purchase/           # Orders, invoices, suppliers, returns, payments tests
-├── inventory/          # Products, stock, transfers, locations, barcode tests
-├── accounts/           # Accounting, expenses, payments, ledger, import data tests
-├── reports/            # Business, GST, HSN summary, sales analysis, day book, dues tests
-├── system/             # Users/roles, settings, backup, status/logs/activity tests
-├── db/                 # DB health, stats, upgrade-path regression test
-├── activity/           # Activity log integration tests
-├── validation/         # Zod schema validation implicit tests
-└── lockout/            # Login lockout behavior tests
-```
-
-**Total**: 237+ passing test files (`.test.ts` suffix)
-
-### E2E Tests (`e2e/`)
-
-```
-e2e/
-├── auth.spec.ts          # Login/logout flow
-├── security.spec.ts      # Security headers, CSRF, rate limiting
-├── sales-orders.spec.ts  # Sales order pipeline
-├── ui.spec.ts            # General UI smoke tests
-├── recovery-login.spec.ts # Forgot/reset password flow
-├── bulk-fulfilment.spec.ts # Bulk order fulfilment
-├── port-card.spec.ts     # Barcode label printing
-├── features.spec.ts      # Feature toggles
-├── app-dialog.spec.ts    # Modal dialogs
-└── ... (total 53 test files)
-```
-
-## How to Install Dependencies & Run Tests
-
-### Backend Dependencies
-
-```bash
-# Root level — installs both workspaces
-npm ci
-
-# Or install backend specifically
-cd backend && npm ci
-```
-
-### Running Backend Unit Tests
-
-```bash
-# From repository root
-npm test
-
-# Equivalent direct command
-node --import tsx --test 'backend/src/**/*.test.ts'
-
-# Or via tsx directly
-npx tsx --test 'backend/src/**/*.test.ts'
-```
-
-**Test runner configuration**: Vitest is configured implicitly via `tsx` test runner. Test files match the pattern `src/**/*.test.ts`. Each test file exports `describe`/`it` blocks using `vitest` or standard `jest`/`node --import tsx --test` syntax.
-
-### Running E2E Tests
-
-```bash
-# From repository root
-npm run test:e2e
-
-# Requirements:
-# 1. Dev stack running (npm run dev) OR signed desktop installer installed
-# 2. E2E_PASSWORD set (generated admin password from first run)
-# 3. E2E_BASE_URL set (default: http://127.0.0.1:47192)
-
-# Example:
-E2E_BASE_URL=http://127.0.0.1:47192 E2E_PASSWORD=<admin-password> npx playwright test
-# Result: 52 pass, 1 skips (the repaired-demo-order test needs dev-store data)
-```
-
-### Running Palette Contrast Check
-
-```bash
-npm run palette:contrast
-# Or directly:
-node scripts/check-palette.mjs
-# Validates WCAG AA contrast for light, dark, and print color modes
-```
-
-### Running Type Check
-
-```bash
-npm run typecheck
-# Equivalent: cd backend && tsc --noEmit
-```
-
-### Running Lint
-
-```bash
-npm run lint
-# Frontend: oxlint on frontend/src/
-# Backend: oxlint on backend/src/
-```
-
-## Build, Lint, Type-Check & Validation Commands
-
-| Command | What it does | Verified |
-|---|---|---|
-| `npm ci` | Installs both workspaces (root hoisted) | ✅ Verified |
-| `npm run dev` | Backend + frontend with hot reload; first run provisions PostgreSQL + `backend/.env` | ✅ Verified |
-| `npm test` | Backend unit tests (237+ passing via `tsx`) | ✅ Verified |
-| `npm run typecheck` | Backend `tsc --noEmit` | ✅ Verified |
-| `npm run lint` | Frontend oxlint | ✅ Verified |
-| `npm run build` | Frontend production build (`tsc -b && vite build`) | ✅ Verified |
-| `npm run electron:dev` | Desktop window on dev stack | ✅ Verified |
-| `npm run electron:build` | NSIS installer → `dist-electron/` | ✅ Verified |
-| `npm run db:push` | Push schema to dev PostgreSQL (port 47194) | ✅ Verified |
-| `npm run db:generate` | Generate Drizzle migrations from schema | ✅ Verified |
-| `npm run scan:secrets` | Run secret-scan before every push | ✅ Verified |
-| `npm run test:e2e` | Playwright e2e suite | ✅ Verified |
-| `npm run palette:contrast` | WCAG AA palette check | ✅ Verified |
-
-## Database Setup & Test Environment Requirements
-
-### For Backend Unit Tests
-
-```bash
-# 1. Install dependencies
-npm ci
-
-# 2. Provision dev PostgreSQL (port 47194, auto-created on first run)
-npm run dev
-
-# 3. Run database seed (creates demo users, roles, settings row)
-npm run db:seed
-
-# 4. Run tests
-npm test
-# Alternatively, a database can be pointed to via DATABASE_URL in backend/.env
-# If no DATABASE_URL, dev PostgreSQL on port 47194 is used automatically
-```
-
-### Database Requirements
-
-| Requirement | Detail |
-|---|---|
-| **PostgreSQL version** | 16+ (bundled in desktop; dev provisions auto on port 47194) |
-| **Connection URL** | `postgresql://postgres:secret@localhost:5432/opal_line` (dev) or custom `DATABASE_URL` |
-| **Database name** | `opal_line` (created during bootstrap) |
-| **Migration state** | Must be up-to-date; `npm run db:push` applies pending migrations |
-| **Seed data** | `npm run db:seed` creates: admin user, `arjun` user, roles (Super Admin, Admin, Manager, User), settings row |
-
-### Test Environment Notes
-
-- **Tests are NOT run against the bundled desktop PostgreSQL** (port 47193) by default
-- **Dev stack uses separate PostgreSQL on port 47194** — fully isolated from desktop app
-- **Each test file assumes a fresh database state** or uses `beforeAll`/`afterAll` to set up required data
-- **Upgrade-path regression test** (`src/db/upgrade.test.ts`) verifies schema migration idempotency
-
-## Existing Test Coverage & Missing Test Scenarios
-
-### Verified Test Coverage (237+ tests)
-
-| Feature | Test Count | Key Test Files |
-|---|---|---|
-| **Authentication** | 34 tests | `auth.test.ts`, `login-lockout.test.ts`, `email-verification.test.ts` |
-| **RBAC/permissions** | 28 tests | `rbac.test.ts`, `permission-compute.test.ts` |
-| **Silver rate** | 22 tests | `silver-rate.test.ts`, `auto-rate.test.ts`, `scheduled-change.test.ts` |
-| **Shopify sync** | 31 tests | `shopify-sync.test.ts`, `webhook.test.ts`, `product-sync.test.ts` |
-| **Products & Inventory** | 41 tests | `products.test.ts`, `stock-test.ts`, `low-stock.test.ts`, `barcode-test.ts` |
-| **Sales (invoices/orders/quotations)** | 44 tests | `invoices.test.ts`, `orders.test.ts`, `quotations.test.ts`, `followups.test.ts` |
-| **Purchase & Suppliers** | 23 tests | `purchase-orders.test.ts`, `supplier-payments.test.ts`, `returns.test.ts` |
-| **Accounts & GST** | 18 tests | `gst-reports.test.ts`, `tax-split.test.ts`, `ledger.test.ts` |
-| **Reports** | 18 tests | `business-reports.test.ts`, `supplier-dues.test.ts`, `hsn-summary.test.ts` |
-| **System & Users** | 17 tests | `users.test.ts`, `roles.test.ts`, `settings.test.ts`, `backup.test.ts` |
-| **Lockout & Security** | 12 tests | `lockout.test.ts`, `rate-limit.test.ts`, `csrf.test.ts` |
-
-### Missing Test Scenarios (identified gaps)
-
-| Area | Current Status | Recommended Test Coverage |
-|---|---|---|
-| **Two-factor authentication** | ❌ Not implemented; no tests | N/A (feature not shipped) |
-| **Password reset token expiry** | ⚠️ Minimal coverage | Add tests for token expiration handling |
-| **CSRF token rotation** | ⚠️ Limited coverage | Test token mismatch rejection and renewal |
-| **E2E: Shopify webhook replay protection** | ⚠️ 1 test covers webhook, no replay test | Add replay-protection test with old timestamps |
-| **E2E: Bulk operation accessibility** | ⚠️ No UI automation for bulk selects | Add Playwright tests for bulk select + action |
-| **Print Designer: PDF correctness** | ⚠️ Visual inspection only; no automated PDF content test | Add `jest`/`playwright` test verifying PDF text content |
-| **Gold rate endpoint security** | ⚠️ Not tested (no RBAC on `/gold/rate`) | Add test verifying 403 without proper permissions |
-| **Rate limit counter persistence across restarts** | ⚠️ 1 test verifies, no restart test | Add test: restart server, verify counters survive |
-| **Email ingestion PII recovery edge cases** | ⚠️ Basic test only | Add test for malformed emails, missing fields |
-| **Accessibility (a11y) tests** | ❌ None in suite | Consider `@playwright/test` a11y checks |
-| **Password strength validation** | ⚠️ Zod schema tests only | Add test for weak password rejection |
-
-### Critical Business Workflows Requiring Testing
-
-| Workflow | Test Coverage | Gap |
-|---|---|---|
-| **Silver rate update → product repricing → Shopify price push** | ✅ Covered (silver + shopify sync tests) | End-to-end integration test (rate change → price update on Shopify) |
-| **Quotation lifecycle: draft → sent → approved → converted → invoice** | ✅ Covered (quotations + invoices tests) | End-to-end test with full lifecycle in one suite |
-| **Purchase invoice → weighted-average cost revaluation → stock update** | ✅ Covered (purchase + inventory tests) | Test cost revaluation edge case: first purchase of new product |
-| **GST HSN summary with CGST/SGST/IGST split** | ✅ Covered (GST reports tests) | Test with mixed-state suppliers (some same, some different) |
-| **Login lockout enable/disable via Settings** | ✅ Covered (lockout tests) | Test that lockout values persist across server restart |
-| **Print Designer: UPI QR generation on invoice** | ⚠️ Visual only; no automated test | Add test rendering PDF and verifying QR pattern |
-| **Encrypted backup → S3 off-site push (simulated)** | ⚠️ No test without actual S3 bucket | Add test mocking S3 client; verify archive encryption |
-| **RBAC: Manager role permissions boundary** | ✅ Covered (RBAC tests) | Test that Manager cannot access System → Users & Roles |
-| **E2E: Full install → login → first run flow** | ✅ Covered (desktop e2e suite) | None — full suite already covers this |
-
-## Authentication & Authorization Test Cases
-
-| Test Category | Example Tests | Status |
-|---|---|---|
-| **Login flow** | Successful login, invalid password, lockout after threshold, CSRF mismatch | ✅ All covered |
-| **Session management** | Login/logout, session persistence across restarts, token regeneration on privilege change | ✅ Covered |
-| **Password change** | Self-service change, admin reset via `auth:reset`, forgot-password flow | ✅ Covered |
-| **Email verification** | New user verification, token expiry, resend verification | ✅ Covered |
-| **RBAC enforcement** | Super Admin `*` wildcard, role-based module visibility, permission denied (403) | ✅ Covered |
-| **Effective permissions** | `computeUserPermissions` merges role + overrides; override takes precedence | ✅ Covered |
-
-## Error Handling & Edge-Case Testing
-
-| Edge Case | Test Coverage | Notes |
-|---|---|---|
-| **Zod validation failure** | ✅ All route handlers test `z.ZodError` → 400 response | Error format `{ error, details }` |
-| **CSRF token mismatch** | ✅ Tests verify 401 on missing/invalid token | Frontend must send `x-csrf-token` |
-| **Session expiry** | ✅ Tests verify logout after inactivity | Cookie-based; no explicit TTL in code beyond browser session |
-| **Database connection failure** | ✅ Health check returns `"database":{"healthy":false}` | `checkDbHealth()` in `index.ts` |
-| **Rate limit exceeded** | ✅ 429 response on login budget exhaustion | E2E tests abort with clear 429 message |
-| **Logged-in user access without session** | ✅ `requireAuth` → 401 | Frontend clears AuthContext on 401 |
-| **Invalid route parameters** | ✅ `routeParam()` from `lib/routeParams.ts` handles Express 5 types | Previously unsafe `req.params.*` casting |
-| **Empty/invalid payloads** | ✅ Zod schemas reject missing required fields | 400 with issue details |
-
-## CI/CD Testing Requirements
-
-### GitHub Actions Workflows
-
-| Workflow | Triggers | Jobs | Testing Gates |
-|---|---|---|---|
-| **Checks job** (ubuntu-24.04) | On every push/PR to `master`/`main` | 1. Secret scan (`npm run scan:secrets`)<br>2. oxlint (frontend + backend)<br>3. `npm run typecheck`<br>4. `npm test` (237 unit tests)<br>5. Palette contrast check<br>6. `npm run build` (frontend)<br>7. Upgrade-path regression test | **All must pass**; failure blocks merge |
-| **Desktop e2e job** (windows-latest) | Manual trigger only | 1. Build signed installer<br>2. Silent install<br>3. Boot app<br>4. Run Playwright suite (53 tests) | **Manual only**; expected to be skipped on dependency PRs (WIN_SIGNING_PFX_B64 withheld) |
-| **Nightly job** (schedule) | Weekly (Monday 06:00 UTC) | 1. Dependency audit (`npm audit --omit=dev`)\br>2. Frontend build + lint | **Dependency audit blocking** for installer tree; dev advisories non-blocking |
-
-### Release Workflow Testing
-
-```bash
-# Cut a release ( documented in DEVELOPING.md )
-npm version 1.0.11 --no-git-tag-version
-# Edit release notes: $EDITOR docs/release-notes-v1.0.11.md
-git add -A && git commit -m "Cut v1.0.11: <summary>"
-git tag v1.0.11 && git push origin master --follow-tags
-# Triggers: release workflow → build signed installer → e2e against installed app
-```
-
-## Prioritized Testing Roadmap
-
-| Priority | Area | Action | Effort |
-|---|---|---|---|
-| **P1** | **End-to-end integration test: silver rate → repricing → Shopify price push** | Write test that updates silver rate, verifies product prices recompute, and Shopify variants get new price | High (requires Shopify test store or mock) |
-| **P1** | **Full quotation lifecycle end-to-end test** | Write Playwright test: create quotation → mark sent → approve → convert → verify invoice created | Medium (Playwright + DB setup) |
-| **P2** | **Print Designer PDF content test** | Automate PDF rendering and verify UPI QR text, product thumbnail presence | Medium (requires PDFKit test canvas) |
-| **P2** | **Rate limit persistence across restart test** | Restart server, verify `rate_limit_hits` and `login_attempts` survive | Low (SQL query + server restart) |
-| **P3** | **Gold rate endpoint RBAC test** | Write test verifying 403 for non-admin on `/api/v1/gold/rate` | Low (existing route + RBAC check) |
-| **P3** | **Email ingestion edge-case tests** | Test malformed emails, missing PII, failed IMAP connection handling | Medium (IMAP mock required) |
-| **P4** | **Accessibility (a11y) test suite** | Add Playwright `@playwright/test` a11y checks to existing e2e suite | Medium (Playwright a11y API) |
-| **P4** | **Two-factor authentication test planning** | Document test requirements; defer implementation until 2FA shipped | Low (planning only) |
-| **P5** | **CI: Add typecheck to every workflow** | Ensure `npm run typecheck` runs in all CI jobs (already in checks job) | Low (already configured) |
-
-### Test Commands Quick Reference
-
-```bash
-# From repository root
-
-# Install
-npm ci
-
-# Development
-npm run dev              # backend + frontend
-
-# Quality gates (CI equivalent)
-npm run typecheck        # backend tsc --noEmit
-npm run lint             # oxlint (frontend + backend)
-npm test                 # 237+ backend unit tests
-npm run scan:secrets     # secret scan before push
-npm run build            # frontend production build
-
 # Testing
-npm run test:e2e         # Playwright e2e (needs running app)
-node scripts/check-palette.mjs  # WCAG AA palette check
 
-# Database
-npm run db:push          # push schema to dev PostgreSQL
-npm run db:generate      # generate Drizzle migrations
-npm run db:seed          # seed demo users/roles/settings
+What is tested, how to run it, and where a new test belongs.
 
-# Electron
-npm run electron:dev     # desktop window on dev stack
-npm run electron:build   # NSIS installer
+The repository has four test layers. Each answers a different question, and
+each catches a different class of bug.
+
+| Layer | Tool | Scope | Runtime |
+|---|---|---|---|
+| **Unit** | `node --test` + tsx | Pure logic: pricing, ranges, lockout, crypto, RBAC merge | ~10 s |
+| **Integration (DB-gated)** | `node --test` + tsx | Real PostgreSQL: schema, migrations, stock ledger | ~30 s |
+| **Component** | `node --test` + tsx + React shim | Frontend rendering and helpers | ~5 s |
+| **End-to-end** | Playwright | The installed app and the dev stack, in a browser | ~5–15 min |
+
+---
+
+## 1. Running everything
+
+```bash
+npm run lint          # frontend oxlint
+npm run lint:backend  # backend oxlint --max-warnings 0
+npm run typecheck     # backend tsc --noEmit
+npm test              # backend unit tests
+npm run build         # frontend tsc -b && vite build
+npm run scan:secrets  # credential scan over the tree and the git history
+```
+
+That list **is** the CI gate (`Lint, typecheck, test, build`). CI adds two
+steps the shell cannot: the palette contrast check and the upgrade-path test
+(it needs a real PostgreSQL). A change is not done until all of it is green.
+
+```bash
+npm run test:e2e              # Playwright against the dev stack (needs it running)
+npm run test:desktop          # Windows-only desktop behaviour tests
+```
+
+---
+
+## 2. Unit tests (backend)
+
+**Location** — beside the code, named `<module>.test.ts`:
+
+```
+backend/src/lockout.test.ts              backend/src/lib/dashboardRange.test.ts
+backend/src/pricing.test.ts              backend/src/lib/rateSchedule.test.ts
+backend/src/rbac.test.ts                 backend/src/lib/scheduledRate.test.ts
+backend/src/webhooks.test.ts             backend/src/lib/scheduler.test.ts
+backend/src/uploads.test.ts              backend/src/lib/seedGuard.test.ts
+backend/src/stock.test.ts                backend/src/proxyTrust.test.ts
+backend/src/purchases.test.ts            backend/src/recoveryPassword.test.ts
+backend/src/gst.test.ts                  backend/src/db/upgrade.test.ts
+backend/src/pdf.test.ts                  backend/src/orderInvoice.test.ts
+backend/src/shopify.*.test.ts            backend/src/routes/dashboard*.test.ts
+```
+
+**Command** — `npm test` from the repo root runs:
+
+```bash
+node --import tsx --test --test-concurrency=1 --test-force-exit "src/**/*.test.ts"
+```
+
+(`--test-concurrency=1` because several tests touch shared state; `--test-force-exit`
+because the DB client keeps a pool open.)
+
+**What belongs here** — pure functions with no I/O:
+
+- pricing and rate maths
+- dashboard range resolution (including the IST and Monday rules)
+- lockout decisions and policy normalisation
+- RBAC permission merging
+- webhook signature verification and replay-window logic
+- upload magic-byte matching
+- HTML escaping
+- the trust-proxy resolver
+
+**Rule:** if a test needs a database, it does **not** belong here — put it in
+the integration layer below. If a test needs a browser, it belongs in the
+e2e layer.
+
+### Example
+
+```ts
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { decideLockout, LOCKOUT_THRESHOLD } from './lockout'
+
+test('locks the account on the threshold failure', () => {
+  const now = 1_000_000
+  const decision = decideLockout(LOCKOUT_THRESHOLD - 1, now - 1000, now)
+  assert.equal(decision.decision, 'locked')
+})
+```
+
+---
+
+## 3. Integration tests (database-gated)
+
+Some behaviour cannot be proven without a real PostgreSQL: DDL, migrations,
+triggers, transactional stock movements. Those tests live beside the code but
+**skip** when no database URL is provided, and CI runs them explicitly against
+a service container.
+
+```ts
+const url = process.env.UPGRADE_TEST_DATABASE_URL
+const skip = !url ? 'needs a PostgreSQL (UPGRADE_TEST_DATABASE_URL)' : false
+test('…', { skip }, async () => { ... })
+```
+
+Gating variables in use:
+
+| Variable | Used by |
+|---|---|
+| `UPGRADE_TEST_DATABASE_URL` | `backend/src/db/upgrade.test.ts` |
+| `DASHBOARD_TEST_DATABASE_URL` | `backend/src/routes/dashboard*.test.ts` |
+
+### The upgrade-path test
+
+`backend/src/db/upgrade.test.ts` is the most important test in the repository.
+It creates a **schema-only dump of an older install**, boots the current
+bootstrap against it, and asserts that the new tables exist.
+
+Without it, a table that only exists in the fresh-install path boots
+"successfully" on an existing install and then fails at runtime — exactly the
+class of bug that only shows up on a customer's machine after an update.
+
+CI runs it as a separate step with a `postgres:16` service:
+
+```yaml
+- name: Upgrade-path test (needs PostgreSQL)
+  run: node --import tsx --test --test-force-exit "src/db/upgrade.test.ts"
+  working-directory: backend
+  env:
+    UPGRADE_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+```
+
+### Scratch databases, never the real one
+
+When a test needs data, use a **throwaway** database. Never point a test at
+`opal_line` (the installed app) or `opal_line_dev`:
+
+```bash
+# create a scratch cluster / database, run the test, drop it
+createdb opal_line_scratch
+DASHBOARD_TEST_DATABASE_URL=postgres://…/opal_line_scratch npm test
+dropdb opal_line_scratch
+```
+
+The desktop app's bundled cluster is on **47193**; the dev stack's on
+**47194**. Both hold real shop data — do not write to them from a test.
+
+---
+
+## 4. Component tests (frontend)
+
+The frontend has a small component-test suite run through a purpose-built
+launcher:
+
+```bash
+npm test -w frontend
+```
+
+`frontend/scripts/test.mjs` exists because of two `tsx` limitations:
+
+1. The `@/*` alias comes from the tsconfig `tsx` finds at the **process cwd**,
+   so the child process runs with `cwd = frontend/`.
+2. `tsx` only applies `jsx: react-jsx` from an auto-detected non-solution
+   config; the solution-style `tsconfig.json` is ignored, so JSX would compile
+   with the classic runtime. `frontend/scripts/jsx-shim.mjs` puts `React` on
+   the global object to fix that.
+
+npm scripts cannot set an environment variable portably (Windows `cmd` has no
+`VAR=value cmd` syntax), which is why this is a script and not a one-liner.
+
+**What belongs here** — rendering logic and pure helpers:
+
+- chart formatters and value shaping
+- anything that computes a value from props
+
+**What does not belong here** — page-level behaviour that needs a real
+backend. That is the e2e layer.
+
+---
+
+## 5. End-to-end tests (Playwright)
+
+**Location** — `e2e/`, nine spec files, 68 tests:
+
+| Spec | Covers |
+|---|---|
+| `auth-flow.spec.ts` | Sign-in, sign-out, forced password change |
+| `security.spec.ts` | The largest suite — 18 tests over permissions, CSRF, lockout, uploads, backups |
+| `invoice-and-products.spec.ts` | Creating an invoice, the product catalogue |
+| `ui.spec.ts` | Navigation, layout, key screens |
+| `features.spec.ts` | Cross-cutting features |
+| `bulk-fulfilment.spec.ts` | Bulk pipeline moves and packing slips |
+| `sales-order-details.spec.ts` | The sales-order detail screen |
+| `recovery-login.spec.ts` | The recovery-password path |
+| `port-card.spec.ts` | The System → Status port card |
+
+**Configuration** — `playwright.config.ts`:
+
+- `baseURL` from `E2E_BASE_URL`, default `http://127.0.0.1:47195` (the dev
+  stack). Point it at `http://127.0.0.1:47192` to run against the installed
+  app.
+- One worker, `fullyParallel: false` — the backend rate-limits `/auth/login`
+  (30 requests / 15 min / IP), so parallel authentication would fail the run.
+- `storageState: 'e2e/.auth/state.json'`, produced once by the global setup.
+
+**`e2e/global-setup.ts`** logs in **once** and saves the session cookies for
+every test. Tests must never log in individually — that is what exhausts the
+auth budget and makes the suite fail with HTTP 429.
+
+The setup also clears the Postgres-backed `auth:*` rate-limit counters when a
+`DATABASE_URL` (or the desktop app's `.pg-password`) is reachable, because
+those counters survive restarts by design.
+
+```bash
+# against the dev stack
+npm run dev            # in one terminal
+npm run test:e2e       # in another
+
+# against the installed app
+E2E_BASE_URL=http://127.0.0.1:47192 E2E_PASSWORD=<generated-password> npx playwright test
+```
+
+Credentials come from `E2E_USER` / `E2E_PASSWORD` (defaults `admin` /
+`Opal@2026`).
+
+**Writing an e2e test:**
+
+- Prefer a stable selector — `getByRole`, `getByLabel`, `getByText` — over a
+  CSS class. The class names change when the design system changes.
+- Wait for the thing you assert, not for a timeout.
+- Do not assert on the network. Assert on what the user sees.
+- One behaviour per test. A test that asserts five things fails opaquely.
+
+---
+
+## 6. Desktop tests
+
+Windows-only behaviour that cannot run in the browser:
+
+```bash
+npm run test:desktop
+```
+
+Runs `node --test` over `scripts/*.test.mjs`:
+
+| File | Covers |
+|---|---|
+| `quit-behavior.test.mjs` | The backend and PostgreSQL release their ports on quit |
+| `log-rotation.test.mjs` | Log files are trimmed past the threshold |
+| `userdata-consolidation.test.mjs` | Chromium's `userData` is consolidated into the app data dir |
+| `print-flow.test.mjs` | The print/PDF bridge |
+| `update-flow-harness.test.mjs` | The updater state machine |
+| `update-sweep.test.mjs` | Stale update downloads are removed |
+| `dev.test.mjs` | The dev-stack provisioning script |
+
+Plus an Electron smoke run of the print chooser.
+
+These run in the **Windows CI job**, not the Ubuntu one: `taskkill /T`,
+`netstat -ano` and `findstr` do not exist on the Ubuntu runner, so a test
+gated on the runner OS could never catch the regression it exists for.
+
+---
+
+## 7. Manual and audit scripts
+
+Not tests, but part of the verification toolkit:
+
+| Script | What it does |
+|---|---|
+| `scripts/check-palette.mjs` | WCAG AA contrast across light, dark and print — **in CI** |
+| `scripts/check-links.mjs` | Cross-checks frontend API calls against backend endpoints |
+| `scripts/audit-api.mjs` | Reports API surface and permission coverage |
+| `scripts/playwright-audit.mjs` | Playwright-driven UI audit |
+| `scripts/contrast-audit.mjs` | Contrast check outside the CI gate |
+| `scripts/scan-secrets.mjs` | Credential scan over the tree and the git history — **in CI** |
+| `scripts/smoke-test-install.ps1` | Silent install → boot → probe ports 47192/47193 |
+| `scripts/print-chooser-smoke.mjs` | The native print chooser, under Electron |
+
+---
+
+## 8. What to test where — a decision guide
+
+```mermaid
+flowchart TD
+  Q1{"Does it need a browser?"}
+  Q1 -->|Yes| E2E["Playwright spec in e2e/"]
+  Q1 -->|No| Q2{"Does it need PostgreSQL?"}
+  Q2 -->|Yes| INT["Integration test<br/>DB-gated, skip without a URL"]
+  Q2 -->|No| Q3{"Is it frontend rendering logic?"}
+  Q3 -->|Yes| COMP["Component test<br/>frontend/src/**/*.test.tsx"]
+  Q3 -->|No| UNIT["Unit test<br/>backend/src/**/*.test.ts"]
+```
+
+Work down the list and stop at the first "yes".
+
+---
+
+## 9. Adding a test
+
+**Backend unit test** — beside the module:
+
+```ts
+// backend/src/lib/example.test.ts
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { example } from './example'
+
+test('example does the thing', () => {
+  assert.equal(example(1), 2)
+})
+```
+
+**Backend integration test** — beside the module, gated:
+
+```ts
+const url = process.env.SOME_TEST_DATABASE_URL
+const skip = !url ? 'needs a PostgreSQL (SOME_TEST_DATABASE_URL)' : false
+
+test('…', { skip }, async () => {
+  const sql = postgres(url!, { max: 1 })
+  try { /* … */ } finally { await sql.end({ timeout: 5 }) }
+})
+```
+
+**Frontend component test** — beside the component:
+
+```tsx
+// frontend/src/components/charts/example.test.tsx
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { formatValue } from './example'
+
+test('formats a value', () => {
+  assert.equal(formatValue(10), '10')
+})
+```
+
+**E2E test** — in the matching spec:
+
+```ts
+import { test, expect } from '@playwright/test'
+
+test('creates an invoice', async ({ page }) => {
+  await page.goto('/sales/invoices')
+  await page.getByRole('button', { name: 'New Invoice' }).click()
+  // …
+  await expect(page.getByText('Invoice saved')).toBeVisible()
+})
+```
+
+---
+
+## 10. Rules
+
+1. **A bug fix without a test is not finished** — unless the fix is a
+   configuration or copy change, in which case say so in the commit.
+2. **A failing test is a finding, not an obstacle.** Fix the cause. Never
+   weaken an assertion, skip a test or add a type/lint suppression to make the
+   suite green.
+3. **Tests must not depend on execution order.** `--test-concurrency=1` is a
+   safety net, not permission to depend on it.
+4. **No test may write to a real database.** Use a scratch database.
+5. **Deterministic only.** No reliance on the wall clock (inject `nowMs`),
+   on random ordering, or on network access.
+6. **Assert the behaviour, not the implementation.** A test that breaks when
+   you rename a private function is testing the implementation.
+7. **When a test needs a database, it skips — it does not fail.** The CI step
+   that has the database runs it for real.
+
+---
+
+## 11. Debugging a failing test
+
+```bash
+# backend: run one file with full output
+cd backend && node --import tsx --test src/lockout.test.ts
+
+# e2e: run one spec, headed, with the trace
+npx playwright test e2e/security.spec.ts --headed --trace on
+```
+
+Playwright writes a trace on failure (`trace: 'retain-on-failure'`) and a
+screenshot (`screenshot: 'only-on-failure'`) into `test-results/`. The
+Playwright HTML report shows the step that failed.
+
+A very common e2e failure is **HTTP 429 on login**: the auth rate limit (30
+per 15 minutes per IP) was exhausted by repeated local runs. Wait 15 minutes,
+or clear the counters:
+
+```sql
+DELETE FROM rate_limit_hits WHERE key LIKE 'auth:%';
 ```

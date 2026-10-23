@@ -1,6 +1,6 @@
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useEffect, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   ArrowLeft,
   ChevronRight,
@@ -10,9 +10,11 @@ import {
   FileText,
   Mail,
   MessageCircle,
+  Pencil,
   Printer,
   ShieldCheck,
   ShoppingBag,
+  Trash2,
   Undo2,
 } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
@@ -34,6 +36,7 @@ import { formatCurrency, formatDateTime } from '@/lib/format'
 
 export default function InvoiceDetailPage() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const [invoice, setInvoice] = useState<Invoice | null>(null)
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [printConfig, setPrintConfig] = useState<unknown>(null)
@@ -42,6 +45,7 @@ export default function InvoiceDetailPage() {
   const productImageBySku = useRef(new Map<string, string>())
   const [loading, setLoading] = useState(true)
   const [refunding, setRefunding] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [waSending, setWaSending] = useState(false)
   const [emailSending, setEmailSending] = useState(false)
   // Auto UPI QR for printables (from Settings UPI ID); null = hidden.
@@ -207,6 +211,34 @@ export default function InvoiceDetailPage() {
     }
   }
 
+  // Edit reuses the invoices list page's edit dialog via router state.
+  const editInvoice = () => {
+    if (!invoice) return
+    navigate('/sales/invoices', { state: { editInvoiceId: invoice.id } })
+  }
+
+  // Permanent delete: the backend reverses the invoice's stock in the same
+  // transaction and the loyalty points it earned right after — same contract
+  // as the delete on the invoices list page.
+  const deleteInvoice = async () => {
+    if (!invoice) return
+    if (!(await confirmDialog({
+      title: `Delete invoice ${invoice.number}?`,
+      description: 'This permanently removes the invoice. The stock it sold comes back into inventory and the loyalty points it earned are reversed.',
+      confirmLabel: 'Delete',
+      danger: true,
+    }))) return
+    setDeleting(true)
+    try {
+      await dbApi.remove('invoices', invoice.id)
+      toast.success(`Invoice ${invoice.number} deleted — stock and loyalty points reversed`)
+      navigate('/sales/invoices')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Delete failed')
+      setDeleting(false)
+    }
+  }
+
   // Returns: choose quantities per line item → credit note + optional restock
   const openReturnDialog = () => {
     const initial: Record<string, number> = {}
@@ -275,6 +307,8 @@ export default function InvoiceDetailPage() {
             ) : null}
             <Button variant="outline" size="sm" onClick={openReturnDialog} disabled={invoice.status === 'refunded' || invoice.status === 'cancelled'}><Undo2 className="h-3.5 w-3.5" /> Return Items</Button>
             <Button variant="soft-danger" size="sm" onClick={refundInvoice} disabled={refunding || invoice.status === 'refunded'}><Undo2 className="h-3.5 w-3.5" /> Refund</Button>
+            <Button variant="outline" size="sm" onClick={editInvoice}><Pencil className="h-3.5 w-3.5" /> Edit</Button>
+            <Button variant="soft-danger" size="sm" onClick={() => void deleteInvoice()} disabled={deleting}><Trash2 className="h-3.5 w-3.5" /> {deleting ? 'Deleting…' : 'Delete'}</Button>
           </>
         }
       />
