@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ImagePlus, Loader2, Plus, Trash2, Wand2 } from 'lucide-react'
+import { ImagePlus, Loader2, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,7 +11,6 @@ import { dbApi, shopifyApi, uploadsApi } from '@/lib/api'
 import {
   combineOptions,
   findDuplicateProduct,
-  generateBarcode,
   generateSku,
   generateVariantSku,
   type DuplicateMatch,
@@ -41,7 +40,6 @@ interface ProductForm {
   name: string
   description: string
   sku: string
-  barcode: string
   huid: string
   category: string
   collection: string
@@ -105,7 +103,6 @@ const EMPTY_FORM: ProductForm = {
   name: '',
   description: '',
   sku: '',
-  barcode: '',
   huid: '',
   category: DEFAULT_CATEGORY,
   collection: '',
@@ -135,7 +132,6 @@ function fromProduct(p: Product): ProductForm {
     name: p.name ?? '',
     description: p.description ?? '',
     sku: p.sku ?? '',
-    barcode: p.barcode ?? '',
     huid: p.huid ?? '',
     category: p.category ?? DEFAULT_CATEGORY,
     collection: p.collection ?? '',
@@ -175,7 +171,6 @@ function buildBody(form: ProductForm, silverRate: number, sellingPrice: number, 
     name: form.name.trim(),
     description: form.description.trim() || null,
     sku: form.sku.trim(),
-    barcode: form.barcode.trim() || null,
     huid: form.huid.trim() || null,
     category: form.category,
     collection: form.collection.trim() || null,
@@ -209,7 +204,6 @@ interface VariantDraft {
   /** Set only for rows loaded from the database (edit mode). */
   id?: string
   sku: string
-  barcode: string
   price: string
   compareAtPrice: string
   stock: string
@@ -307,14 +301,13 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const [uploading, setUploading] = useState(false)
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [supplierId, setSupplierId] = useState<string>('')
-  // Active duplicate (same SKU or barcode) — resolved inline before saving.
+  // Active duplicate (same SKU) — resolved inline before saving.
   const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null)
   // Categories added inline by this user (persisted per browser).
   const [customCategories, setCustomCategories] = useState<string[]>(loadCustomCategories)
   // Collection names already used by products (loaded once per mount) so the
   // collection picker can offer them alongside the built-in categories.
   const [collectionChoices, setCollectionChoices] = useState<string[]>([])
-  const [barcodeBusy, setBarcodeBusy] = useState(false)
   const collectionsLoaded = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // Latest catalogue for code generation + duplicate checks without turning
@@ -324,15 +317,15 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // only the cross-location rollup, so the per-location truth comes from the
   // ledger when the dialog opens.
   const [levelDraft, setLevelDraft] = useState<StockRow[]>([])
-  // Settings → Product codes (SKU/barcode format) — loaded once per mount and
+  // Settings → Product codes (SKU format) — loaded once per mount and
   // applied when minting codes; null until loaded (the shipped defaults).
   const [codeSettings, setCodeSettings] = useState<ProductCodeSettings | null>(null)
   const codeSettingsRef = useRef<ProductCodeSettings | null>(null)
   // Shopify-style options + the editable variant table derived from them.
   const [options, setOptions] = useState<ProductOption[]>([])
   const [variants, setVariants] = useState<VariantDraft[]>([])
-  /** Codes last auto-minted for an untouched add-mode form (see the effect). */
-  const lastGenerated = useRef<{ sku: string; barcode: string } | null>(null)
+  /** SKU last auto-minted for an untouched add-mode form (see the effect). */
+  const lastGenerated = useRef<{ sku: string } | null>(null)
 
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) => setForm((f) => ({ ...f, [key]: value }))
 
@@ -369,24 +362,22 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         ? {
             ...fromProduct(duplicateOf),
             // Duplicate keeps the descriptive fields but clears the unique
-            // ones: a fresh SKU and barcode are generated like any new
-            // product, and the copy is not pushed to Shopify until asked.
+            // one: a fresh SKU is generated like any new product, and the
+            // copy is not pushed to Shopify until asked.
             name: `${duplicateOf.name} (Copy)`,
             sku: generateSku(productsRef.current, duplicateOf.category ?? EMPTY_FORM.category, codeSettingsRef.current),
-            barcode: generateBarcode(productsRef.current, codeSettingsRef.current),
             pushToShopify: false,
           }
         : {
             ...EMPTY_FORM,
-            // New products get unique identifiers up front (settings format,
-            // e.g. SLV-RNG-00001; scan-ready EAN-13); saving re-checks and the
-            // duplicate panel offers fresh codes if anything still collides.
+            // New products get a category-based SKU up front (settings format,
+            // e.g. OL-RNG-001); saving re-checks and the duplicate panel offers
+            // a fresh code if anything still collides.
             sku: generateSku(productsRef.current, EMPTY_FORM.category, codeSettingsRef.current),
-            barcode: generateBarcode(productsRef.current, codeSettingsRef.current),
           }
     const p = computePrice(initial)
     if (Number.isFinite(p)) initial.sellingPrice = String(Math.round(p * 100) / 100)
-    lastGenerated.current = mode === 'add' ? { sku: initial.sku, barcode: initial.barcode } : null
+    lastGenerated.current = mode === 'add' ? { sku: initial.sku } : null
     // Defer the reset out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setForm(initial)
@@ -398,25 +389,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       setVariants([])
     })
   }, [open, mode, product, duplicateOf])
-
-  // Edit mode: the product already exists, so the server can assign a real,
-  // globally-unique barcode immediately. Add mode pre-fills a locally generated
-  // EAN-13 (see the effect above) and the backend still assigns one on save if
-  // the field is left blank (see the create route).
-  const generateServerBarcode = async () => {
-    if (!product?.id) return
-    setBarcodeBusy(true)
-    try {
-      const res = await dbApi.generateProductBarcode(product.id)
-      set('barcode', res.barcode)
-      setError('')
-      toast.success(res.created ? `Generated barcode ${res.barcode}` : `Barcode: ${res.barcode}`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not generate a barcode')
-    } finally {
-      setBarcodeBusy(false)
-    }
-  }
 
   // Edit mode: pull this product's option definitions + variant rows.
   useEffect(() => {
@@ -432,7 +404,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
             title: v.title ?? '',
             optionValues: Array.isArray(v.optionValues) ? v.optionValues : [],
             sku: v.sku ?? '',
-            barcode: v.barcode ?? '',
             price: v.sellingPrice != null ? String(v.sellingPrice) : '',
             compareAtPrice: v.compareAtPrice != null ? String(v.compareAtPrice) : '',
             stock: String(Math.floor(Number(v.stock) || 0)),
@@ -451,7 +422,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   }, [open, mode, product])
 
   // Code settings arrive after mount; if the form is still exactly what we
-  // auto-minted (the user has not touched SKU/barcode), re-mint under the
+  // auto-minted (the user has not touched the SKU), re-mint under the
   // saved format so an Add dialog opened instantly still honours Settings.
   useEffect(() => {
     if (!open || mode !== 'add' || !codeSettings) return
@@ -459,14 +430,31 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     if (!gen) return
     queueMicrotask(() => {
       setForm((f) => {
-        if (f.sku !== gen.sku || f.barcode !== gen.barcode) return f
+        if (f.sku !== gen.sku) return f
         const sku = generateSku(productsRef.current, f.category, codeSettings)
-        const barcode = generateBarcode(productsRef.current, codeSettings)
-        lastGenerated.current = { sku, barcode }
-        return { ...f, sku, barcode }
+        lastGenerated.current = { sku }
+        return { ...f, sku }
       })
     })
   }, [codeSettings, open, mode])
+
+  // The SKU's middle segment IS the category (OL-RNG-001): re-mint an
+  // untouched add-mode SKU whenever the category changes, so a product never
+  // keeps the generic code minted for the previous category. Edit mode is
+  // guarded — an existing SKU is never regenerated.
+  useEffect(() => {
+    if (!open || mode !== 'add') return
+    const gen = lastGenerated.current
+    if (!gen) return
+    queueMicrotask(() => {
+      setForm((f) => {
+        if (f.sku !== gen.sku) return f
+        const sku = generateSku(productsRef.current, f.category, codeSettingsRef.current)
+        lastGenerated.current = { sku }
+        return { ...f, sku }
+      })
+    })
+  }, [form.category, open, mode])
 
   // Stock levels behind the edit dialog: clear first (deferred — sync setState
   // in an effect is linted), then load this product's per-location balances.
@@ -567,7 +555,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   // The variant table is derived from the option definitions (cartesian
   // product, last option varying fastest — same as Shopify). Rows are keyed
   // by their joined title, so editing one option's values keeps every
-  // unchanged combination's SKU/barcode/price/stock intact.
+  // unchanged combination's SKU/price/stock intact.
   const hasVariants = options.length > 0
 
   const syncVariants = (nextOptions: ProductOption[], prev: VariantDraft[]) => {
@@ -577,10 +565,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       ...productsRef.current.map((p) => (p.sku ?? '').trim().toUpperCase()),
       ...prev.map((v) => v.sku.trim().toUpperCase()),
     ])
-    const takenBarcode = new Set<string>([
-      ...productsRef.current.map((p) => (p.barcode ?? '').trim()).filter(Boolean),
-      ...prev.map((v) => v.barcode.trim()).filter(Boolean),
-    ])
     const parentSku = form.sku.trim() || generateSku(productsRef.current, form.category, codeSettingsRef.current)
     const defaultPrice = form.sellingPrice.trim()
     const next: VariantDraft[] = combos.map((combo) => {
@@ -588,13 +572,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
       if (kept) return { ...kept, optionValues: combo.optionValues }
       const sku = generateVariantSku(parentSku, combo.optionValues, takenSku)
       takenSku.add(sku.toUpperCase())
-      const barcode = generateBarcode([...takenBarcode], codeSettingsRef.current)
-      takenBarcode.add(barcode)
       return {
         title: combo.title,
         optionValues: combo.optionValues,
         sku,
-        barcode,
         price: defaultPrice,
         compareAtPrice: '',
         stock: '0',
@@ -624,7 +605,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     syncVariants(next, variants)
   }
 
-  const setVariantField = (index: number, key: 'sku' | 'barcode' | 'price' | 'compareAtPrice' | 'stock', value: string) => {
+  const setVariantField = (index: number, key: 'sku' | 'price' | 'compareAtPrice' | 'stock', value: string) => {
     setVariants((prev) => prev.map((v, i) => (i === index ? { ...v, [key]: value } : v)))
   }
 
@@ -745,11 +726,10 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         body.stock = 0
       }
       // Duplicate guard: never silently create a second product on the same
-      // identifier — offer to open the existing one or mint fresh codes.
+      // identifier — offer to open the existing one or mint a fresh code.
       const dup = findDuplicateProduct(
         productsRef.current,
         body.sku ?? '',
-        body.barcode ?? '',
         mode === 'edit' ? product?.id : undefined,
       )
       if (dup) {
@@ -794,7 +774,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
             title: v.title,
             optionValues: v.optionValues,
             sku: v.sku.trim(),
-            barcode: v.barcode.trim() || undefined,
             sellingPrice: parseFloat(v.price) || undefined,
             compareAtPrice: parseFloat(v.compareAtPrice) || undefined,
             stock: Math.max(0, Math.floor(parseInt(v.stock, 10) || 0)),
@@ -857,7 +836,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
         const dup = findDuplicateProduct(
           productsRef.current,
           form.sku,
-          form.barcode,
           mode === 'edit' ? product?.id : undefined,
         )
         if (dup) {
@@ -875,7 +853,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
     setForm((f) => ({
       ...f,
       sku: generateSku(productsRef.current, f.category, codeSettingsRef.current),
-      barcode: generateBarcode(productsRef.current, codeSettingsRef.current),
     }))
     setDuplicate(null)
     setError('')
@@ -886,8 +863,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
   const duplicatePanel = duplicate ? (
     <div className="space-y-2 rounded-lg border border-amber-300 bg-amber-50/60 px-3 py-2 text-sm text-amber-900">
       <p>
-        <span className="font-medium">{duplicate.field === 'sku' ? 'SKU' : 'Barcode'}</span>{' '}
-        <span className="font-mono">{duplicate.field === 'sku' ? form.sku : form.barcode}</span> is already used
+        <span className="font-medium">SKU</span>{' '}
+        <span className="font-mono">{form.sku}</span> is already used
         by <span className="font-medium">“{duplicate.product.name}”</span>
         {duplicate.product.sku ? (
           <> (SKU <span className="font-mono">{duplicate.product.sku}</span>)</>
@@ -970,35 +947,8 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                 <p className="text-[11px] text-muted-foreground">Synced to Shopify body_html when the product is pushed.</p>
               </Field>
               <Field label="SKU *">
-                <Input aria-label="Product SKU" value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. SLV-RNG-00001" />
-              </Field>
-              <Field label="Barcode">
-                <div className="flex gap-1.5">
-                  <Input
-                    aria-label="Product barcode"
-                    value={form.barcode}
-                    onChange={(e) => set('barcode', e.target.value)}
-                    placeholder={mode === 'edit' ? 'Code encoded in the label' : 'Auto-generated if left blank'}
-                    className="font-mono"
-                  />
-                  {mode === 'edit' && product?.id ? (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      disabled={barcodeBusy}
-                      onClick={generateServerBarcode}
-                      title="Generate a unique barcode"
-                    >
-                      <Wand2 className={cn('h-4 w-4', barcodeBusy && 'animate-pulse')} />
-                    </Button>
-                  ) : null}
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {mode === 'edit'
-                    ? 'This exact value is encoded in the printed QR/barcode.'
-                    : 'Leave blank to generate a unique barcode automatically on save.'}
-                </p>
+                <Input aria-label="Product SKU" value={form.sku} onChange={(e) => set('sku', e.target.value)} placeholder="e.g. OL-RNG-001" />
+                <p className="text-[11px] text-muted-foreground">Auto-generated per category. The printed label's QR code encodes this SKU.</p>
               </Field>
               <Field label="HUID (Hallmark)">
                 <Input value={form.huid} onChange={(e) => set('huid', e.target.value)} placeholder="e.g. HUIA07" />
@@ -1042,7 +992,7 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
           <div className="space-y-3">
             <SectionTitle
               title="Options & variants"
-              hint="Add options like Size or Colour — every combination becomes its own variant with its own SKU, barcode, price and stock (Shopify-style)."
+              hint="Add options like Size or Colour — every combination becomes its own variant with its own SKU, price and stock (Shopify-style)."
             />
             {options.map((opt, i) => (
               <div key={i} className="space-y-2 rounded-lg border p-3">
@@ -1094,7 +1044,6 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                         <th className="px-3 py-2 font-medium">Price (₹)</th>
                         <th className="px-3 py-2 font-medium">Stock (pcs)</th>
                         <th className="px-3 py-2 font-medium">SKU</th>
-                        <th className="px-3 py-2 font-medium">Barcode</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1131,21 +1080,13 @@ export function ProductDialog({ open, onOpenChange, mode, product, onSaved, prod
                               className="h-8 w-44 font-mono text-xs"
                             />
                           </td>
-                          <td className="px-3 py-1.5">
-                            <Input
-                              value={v.barcode}
-                              onChange={(e) => setVariantField(i, 'barcode', e.target.value)}
-                              aria-label={`Barcode for ${v.title}`}
-                              className="h-8 w-36 font-mono text-xs"
-                            />
-                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  SKUs and barcodes are minted per variant using the Product codes settings. Price follows the
+                  SKUs are minted per variant using the Product codes settings. Price follows the
                   product's auto-calculated price until you override it per row. The product's stock is the sum of
                   its variants.
                 </p>

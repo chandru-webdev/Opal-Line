@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Loader2, Plus, Trash2 } from 'lucide-react'
 import { toast } from '@/components/ui/confirm'
 import { Button } from '@/components/ui/button'
@@ -6,8 +6,11 @@ import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { AppDialog } from '@/components/ui/app-dialog'
 import { DialogFooter } from '@/components/ui/dialog'
+import { CustomerPicker, type CustomerHit } from '@/components/customer-picker'
 import { dbApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
+import { useSilverRate } from '@/lib/silver-rate-context'
+import { lineAmount, invoiceTotalsPreview } from '@/lib/invoicePricing'
 import type { Invoice, Product } from '@/types'
 
 /** Sentinel: the line's product is typed by hand, not picked from the catalogue. */
@@ -18,24 +21,21 @@ interface DraftLine {
   product: string
   sku: string
   qty: string
-  /** Line TOTAL weight in grams — the backend prices on weight × silver rate. */
-  weight: string
-  silverRate: string
+  /** Per-PIECE net weight in grams (from the catalogue). */
+  netWeight: string
+  /** Making charge PER GRAM (from the catalogue, editable). */
   makingCharge: string
 }
 
 function emptyLine(): DraftLine {
-  return { product: '', sku: '', qty: '1', weight: '', silverRate: '', makingCharge: '' }
+  return { product: '', sku: '', qty: '1', netWeight: '', makingCharge: '' }
 }
 
-const round2 = (n: number) => Math.round(n * 100) / 100
-
-/** Line amount exactly as the backend computes it: weight × silver rate + making charge. */
-function lineAmount(line: DraftLine): number {
-  const weight = Number(line.weight) || 0
-  const rate = Number(line.silverRate) || 0
-  const making = Number(line.makingCharge) || 0
-  return round2(weight * rate + making)
+/** Total billable weight for a line = per-piece net weight × qty. */
+function lineTotalWeight(line: DraftLine): number {
+  const net = Number(line.netWeight) || 0
+  const qty = Math.max(1, Math.floor(Number(line.qty) || 1))
+  return net * qty
 }
 
 interface DraftForm {
@@ -71,13 +71,13 @@ export interface ManualInvoiceDialogProps {
 /**
  * Bill a walk-in or phone sale straight to an invoice — no sales order needed.
  *
- * The server mints the invoice number (settings-driven prefix + stamp) and
- * recomputes every total from the lines, so this form mirrors that maths rather
- * than owning it. Each line carrying a SKU deducts stock; lines typed by hand
- * leave stock alone.
+ * The silver rate comes from Silver Rate Management (authoritative, read-only)
+ * and every total is computed with the SAME per-gram maths the server uses
+ * (`lib/invoicePricing` mirrors `normalizeInvoiceItems`), so the preview equals
+ * what gets stored. Each line carrying a SKU deducts stock; hand-typed lines
+ * leave stock alone. The server mints the invoice number.
  *
- * Shared by the Sales Invoices "New Invoice" button and the Sales Orders page,
- * so both entry points bill identically.
+ * Shared by the Sales Invoices "New Invoice" button and the Sales Orders page.
  */
 export function ManualInvoiceDialog({
   open,
@@ -86,11 +86,21 @@ export function ManualInvoiceDialog({
   initialCustomerPhone,
   onCreated,
 }: ManualInvoiceDialogProps) {
+  const { rate: silverRate } = useSilverRate()
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [products, setProducts] = useState<Product[]>([])
+  const [productQuery, setProductQuery] = useState('')
+  const [productHits, setProductHits] = useState<Product[]>([])
+  // Tracks the query whose results are in productHits, so the spinner is
+  // derived (not set synchronously in the search effect).
+  const [resolvedProductQuery, setResolvedProductQuery] = useState('')
   const [form, setForm] = useState<DraftForm>(emptyForm)
   const [lines, setLines] = useState<DraftLine[]>([emptyLine()])
+  const productToken = useRef(0)
+
+  // Managed rate per gram; 0 until the provider loads (blocks submit below).
+  const ratePerGram = silverRate?.rate ?? 0
 
   // Reset the form each time the dialog opens so a stale draft (or the previous
   // order's pre-fill) never leaks into the next invoice.
@@ -99,16 +109,68 @@ export function ManualInvoiceDialog({
     // Defer the setState out of the effect body (react/set-state-in-effect).
     queueMicrotask(() => {
       setError('')
+      setProductQuery('')
+      setProductHits([])
       setForm({ ...emptyForm(), customer: initialCustomer ?? '', customerPhone: initialCustomerPhone ?? '' })
       setLines([emptyLine()])
     })
   }, [open, initialCustomer, initialCustomerPhone])
 
-  // Catalogue is only needed for the SKU picker — load it on first open.
+  // Seed the product search with the full catalogue on first open so the
+  // dropdown is browsable before the user types.
   useEffect(() => {
     if (!open || products.length > 0) return
-    dbApi.getProducts().then(setProducts).catch(() => setProducts([]))
+    dbApi.getProducts().then((all) => {
+      setProducts(all)
+      setProductHits(all.slice(0, 20))
+    }).catch(() => setProducts([]))
   }, [open, products.length])
+
+  // Debounced product search (name / SKU) with a stale-guard.
+  useEffect(() => {
+    if (!open) return
+    const q = productQuery.trim()
+    if (q === '') {
+      // Defer the reset out of the effect body (react/set-state-in-effect).
+      queueMicrotask(() => {
+        setProductHits(products.slice(0, 20))
+        setResolvedProductQuery('')
+      })
+      return
+    }
+    const lower = q.toLowerCase()
+    // Filter the already-loaded catalogue first; only reach out when the local
+    // list doesn't obviously contain the term (keeps keystrokes snappy).
+    const local = products.filter(
+      (p) =>
+        p.name.toLowerCase().includes(lower) ||
+        p.sku.toLowerCase().includes(lower),
+    )
+    if (local.length > 0) {
+      // Defer out of the effect body (react/set-state-in-effect).
+      queueMicrotask(() => {
+        setProductHits(local.slice(0, 20))
+        setResolvedProductQuery(q)
+      })
+      return
+    }
+    const t = window.setTimeout(() => {
+      const token = ++productToken.current
+      dbApi.searchProducts(q).then((rows) => {
+        if (token !== productToken.current) return // stale — a newer query won
+        setProductHits(rows)
+        setResolvedProductQuery(q)
+      }).catch(() => {
+        if (token !== productToken.current) return
+        setProductHits([])
+        setResolvedProductQuery(q)
+      })
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [productQuery, open, products])
+
+  // Derived: a non-empty query is "searching" until its results have landed.
+  const searchingProducts = productQuery.trim() !== '' && productQuery.trim() !== resolvedProductQuery
 
   const setLine = (index: number, patch: Partial<DraftLine>) =>
     setLines((prev) => prev.map((l, i) => (i === index ? { ...l, ...patch } : l)))
@@ -116,34 +178,50 @@ export function ManualInvoiceDialog({
   const removeLine = (index: number) =>
     setLines((prev) => (prev.length === 1 ? [emptyLine()] : prev.filter((_, i) => i !== index)))
 
-  const knownSkus = useMemo(
-    () => Array.from(new Set(products.map((p) => p.sku).filter(Boolean))).sort(),
-    [products],
-  )
-
-  // Picking a catalogue SKU prefills the item name and per-piece net weight.
+  // Picking a catalogue product prefills name, per-piece net weight and the
+  // per-gram making charge — the two numbers that drive the price.
   const pickProduct = (index: number, sku: string) => {
     if (sku === CUSTOM_SKU) {
       setLine(index, { sku: '', product: '' })
       return
     }
-    const p = products.find((x) => x.sku === sku)
-    setLine(index, { sku, product: p?.name ?? '', weight: p?.netWeight != null ? String(p.netWeight) : '' })
+    const p = products.find((x) => x.sku === sku) ?? productHits.find((x) => x.sku === sku)
+    if (!p) return
+    setLine(index, {
+      sku: p.sku,
+      product: p.name,
+      netWeight: p.netWeight != null ? String(p.netWeight) : '',
+      makingCharge: p.makingCharge != null ? String(p.makingCharge) : '',
+    })
+  }
+
+  // Customer autofetch: picking an existing customer fills their contact block.
+  const onCustomerPicked = (hit: CustomerHit) => {
+    setForm((f) => ({
+      ...f,
+      customer: hit.name ?? '',
+      customerPhone: hit.phone ?? '',
+      customerEmail: hit.email ?? '',
+    }))
   }
 
   const totals = useMemo(() => {
-    const subtotal = round2(lines.reduce((a, l) => a + lineAmount(l), 0))
-    const gstRate = Number(form.gst) || 0
-    const gstAmount = round2(subtotal * gstRate / 100)
-    const discount = Number(form.discount) || 0
-    return { subtotal, gstRate, gstAmount, discount, grandTotal: round2(subtotal + gstAmount - discount) }
-  }, [lines, form.gst, form.discount])
+    const priced = lines
+      .filter((l) => l.sku.trim() !== '' || l.product.trim() !== '')
+      .map((l) => ({
+        weight: lineTotalWeight(l),
+        silverRatePerGram: ratePerGram,
+        makingChargePerGram: Number(l.makingCharge) || 0,
+      }))
+    return invoiceTotalsPreview(priced, Number(form.gst) || 0, Number(form.discount) || 0)
+  }, [lines, form.gst, form.discount, ratePerGram])
 
   const submit = async () => {
     const customer = form.customer.trim()
     if (!customer) { setError('Customer name is required'); return }
     const usable = lines.filter((l) => l.sku.trim() !== '' || l.product.trim() !== '')
     if (usable.length === 0) { setError('Add at least one line item'); return }
+    if (!(ratePerGram > 0)) { setError('Silver rate is not loaded yet — set it in Silver Rate Management.'); return }
     setSaving(true)
     setError('')
     try {
@@ -158,15 +236,22 @@ export function ManualInvoiceDialog({
         gst: Number(form.gst) || 0,
         discount: Number(form.discount) || 0,
         date: new Date().toISOString(),
-        items: usable.map((l) => ({
-          product: l.product.trim(),
-          sku: l.sku.trim(),
-          qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
-          weight: Number(l.weight) || 0,
-          silverRate: Number(l.silverRate) || 0,
-          makingCharge: Number(l.makingCharge) || 0,
-          amount: lineAmount(l),
-        })),
+        items: usable.map((l) => {
+          const weight = lineTotalWeight(l)
+          const making = Number(l.makingCharge) || 0
+          return {
+            product: l.product.trim(),
+            sku: l.sku.trim(),
+            qty: Math.max(1, Math.floor(Number(l.qty) || 1)),
+            weight,
+            // The server overwrites the rate with the managed value; sending it
+            // keeps the payload self-describing for logs and for the preview
+            // matching the stored row.
+            silverRate: ratePerGram,
+            makingCharge: making,
+            amount: lineAmount({ weight, silverRatePerGram: ratePerGram, makingChargePerGram: making }),
+          }
+        }),
       }
       // No number in the payload — the server mints the next invoice number.
       const created = await dbApi.create<Invoice>('invoices', payload)
@@ -203,7 +288,11 @@ export function ManualInvoiceDialog({
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Customer *">
-            <Input value={form.customer} onChange={(e) => setForm((f) => ({ ...f, customer: e.target.value }))} placeholder="Walk-in customer" />
+            <CustomerPicker
+              onPick={onCustomerPicked}
+              onNameChange={(name) => setForm((f) => ({ ...f, customer: name }))}
+              disabled={saving}
+            />
           </Field>
           <Field label="Phone">
             <Input value={form.customerPhone} onChange={(e) => setForm((f) => ({ ...f, customerPhone: e.target.value }))} />
@@ -223,64 +312,93 @@ export function ManualInvoiceDialog({
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border/60 text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="min-w-[190px] px-3 py-2 font-medium">Product / SKU</th>
+                  <th className="min-w-[210px] px-3 py-2 font-medium">Product / SKU</th>
                   <th className="w-20 px-2 py-2 text-right font-medium">Qty</th>
-                  <th className="w-28 px-2 py-2 text-right font-medium">Weight (gm)</th>
+                  <th className="w-28 px-2 py-2 text-right font-medium">Net wt / pc</th>
                   <th className="w-28 px-2 py-2 text-right font-medium">Rate / gm</th>
-                  <th className="w-28 px-2 py-2 text-right font-medium">Making (₹)</th>
+                  <th className="w-28 px-2 py-2 text-right font-medium">Making / gm</th>
                   <th className="w-24 px-2 py-2 text-right font-medium">Amount</th>
                   <th className="w-10 px-2 py-2"></th>
                 </tr>
               </thead>
               <tbody>
-                {lines.map((line, index) => (
-                  <tr key={index} className="border-b border-border/40 last:border-0">
-                    <td className="px-2 py-1.5">
-                      <Select
-                        options={[
-                          { value: '', label: 'Select a product…' },
-                          ...knownSkus.map((sku) => {
-                            const p = products.find((x) => x.sku === sku)
-                            return { value: sku, label: `${p?.name ?? sku} (${sku})` }
-                          }),
-                          { value: CUSTOM_SKU, label: 'Other / type manually' },
-                        ]}
-                        value={line.sku === '' ? (line.product ? CUSTOM_SKU : '') : line.sku}
-                        onValueChange={(v) => pickProduct(index, v)}
-                        className="h-8 text-xs"
-                      />
-                      <Input
-                        value={line.product}
-                        onChange={(e) => setLine(index, { product: e.target.value })}
-                        placeholder="Item name / SKU"
-                        className="mt-1 h-7 text-xs"
-                      />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} className="h-8 text-right text-xs" />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input type="number" min="0" step="0.001" value={line.weight} onChange={(e) => setLine(index, { weight: e.target.value })} className="h-8 text-right text-xs" />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input type="number" min="0" step="0.01" value={line.silverRate} onChange={(e) => setLine(index, { silverRate: e.target.value })} className="h-8 text-right text-xs" />
-                    </td>
-                    <td className="px-2 py-1.5">
-                      <Input type="number" min="0" step="0.01" value={line.makingCharge} onChange={(e) => setLine(index, { makingCharge: e.target.value })} className="h-8 text-right text-xs" />
-                    </td>
-                    <td className="px-2 py-1.5 text-right tabular-nums text-xs">
-                      {formatCurrency(lineAmount(line))}
-                    </td>
-                    <td className="px-2 py-1.5 text-right">
-                      <Button variant="ghost" size="icon-sm" onClick={() => removeLine(index)} aria-label="Remove line">
-                        <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
+                {lines.map((line, index) => {
+                  const weight = lineTotalWeight(line)
+                  const preview = lineAmount({
+                    weight,
+                    silverRatePerGram: ratePerGram,
+                    makingChargePerGram: Number(line.makingCharge) || 0,
+                  })
+                  return (
+                    <tr key={index} className="border-b border-border/40 last:border-0">
+                      <td className="px-2 py-1.5">
+                        <Input
+                          value={line.sku ? `${line.product} (${line.sku})` : line.product}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            // Typing clears the picked SKU (back to a hand line)
+                            // and re-runs the product search.
+                            setLine(index, { product: v, sku: '', netWeight: '', makingCharge: '' })
+                            setProductQuery(v)
+                          }}
+                          placeholder="Search name or SKU…"
+                          className="h-8 text-xs"
+                          aria-label="Search products"
+                        />
+                        {productQuery.trim() !== '' && (productHits.length > 0 || searchingProducts) ? (
+                          <div className="mt-1 max-h-32 overflow-auto rounded-md border border-border/60 bg-card p-1">
+                            {searchingProducts && productHits.length === 0 ? (
+                              <p className="flex items-center gap-2 px-2 py-1 text-[11px] text-muted-foreground">
+                                <Loader2 className="h-3 w-3 animate-spin" /> Searching…
+                              </p>
+                            ) : (
+                              productHits.map((p) => (
+                                <button
+                                  key={p.sku}
+                                  type="button"
+                                  onClick={() => {
+                                    pickProduct(index, p.sku)
+                                    setProductQuery('')
+                                  }}
+                                  className="flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-[11px] transition-colors hover:bg-muted"
+                                >
+                                  <span className="truncate">{p.name}</span>
+                                  <span className="shrink-0 text-muted-foreground">{p.sku}</span>
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        ) : null}
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input type="number" min="1" value={line.qty} onChange={(e) => setLine(index, { qty: e.target.value })} className="h-8 text-right text-xs" />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input type="number" min="0" step="0.001" value={line.netWeight} onChange={(e) => setLine(index, { netWeight: e.target.value })} className="h-8 text-right text-xs" />
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-xs text-muted-foreground">
+                        {ratePerGram > 0 ? ratePerGram.toFixed(2) : '—'}
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <Input type="number" min="0" step="0.01" value={line.makingCharge} onChange={(e) => setLine(index, { makingCharge: e.target.value })} className="h-8 text-right text-xs" />
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-xs" title={weight > 0 ? `${weight.toFixed(3)} gm × (₹${ratePerGram.toFixed(2)} + making)` : undefined}>
+                        {formatCurrency(preview)}
+                      </td>
+                      <td className="px-2 py-1.5 text-right">
+                        <Button variant="ghost" size="icon-sm" onClick={() => removeLine(index)} aria-label="Remove line">
+                          <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                        </Button>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
+          <p className="mt-1.5 text-[11px] text-muted-foreground">
+            Rate / gm is locked to the managed silver rate. Amount = total weight (net wt × qty) × (rate + making per gm).
+          </p>
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">

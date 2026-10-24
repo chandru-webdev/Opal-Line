@@ -10,10 +10,10 @@ import { and, desc, eq, inArray, ne, or, sql } from 'drizzle-orm'
 import { config, isConfigured, loadSecretsFromDb } from './config'
 import { applyPriceSync, applySilverRate, createShopifyDraftOrder, ensureSynced, getLatestSilverRate, getSilverRateProgress, importShopifyOrders, purgeProducts, pushInventoryToShopify, pushProductPriceToShopify, pushProductsToShopify, runSync, store, syncProductsToDb, testShopifyConnection, updateShopifyOrder } from './shopify'
 import { round2 } from './routes/db'
-import { invoiceTotals } from './invoiceTotals'
+import { buildPricedOrder, type ValidatedOrderItem } from './orderPricing'
 import type { SyncResource } from './types'
 import { db, schema, checkDbHealth, getDbStats } from './db/client'
-import { applyStockMovement, resolveMovementLocation, levelAt } from './stock'
+import { deductOrderLineStock, resolveMovementLocation, restoreOrderLineStock } from './stock'
 import { authRouter } from './routes/auth'
 import { dbRouter } from './routes/db'
 import { dashboardRouter } from './routes/dashboard'
@@ -315,15 +315,10 @@ app.post('/api/v1/webhooks/shopify', verifyShopifyWebhook, rejectReplayedWebhook
               const sku = String(li.sku ?? '').trim()
               const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
               if (!sku || qty <= 0) continue
-              const [p] = await tx
-                .select({ id: schema.products.id })
-                .from(schema.products)
-                .where(eq(schema.products.sku, sku))
-                .limit(1)
-                .for('update')
-              if (!p) continue
-              await applyStockMovement({ sku, qty, type: 'sale_return_in', refType: 'sales_order', locationId, tx })
-              itemsRestored += qty
+              // Resolves variant SKUs through product_variants; an unresolvable
+              // SKU (product deleted since the sale) restores nothing, as before.
+              const restored = await restoreOrderLineStock({ tx, locationId, sku, qty })
+              if (restored) itemsRestored += qty
             }
             await tx
               .update(schema.salesOrders)
@@ -1791,57 +1786,15 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
     })
     .from(schema.products)
     .where(inArray(schema.products.sku, items.map((li: { sku?: string; productSku?: string }) => String(li.productSku ?? li.sku ?? '')).filter(Boolean)))
-  const productMap = Object.fromEntries(
-    productData.map((p) => [
-      p.sku,
-      {
-        netWeight: Number(p.netWeight ?? 0),
-        makingCharge: Number(p.makingCharge ?? 0),
-      },
-    ])
-  )
-
-  // Calculate prices using the authoritative silver rate
-  // Canonical formula (same as invoices):
-  //   silverValue = sum(netWeight * qty * silverRate)
-  //   makingCharge = sum(netWeight * qty * makingChargePerGram)
-  //   subtotal = round2(silverValue + makingCharge)
-  //   gstAmount = round2(subtotal * gstRate / 100)
-  //   grandTotal = round2(subtotal + gstAmount - discount)
-  // This ensures order totals match invoice totals exactly.
-  const gstRate = 3 // standard GST rate for silver jewellery
-  const itemsWithCalculatedPrice = items.map((li: { sku?: string; productSku?: string; quantity: number; price: number }) => {
-    const sku = String(li.productSku ?? li.sku ?? '').trim()
-    const product = productMap[sku] ?? { netWeight: 0, makingCharge: 0 }
-    const netWeight = product.netWeight
-    const makingChargePerGram = product.makingCharge
-    const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-    const weight = netWeight > 0 ? round2(netWeight * qty) : 0
-    const itemSilverRate = weight > 0 ? silverRate : 0
-    const itemMakingCharge = weight > 0 ? makingChargePerGram : 0
-    const silverValue = weight > 0 ? round2(weight * itemSilverRate) : 0
-    const makingValue = weight > 0 ? round2(weight * itemMakingCharge) : 0
-    const amount = round2(silverValue + makingValue) // line subtotal (ex-GST)
-    return {
-      ...li,
-      price: amount, // Store line subtotal (ex-GST) for consistency with invoice line items
-      netWeight,
-      makingCharge: makingChargePerGram,
-      weight,
-      silverRate: itemSilverRate,
-      silverValue,
-      makingValue,
-      amount,
-    }
-  })
-
-  // Aggregate totals using canonical invoice calculation
-  const totalSilverValue = round2(itemsWithCalculatedPrice.reduce((sum: number, li: { silverValue: number }) => sum + (Number.isFinite(li.silverValue) ? li.silverValue : 0), 0))
-  const totalMakingCharge = round2(itemsWithCalculatedPrice.reduce((sum: number, li: { makingValue: number }) => sum + (Number.isFinite(li.makingValue) ? li.makingValue : 0), 0))
-  const subtotal = round2(totalSilverValue + totalMakingCharge)
-  const { gstAmount: _gstAmount, grandTotal } = invoiceTotals(subtotal, gstRate, 0)
-  const value = grandTotal
-  const itemCount = itemsWithCalculatedPrice.reduce((sum: number, li: { quantity: number }) => sum + li.quantity, 0)
+  // Price the lines with the authoritative silver rate — canonical invoice
+  // formula, extracted so the per-unit convention is unit-testable. Each
+  // line's stored price is PER-UNIT and GST-inclusive: every consumer (the
+  // edit dialog's subtotal, the print doc, the update handler's value)
+  // multiplies it by quantity exactly once.
+  const priced = buildPricedOrder(items as ValidatedOrderItem[], productData, silverRate)
+  const itemsWithCalculatedPrice = priced.lines
+  const value = priced.grandTotal
+  const itemCount = priced.itemCount
 
   const now = new Date()
   const internalId = `MO-${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}-${now.getTime().toString().slice(-6)}`
@@ -1884,20 +1837,16 @@ app.post('/api/v1/shopify/orders/create', requirePermission('shopify', 'create')
       // where such orders already went before locations existed.
       const locationId = await resolveMovementLocation(reqLocation as string | undefined, tx as never)
       for (const li of itemsWithCalculatedPrice) {
-        const sku = String(li.sku ?? '').trim()
-        const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-        if (!sku || qty <= 0) continue
-        const [row] = await tx.select({ id: schema.products.id }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-        if (!row) continue
-        // Availability is checked AT this location, not against the global
-        // rollup: a chain can hold 12 units while the shop actually taking the
-        // sale has 2, and the sale would drive that shop negative.
-        const current = await levelAt(tx as never, row.id, locationId)
-        if (current - qty < 0) {
-          throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${current}, requested ${qty}`)
-        }
-        await applyStockMovement({ sku, qty: -qty, type: 'sale_out', refType: 'sales_order', locationId, tx })
-        affectedProductIds.push(row.id)
+        // Resolves variant SKUs through product_variants (their stock is a
+        // counter the parent rollup mirrors), checks availability AT this
+        // location and rejects unknown SKUs instead of silently skipping them.
+        const deducted = await deductOrderLineStock({
+          tx,
+          locationId,
+          sku: String(li.sku ?? ''),
+          qty: Number(li.quantity ?? 0),
+        })
+        if (deducted) affectedProductIds.push(deducted.productId)
       }
 
       const [row] = await tx
@@ -2065,23 +2014,24 @@ app.patch('/api/v1/shopify/orders/:id', requirePermission('shopify', 'edit'), va
         // which is exactly where its movements already went.
         const locationId = await resolveMovementLocation(existing.locationId as string | null, tx as never)
         for (const oi of oldItems) {
-          const sku = String(oi?.sku ?? '').trim()
-          const qty = Math.max(0, Math.floor(Number(oi?.quantity ?? 0)))
-          if (!sku || qty <= 0) continue
-          await applyStockMovement({ sku, qty, type: 'sale_return_in', refType: 'sales_order', locationId, tx })
+          // Restore resolves variant SKUs too, so editing a variant line gives
+          // its stock back instead of deducting the new line on top of an
+          // unrestored old one (the silent double deduction).
+          await restoreOrderLineStock({
+            tx,
+            locationId,
+            sku: String(oi?.sku ?? ''),
+            qty: Number(oi?.quantity ?? 0),
+          })
         }
         for (const li of mappedLineItems) {
-          const sku = String(li.sku ?? '').trim()
-          const qty = Math.max(0, Math.floor(Number(li.quantity ?? 0)))
-          if (!sku || qty <= 0) continue
-          const [row] = await tx.select({ id: schema.products.id }).from(schema.products).where(eq(schema.products.sku, sku)).limit(1).for('update')
-          if (!row) continue
-          const current = await levelAt(tx as never, row.id, locationId)
-          if (current - qty < 0) {
-            throw new Error(`Insufficient stock for SKU ${sku} at this location: available ${current}, requested ${qty}`)
-          }
-          await applyStockMovement({ sku, qty: -qty, type: 'sale_out', refType: 'sales_order', locationId, tx })
-          affectedProductIds.push(row.id)
+          const deducted = await deductOrderLineStock({
+            tx,
+            locationId,
+            sku: String(li.sku ?? ''),
+            qty: Number(li.quantity ?? 0),
+          })
+          if (deducted) affectedProductIds.push(deducted.productId)
         }
         const [u] = await tx
           .update(schema.salesOrders)

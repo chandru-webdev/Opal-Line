@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Bell, Barcode, Building2, Check, KeyRound, Landmark, Loader2, LogOut, Monitor, Moon, Package, Save, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sun, Tag, Users } from 'lucide-react'
+import { Bell, Building2, Check, KeyRound, Landmark, Loader2, LogOut, Monitor, Moon, Package, Save, Settings as SettingsIcon, ShieldCheck, SlidersHorizontal, Sun, Tag, Users } from 'lucide-react'
 import { PageHeader } from '@/components/ui/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -14,7 +14,7 @@ import { dbApi, authApi } from '@/lib/api'
 import { confirmDialog, toast } from '@/components/ui/confirm'
 import { useAuth } from '@/auth/auth-context'
 import { setTheme, type Theme } from '@/lib/theme'
-import { generateBarcode, renderSku } from '@/lib/productCodes'
+import { renderSku } from '@/lib/productCodes'
 import type { AppSettings } from '@/types'
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -42,11 +42,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   loginLockoutEnabled: false,
   lockoutThreshold: 5,
   lockoutDurationMinutes: 15,
-  skuPrefix: 'SLV',
+  skuPrefix: 'OL',
   skuSuffix: '',
   skuFormat: '{PREFIX}-{CATEGORY}-{SEQ}',
-  skuSeqLength: 5,
-  barcodePrefix: '890',
+  skuSeqLength: 3,
   updatedAt: null,
 }
 
@@ -326,10 +325,10 @@ function SettingsContent() {
                   <Field label="Prefix">
                     <Input
                       aria-label="SKU prefix"
-                      value={settings.skuPrefix ?? 'SLV'}
+                      value={settings.skuPrefix ?? 'OL'}
                       onChange={(e) => set('skuPrefix', e.target.value.toUpperCase())}
                       maxLength={12}
-                      placeholder="SLV"
+                      placeholder="OL"
                     />
                   </Field>
                   <Field label="Suffix">
@@ -347,10 +346,10 @@ function SettingsContent() {
                         identical SKUs forever, so it is rejected. */}
                     <CreatableSelect
                       options={[
-                        { value: '{PREFIX}-{CATEGORY}-{SEQ}', label: 'PREFIX-CATEGORY-SEQ — SLV-RNG-00001' },
-                        { value: '{PREFIX}-{SEQ}{SUFFIX}', label: 'PREFIX-SEQ SUFFIX — SLV-00001IN' },
-                        { value: '{CATEGORY}-{SEQ}', label: 'CATEGORY-SEQ — RNG-00001' },
-                        { value: '{PREFIX}{CATEGORY}{SEQ}', label: 'PREFIXCATEGORYSEQ — SLVRNG00001' },
+                        { value: '{PREFIX}-{CATEGORY}-{SEQ}', label: 'PREFIX-CATEGORY-SEQ — OL-RNG-001' },
+                        { value: '{PREFIX}-{SEQ}{SUFFIX}', label: 'PREFIX-SEQ SUFFIX — OL-001' },
+                        { value: '{CATEGORY}-{SEQ}', label: 'CATEGORY-SEQ — RNG-001' },
+                        { value: '{PREFIX}{CATEGORY}{SEQ}', label: 'PREFIXCATEGORYSEQ — OLRNG001' },
                       ]}
                       value={settings.skuFormat ?? '{PREFIX}-{CATEGORY}-{SEQ}'}
                       onValueChange={(v) => {
@@ -368,50 +367,19 @@ function SettingsContent() {
                   <Field label="Sequence digits">
                     <Input
                       type="number"
-                      min={1}
+                      min={3}
                       max={8}
                       aria-label="SKU sequence digits"
-                      value={settings.skuSeqLength ?? 5}
-                      onChange={(e) => set('skuSeqLength', Number(e.target.value))}
+                      value={settings.skuSeqLength ?? 3}
+                      onChange={(e) => set('skuSeqLength', Math.max(3, Number(e.target.value) || 3))}
                     />
+                    <p className="text-[11px] text-muted-foreground">Minimum 3 — sequences are three digits, e.g. 001.</p>
                   </Field>
                 </div>
                 <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5">
                   <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Preview</p>
                   <p className="mt-0.5 font-mono text-sm text-foreground" data-testid="sku-preview">
                     {renderSku(settings, 'Rings', 42)}
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="space-y-4 p-5">
-                <div className="flex items-center gap-2">
-                  <Barcode className="h-4 w-4 text-muted-foreground" />
-                  <h3 className="font-semibold text-foreground">Barcode auto-generation</h3>
-                </div>
-                <p className="text-[13px] text-muted-foreground">
-                  New products and variants get a scan-ready EAN-13 barcode: your prefix, then a running number padded
-                  to 12 digits, then a check digit calculated so real barcode readers accept it.
-                </p>
-                <Field label="Barcode prefix (digits)">
-                  <Input
-                    aria-label="Barcode prefix"
-                    value={settings.barcodePrefix ?? '890'}
-                    onChange={(e) => set('barcodePrefix', e.target.value.replace(/\D/g, '').slice(0, 11))}
-                    inputMode="numeric"
-                    placeholder="890"
-                  />
-                  <p className="text-[11px] text-muted-foreground">
-                    890 is the Indian GS1 prefix. At most 11 digits — 12 are reserved for the running number and check
-                    digit.
-                  </p>
-                </Field>
-                <div className="rounded-lg border border-border bg-muted/30 px-3 py-2.5">
-                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Preview</p>
-                  <p className="mt-0.5 font-mono text-sm text-foreground" data-testid="barcode-preview">
-                    {generateBarcode([], settings)}
                   </p>
                 </div>
               </CardContent>

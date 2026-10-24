@@ -358,6 +358,11 @@ export const dbApi = {
   reorderSuggestions: () =>
     request<{ data: ReorderSuggestion[]; generatedAt: string }>('/db/inventory/reorder-suggestions'),
   getCustomers: () => list<Customer>('/db/customers', PAGED),
+  /** Bounded type-ahead behind the invoice comboboxes (debounced by caller). */
+  searchCustomers: (q: string): Promise<Customer[]> =>
+    request<{ data: Customer[] }>(`/db/customers/search?q=${encodeURIComponent(q)}`).then((r) => r.data),
+  searchProducts: (q: string): Promise<Product[]> =>
+    request<{ data: Product[] }>(`/db/products/search?q=${encodeURIComponent(q)}`).then((r) => r.data),
   getSuppliers: () => list<Supplier>('/db/suppliers', PAGED),
   getInvoices: async (): Promise<Invoice[]> => {
     const invoices = await list<SalesInvoiceRow>('/db/invoices', PAGED)
@@ -382,31 +387,13 @@ export const dbApi = {
   resendNotification: (id: string) =>
     request<{ ok: boolean }>('/db/notifications/resend', { method: 'POST', body: JSON.stringify({ id }) }),
   getProductDuplicates: () => request<{ data: Array<{ sku: string; cnt: number; products: string }> }>('/db/products/duplicates'),
-  /** Counts of products missing a barcode and any duplicated barcodes. */
-  getBarcodeSummary: () =>
-    request<{ total: number; missing: number; duplicates: Array<{ barcode: string; count: number }> }>('/db/products/barcodes/summary'),
-  /** Assign a specific barcode, or generate one when `barcode` is omitted. */
-  generateProductBarcode: (id: string, barcode?: string) =>
-    request<{ ok: boolean; id: string; barcode: string; created: boolean }>(`/db/products/${id}/barcode`, {
-      method: 'POST',
-      body: JSON.stringify(barcode ? { barcode } : {}),
-    }),
-  /** Backfill barcodes for products that have none. `dryRun` previews only. */
-  generateMissingBarcodes: (opts?: { ids?: string[]; dryRun?: boolean }) =>
-    request<{
-      ok: boolean
-      dryRun: boolean
-      candidates: number
-      assigned: number
-      samples: Array<{ id: string; name: string; sku: string }>
-      assignments: Array<{ id: string; name: string; sku: string; barcode: string }>
-    }>('/db/products/barcodes/generate', {
-      method: 'POST',
-      body: JSON.stringify(opts ?? {}),
-    }),
   getCustomerDuplicateEmails: () => request<{ data: Array<{ email: string; cnt: number; customers: string }> }>('/db/customers/duplicate-emails'),
+  /**
+   * Resolve a scanned label by its EXACT SKU — printed labels carry a QR code
+   * encoding only the SKU (e.g. `OL-RNG-001`), never a barcode.
+   */
   scanProduct: (code: string) =>
-    request<{ data: { id: string; name: string; sku: string; barcode: string | null; stock: number | null; category: string | null } }>(
+    request<{ data: { id: string; name: string; sku: string; stock: number | null; category: string | null } }>(
       `/db/products/scan?code=${encodeURIComponent(code)}`,
     ),
   /**
@@ -453,7 +440,7 @@ export const dbApi = {
       options: ProductOption[]
       variants: Array<
         Pick<ProductVariant, 'title' | 'optionValues' | 'sku' | 'stock'> &
-          Partial<Pick<ProductVariant, 'id' | 'barcode' | 'sellingPrice' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
+          Partial<Pick<ProductVariant, 'id' | 'sellingPrice' | 'compareAtPrice' | 'costPrice' | 'grossWeight' | 'reorderLevel' | 'status'>>
       >
     },
   ) =>

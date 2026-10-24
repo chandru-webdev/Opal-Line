@@ -4,7 +4,6 @@ import {
   Printer,
   Tag,
   QrCode,
-  Barcode,
   Search,
   FileDown,
   Eye,
@@ -75,7 +74,6 @@ function toLabelProduct(p: Product): LabelProduct {
     id: p.id,
     name: p.name,
     sku: p.sku,
-    barcode: p.barcode || undefined,
     price: p.sellingPrice ?? 0,
     weight: p.netWeight || undefined,
     category: p.category,
@@ -251,7 +249,7 @@ export default function BarcodeLabelsPage() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     return products.filter((p) => {
-      if (q && !(`${p.name} ${p.sku} ${p.barcode ?? ''}`.toLowerCase().includes(q))) return false
+      if (q && !(`${p.name} ${p.sku}`.toLowerCase().includes(q))) return false
       if (category !== 'all' && p.category !== category) return false
       if (stockFilter === 'in' && !(p.stock > 0)) return false
       if (stockFilter === 'out' && p.stock !== 0) return false
@@ -401,7 +399,7 @@ export default function BarcodeLabelsPage() {
             <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-primary-50 text-primary-700 dark:bg-primary-50/60 dark:text-primary-300 ring-1 ring-primary-100">
               <Tag className="h-5 w-5" />
             </div>
-            <span>Barcode Labels</span>
+            <span>QR Labels</span>
           </span>
         }
         subtitle="Design, preview and print labels at true physical size from your product catalog"
@@ -530,16 +528,10 @@ export default function BarcodeLabelsPage() {
               <ToggleRow label="HUID" checked={cfg.showHuid} onCheckedChange={(v) => patch({ showHuid: v })} />
               <ToggleRow label="Category" checked={cfg.showCategory} onCheckedChange={(v) => patch({ showCategory: v })} />
               <ToggleRow
-                label="QR code"
+                label="QR code (encodes the SKU)"
                 icon={<QrCode className="h-3.5 w-3.5 text-muted-foreground" />}
                 checked={cfg.showQr}
                 onCheckedChange={(v) => patch({ showQr: v })}
-              />
-              <ToggleRow
-                label="Barcode (Code 128)"
-                icon={<Barcode className="h-3.5 w-3.5 text-muted-foreground" />}
-                checked={cfg.showBarcode}
-                onCheckedChange={(v) => patch({ showBarcode: v })}
               />
               <ToggleRow label="Border" checked={cfg.showBorder} onCheckedChange={(v) => patch({ showBorder: v })} />
               <ToggleRow label="Company name" checked={cfg.showCompany} onCheckedChange={(v) => patch({ showCompany: v })} />
@@ -674,7 +666,7 @@ export default function BarcodeLabelsPage() {
                 <Input
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search name, SKU or barcodeΓÇª"
+                  placeholder="Search name or SKU..."
                   className="h-8 pl-8 text-sm"
                 />
               </div>
@@ -732,7 +724,6 @@ export default function BarcodeLabelsPage() {
                           <p className="truncate text-sm font-medium text-foreground">{product.name}</p>
                           <p className="truncate text-xs text-muted-foreground">
                             {product.sku}
-                            {product.barcode && <span className="ml-2 font-mono">Γöé {product.barcode}</span>}
                             {product.sku && duplicates.has(product.sku.toLowerCase()) && (
                               <Badge variant="warning" className="ml-1.5 text-[10px]">
                                 Dup SKU

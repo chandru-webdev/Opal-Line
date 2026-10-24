@@ -1,12 +1,12 @@
 import { expect, test, type APIRequestContext } from '@playwright/test'
 
 /**
- * Settings → Product codes (SKU/barcode auto-generation) and the Shopify-style
+ * Settings → Product codes (SKU auto-generation) and the Shopify-style
  * variant builder in the product dialog:
  *
  *  1. The settings tab previews codes from the configured format and saves.
  *  2. A new product is minted under those rules, gets option-driven variants
- *     with per-variant SKU/barcode/price/stock, rolls the variant stock into
+ *     with per-variant SKU/price/stock, rolls the variant stock into
  *     the parent, and round-trips through edit + the detail page.
  *
  * The product created here is deleted at the end and the settings row is
@@ -42,14 +42,13 @@ test.afterEach(async ({ request }) => {
       skuSuffix: savedCodeSettings.skuSuffix ?? null,
       skuFormat: savedCodeSettings.skuFormat ?? null,
       skuSeqLength: savedCodeSettings.skuSeqLength ?? null,
-      barcodePrefix: savedCodeSettings.barcodePrefix ?? null,
     },
   })
   savedCodeSettings = null
 })
 
 test.describe('product codes & variants', () => {
-  test('settings drive SKU/barcode generation and variants save like Shopify', async ({ page }) => {
+  test('settings drive SKU generation and variants save like Shopify', async ({ page }) => {
     test.setTimeout(150_000)
 
     // ── 1. Settings → Product codes ──────────────────────────────────────
@@ -61,13 +60,6 @@ test.describe('product codes & variants', () => {
     await page.getByLabel('SKU prefix').fill('TST')
     await page.getByLabel('SKU sequence digits').fill('4')
     await expect(page.getByTestId('sku-preview')).toHaveText('TST-RNG-0042')
-    await expect(page.getByTestId('barcode-preview')).toHaveText(/^890\d{10}$/)
-
-    // A custom barcode prefix is honoured by the preview (EAN-13: prefix +
-    // digits to 12 + check digit).
-    await page.getByLabel('Barcode prefix').fill('777')
-    await expect(page.getByTestId('barcode-preview')).toHaveText(/^777\d{10}$/)
-    await page.getByLabel('Barcode prefix').fill('890')
 
     await page.getByRole('button', { name: /Save Changes/i }).click()
     await expect(page.getByText('Saved', { exact: true })).toBeVisible({ timeout: 10000 })
@@ -81,9 +73,8 @@ test.describe('product codes & variants', () => {
     await expect(dialog).toBeVisible({ timeout: 10000 })
     await dialog.getByLabel('Product title').fill(PRODUCT_NAME)
 
-    // SKU minted under the saved format (category "Silver jewels" → GEN).
-    await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-GEN-\d{4}$/)
-    await expect(dialog.getByLabel('Product barcode')).toHaveValue(/^\d{13}$/)
+    // SKU minted under the saved format (category "Silver jewels" → SIL).
+    await expect(dialog.getByLabel('Product SKU')).toHaveValue(/^TST-SIL-\d{4}$/)
 
     // Pricing inputs drive the auto price: (105 + 20) × 10g × 1.03 = 1287.5,
     // which locks the selling price field.
@@ -105,7 +96,6 @@ test.describe('product codes & variants', () => {
     const parentSku = await dialog.getByLabel('Product SKU').inputValue()
     await expect(dialog.getByLabel(`SKU for S`)).toHaveValue(new RegExp(`^${parentSku}-S$`))
     await expect(dialog.getByLabel(`SKU for M`)).toHaveValue(new RegExp(`^${parentSku}-M$`))
-    await expect(dialog.getByLabel(`Barcode for S`)).toHaveValue(/^\d{13}$/)
 
     // Variants inherit the auto-calculated price...
     await expect(dialog.getByLabel('Price for S')).toHaveValue('1287.5')

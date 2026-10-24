@@ -1,29 +1,30 @@
 /**
  * Auto-generation of product identifiers, driven by the configurable rules in
- * Settings → Product codes (skuPrefix / skuSuffix / skuFormat / skuSeqLength
- * and barcodePrefix).
+ * Settings → Product codes (skuPrefix / skuSuffix / skuFormat / skuSeqLength).
  *
  * This module is the server-side source of truth and is mirrored in
  * frontend/src/lib/productCodes.ts so the product dialog can generate codes
  * offline — the same convention as normalizeLockoutPolicy in src/lockout.ts.
  *
  * SKUs are built from a format template with tokens:
- *   {PREFIX}   settings prefix (default SLV)
- *   {CATEGORY} 3-letter category code (RNG, BRC …)
- *   {SEQ}      zero-padded running sequence
+ *   {PREFIX}   settings prefix (default OL — the Opal Line house prefix)
+ *   {CATEGORY} 3-letter category code (RNG, CHN …)
+ *   {SEQ}      zero-padded running sequence (minimum three digits, e.g. 001)
  *   {SUFFIX}   settings suffix (default empty)
- * The default template `{PREFIX}-{CATEGORY}-{SEQ}` reproduces the house style
- * SLV-RNG-00001, so installs that never open the settings keep their codes.
+ * The default template `{PREFIX}-{CATEGORY}-{SEQ}` renders the house style
+ * OL-RNG-001: category-based, sequences independent per category code.
  *
- * Barcodes are EAN-13: prefix digits (default 890 — Indian GS1) + a sequence
- * padded to 12 digits + a valid check digit, so they scan on real readers.
+ * Barcodes are no longer generated anywhere in the product workflow: product
+ * labels encode the SKU in a QR code (see src/barcodeLabels.ts).
  */
 
-export const DEFAULT_SKU_PREFIX = 'SLV'
+export const DEFAULT_SKU_PREFIX = 'OL'
 export const DEFAULT_SKU_SUFFIX = ''
 export const DEFAULT_SKU_FORMAT = '{PREFIX}-{CATEGORY}-{SEQ}'
-export const DEFAULT_SKU_SEQ_LENGTH = 5
-export const DEFAULT_BARCODE_PREFIX = '890'
+/** Sequences are three-digit minimum: OL-RNG-001, never OL-RNG-1. */
+export const DEFAULT_SKU_SEQ_LENGTH = 3
+/** The shortest sequence the settings may configure (spec: three digits). */
+export const MIN_SKU_SEQ_LENGTH = 3
 
 /** The settings row slice that drives code generation. */
 export interface ProductCodeSettings {
@@ -31,31 +32,38 @@ export interface ProductCodeSettings {
   skuSuffix?: string | null
   skuFormat?: string | null
   skuSeqLength?: number | null
-  barcodePrefix?: string | null
 }
 
 /** Category → the middle segment of auto-generated SKUs. */
 const CATEGORY_PREFIX: Record<string, string> = {
-  // 'Silver jewels' is the whole-catalogue default → generic code (SLV-GEN-00001)
-  'Silver jewels': 'GEN',
+  // The business default category still gets a real category code — generic
+  // `OL-GEN-*` codes are reserved for rows with no usable category at all, so
+  // no new generic SKUs are minted.
+  'Silver jewels': 'SIL',
   Rings: 'RNG',
   Chains: 'CHN',
+  Earrings: 'EAR',
+  Necklaces: 'NCK',
   Bracelets: 'BRC',
-  Earrings: 'ERN',
+  Bangles: 'BNG',
   Pendants: 'PND',
-  Mangalsutra: 'MNG',
   Anklets: 'ANK',
+  Mangalsutra: 'MNG',
   'Toe Rings': 'TRG',
   'Nose Pins': 'NSP',
-  Necklaces: 'NCK',
-  Bangles: 'BGL',
   Accessories: 'CUF',
 }
 
+/** Lower-cased lookup so "rings" and "Rings" mint the same category code. */
+const CATEGORY_PREFIX_BY_KEY = new Map(
+  Object.entries(CATEGORY_PREFIX).map(([k, v]) => [k.toLowerCase(), v]),
+)
+
 export function categoryCode(category: string): string {
-  const known = CATEGORY_PREFIX[category.trim()]
+  const key = String(category ?? '').trim().toLowerCase()
+  const known = CATEGORY_PREFIX_BY_KEY.get(key)
   if (known) return known
-  const letters = category.replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase()
+  const letters = String(category ?? '').replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase()
   return letters || 'GEN'
 }
 
@@ -65,7 +73,6 @@ export interface NormalizedCodeSettings {
   skuSuffix: string
   skuFormat: string
   skuSeqLength: number
-  barcodePrefix: string
 }
 
 /** Sanitised view of the settings with the shipped defaults filled in. */
@@ -75,14 +82,16 @@ export function normalizedCodeSettings(settings?: ProductCodeSettings | null): N
   const suffix = String(raw.skuSuffix ?? '').trim().toUpperCase() || DEFAULT_SKU_SUFFIX
   const format = String(raw.skuFormat ?? '').trim() || DEFAULT_SKU_FORMAT
   const seqRaw = Number(raw.skuSeqLength)
-  const seqLength = Number.isFinite(seqRaw) ? Math.min(8, Math.max(1, Math.round(seqRaw))) : DEFAULT_SKU_SEQ_LENGTH
-  const barcodePrefix = String(raw.barcodePrefix ?? '').replace(/\D/g, '').slice(0, 11) || DEFAULT_BARCODE_PREFIX
-  return { skuPrefix: prefix, skuSuffix: suffix, skuFormat: format.includes('{SEQ}') ? format : DEFAULT_SKU_FORMAT, skuSeqLength: seqLength, barcodePrefix }
+  const seqLength = Number.isFinite(seqRaw)
+    ? Math.min(8, Math.max(MIN_SKU_SEQ_LENGTH, Math.round(seqRaw)))
+    : DEFAULT_SKU_SEQ_LENGTH
+  return { skuPrefix: prefix, skuSuffix: suffix, skuFormat: format.includes('{SEQ}') ? format : DEFAULT_SKU_FORMAT, skuSeqLength: seqLength }
 }
 
 /**
  * Render one SKU from a format template. `seq` is the raw running number;
  * the caller passes already-computed candidates and handles collisions.
+ * The sequence is always padded to at least MIN_SKU_SEQ_LENGTH digits.
  */
 export function renderSku(
   settings: ProductCodeSettings | null | undefined,
@@ -93,28 +102,39 @@ export function renderSku(
   return cfg.skuFormat
     .replaceAll('{PREFIX}', cfg.skuPrefix)
     .replaceAll('{CATEGORY}', categoryCode(category))
-    .replaceAll('{SEQ}', String(Math.max(0, Math.floor(seq))).padStart(cfg.skuSeqLength, '0'))
+    .replaceAll('{SEQ}', String(Math.max(0, Math.floor(seq))).padStart(Math.max(MIN_SKU_SEQ_LENGTH, cfg.skuSeqLength), '0'))
     .replaceAll('{SUFFIX}', cfg.skuSuffix)
     .trim()
 }
 
 /**
- * Highest {SEQ} already used among SKUs matching the configured format.
- * A legacy house-style scan (PREFIX-CODE-NNNNN) runs too, so upgrading an
- * install that used the old fixed format continues its sequence instead of
- * restarting from 1.
+ * Highest {SEQ} already used among SKUs matching the configured format for
+ * ONE category code. When `category` is omitted every category counts (used
+ * by callers that only need a global view).
+ *
+ * A legacy house-style scan (ANYPREFIX-CODE-NNNNN with the same category
+ * code) runs too, so upgrading an install that used SLV-RNG-00021 continues
+ * that category's sequence instead of restarting from 1 — while a different
+ * category (SLV-GEN-00099) never inflates this category's sequence: each
+ * category sequence is independent.
  */
-export function maxSequence(skus: Array<string | null | undefined>, settings?: ProductCodeSettings | null): number {
+export function maxSequence(
+  skus: Array<string | null | undefined>,
+  settings?: ProductCodeSettings | null,
+  category?: string,
+): number {
   const cfg = normalizedCodeSettings(settings)
   const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const code = category !== undefined ? escape(categoryCode(category)) : '[A-Z]{2,5}'
   const pattern = cfg.skuFormat
     .split('{PREFIX}').join(escape(cfg.skuPrefix))
-    .split('{CATEGORY}').join('[A-Z]{2,5}')
+    .split('{CATEGORY}').join(code)
     .split('{SUFFIX}').join(cfg.skuSuffix ? escape(cfg.skuSuffix) : '')
     .split('{SEQ}').join('(\\d{1,8})')
   const configured = new RegExp(`^${pattern}$`, 'i')
   // Legacy fixed house style, kept so sequences survive the move to templates.
-  const house = /^[A-Z]{2,5}-[A-Z]{2,5}-(\d{1,5})$/i
+  // When a category is given, only that category's legacy codes count.
+  const house = new RegExp(`^[A-Z]{2,5}-${code}-(\\d{1,5})$`, 'i')
   let max = 0
   for (const sku of skus) {
     const value = (sku ?? '').trim().toUpperCase()
@@ -128,9 +148,10 @@ export function maxSequence(skus: Array<string | null | undefined>, settings?: P
 }
 
 /**
- * Next free SKU for the category under the configured format: global max
- * sequence + 1, bumped while the candidate is already taken, so the result
- * never collides with `existing`.
+ * Next free SKU for the category under the configured format: that category's
+ * max sequence + 1, bumped while the candidate is already taken, so the
+ * result never collides with `existing`. Sequences run independently per
+ * category: Rng codes never consume the Chain sequence and vice versa.
  */
 export function generateSku(
   existing: Array<string | null | undefined>,
@@ -139,63 +160,13 @@ export function generateSku(
 ): string {
   const cfg = normalizedCodeSettings(settings)
   const taken = new Set(existing.map((s) => (s ?? '').trim().toUpperCase()).filter(Boolean))
-  let n = maxSequence([...taken], cfg) + 1
+  let n = maxSequence([...taken], cfg, category) + 1
   let sku = renderSku(cfg, category, n)
   while (taken.has(sku.toUpperCase())) {
     n += 1
     sku = renderSku(cfg, category, n)
   }
   return sku
-}
-
-/** EAN-13 check digit over the first 12 digits (weights 1/3 alternating). */
-export function ean13CheckDigit(twelve: string): number {
-  let sum = 0
-  for (let i = 0; i < 12; i++) {
-    const d = Number(twelve[i])
-    sum += i % 2 === 0 ? d : d * 3
-  }
-  return (10 - (sum % 10)) % 10
-}
-
-/**
- * Next free EAN-13 barcode under the configured prefix: prefix digits + a
- * running sequence padded to 12 digits + a valid check digit, bumped while
- * taken. Falls back to random digits if the sequence ever outgrows the
- * 12-digit body (prefix longer than the digits allow).
- */
-export function generateBarcode(
-  existing: Array<string | null | undefined>,
-  settings?: ProductCodeSettings | null,
-): string {
-  const cfg = normalizedCodeSettings(settings)
-  const taken = new Set(
-    existing
-      .map((b) => (b ?? '').trim())
-      .filter(Boolean),
-  )
-  const bodyLen = 12
-  const pad = bodyLen - cfg.barcodePrefix.length
-  let max = 0
-  for (const code of taken) {
-    if (!code.startsWith(cfg.barcodePrefix)) continue
-    const digits = code.slice(0, bodyLen)
-    if (!/^\d{12}$/.test(digits)) continue
-    const n = Number.parseInt(digits.slice(cfg.barcodePrefix.length), 10)
-    if (Number.isFinite(n) && n > max) max = n
-  }
-  if (max + 1 < 10 ** pad) {
-    const body = cfg.barcodePrefix + String(max + 1).padStart(pad, '0')
-    return body + ean13CheckDigit(body)
-  }
-  // Sequence exhausted the body — random digits, retried against `taken`.
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const body = cfg.barcodePrefix + String(Math.floor(Math.random() * 10 ** pad)).padStart(pad, '0')
-    const code = body + ean13CheckDigit(body)
-    if (!taken.has(code)) return code
-  }
-  const body = cfg.barcodePrefix + String(Date.now() % 10 ** pad).padStart(pad, '0')
-  return body + ean13CheckDigit(body)
 }
 
 /**

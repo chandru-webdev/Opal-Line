@@ -153,7 +153,7 @@ export default function ProductDetailPage() {
             <Badge variant="success" className="align-middle">{product.status}</Badge>
           </span>
         }
-        subtitle={`${product.sku} · ${product.barcode ?? '—'} · ${product.category} · ${product.collection ?? '—'}`}
+        subtitle={`${product.sku} · ${product.category} · ${product.collection ?? '—'}`}
         actions={
           <>
             <Button variant="outline" size="sm" onClick={syncShopify} disabled={syncing}>
@@ -226,7 +226,7 @@ export default function ProductDetailPage() {
             <CardTitle className="text-sm">Variants</CardTitle>
             <CardDescription>
               {product.options?.map((o) => o.name).join(' × ') ?? 'Options'} — {variants.length} combination
-              {variants.length === 1 ? '' : 's'}, each with its own SKU, barcode, price and stock.
+              {variants.length === 1 ? '' : 's'}, each with its own SKU, price and stock.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -236,7 +236,6 @@ export default function ProductDetailPage() {
                   <TableRow>
                     <TableHead>Variant</TableHead>
                     <TableHead>SKU</TableHead>
-                    <TableHead>Barcode</TableHead>
                     <TableHead className="text-right">Price</TableHead>
                     <TableHead className="text-right">Stock</TableHead>
                   </TableRow>
@@ -246,7 +245,6 @@ export default function ProductDetailPage() {
                     <TableRow key={v.id}>
                       <TableCell className="font-medium text-foreground">{v.title}</TableCell>
                       <TableCell className="font-mono text-xs">{v.sku}</TableCell>
-                      <TableCell className="font-mono text-xs">{v.barcode ?? '—'}</TableCell>
                       <TableCell className="text-right tabular-nums">{formatCurrency(v.sellingPrice ?? 0)}</TableCell>
                       <TableCell className="text-right tabular-nums">{Math.floor(Number(v.stock) || 0)} pcs</TableCell>
                     </TableRow>
@@ -285,7 +283,6 @@ export default function ProductDetailPage() {
               <CardContent className="grid grid-cols-2 gap-x-6 gap-y-4 md:grid-cols-3">
                 <InfoRow label="Product Name" value={product.name} />
                 <InfoRow label="SKU" value={product.sku} />
-                <InfoRow label="Barcode" value={product.barcode} mono />
                 <InfoRow label="HUID / Batch" value={product.huid ?? '—'} mono />
                 <InfoRow label="Category" value={product.category} />
                 <InfoRow label="Collection" value={product.collection} />

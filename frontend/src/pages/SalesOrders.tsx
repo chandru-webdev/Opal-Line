@@ -21,7 +21,7 @@ import {
   Plus,
   Printer,
   RefreshCw,
-  ScanBarcode,
+  ScanQrCode,
   Search,
   UserRoundCheck,
   ShoppingBag,
@@ -63,7 +63,7 @@ import { exportTable } from '@/lib/export'
 import type { Customer, Customer360, InventoryLocation, OrderEvent, OrderFullDetail, OrderStatus, Product, ProductVariant, SalesOrder } from '@/types'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatDateTime, todayIST } from '@/lib/format'
-import { calculateJewelleryPrice } from '@/lib/utils'
+import { perUnitLinePrice, orderLinesTotal } from '@/lib/orderPricing'
 
 const statusMeta: Record<OrderStatus, { label: string; variant: 'success' | 'warning' | 'danger' | 'muted' | 'info' | 'purple' }> = {
   imported: { label: 'Imported', variant: 'info' },
@@ -268,7 +268,7 @@ export default function SalesOrdersPage() {
   // live per-line check below handles the common case; this holds the
   // server's authoritative per-location answer until the line is edited.
   const [serverStockErrors, setServerStockErrors] = useState<Record<string, string>>({})
-  const [barcodeInput, setBarcodeInput] = useState('')
+  const [scanInput, setScanInput] = useState('')
   const [scanFeedback, setScanFeedback] = useState<{ ok: boolean; text: string } | null>(null)
   const [silverRate, setSilverRate] = useState<number | null>(null)
   const [silverRateLoading, setSilverRateLoading] = useState(false)
@@ -871,10 +871,7 @@ export default function SalesOrdersPage() {
       })
   }
 
-  const totalValue = useMemo(
-    () => lineItems.reduce((acc, li) => acc + (Number.isFinite(li.price) ? li.price : 0) * (Number.isFinite(li.qty) ? li.qty : 0), 0),
-    [lineItems],
-  )
+  const totalValue = useMemo(() => orderLinesTotal(lineItems), [lineItems])
 
   // Live stock check per line: mirrors the order endpoints' per-line
   // validation against the catalog already loaded, so an over-quantity shows
@@ -927,14 +924,12 @@ export default function SalesOrdersPage() {
     // immediately billable; the Variant dropdown swaps it. Flat products keep
     // the plain product values, exactly as before.
     const first = productVariants(p)[0] ?? null
-    const price = silverRate && p.netWeight > 0
-      ? calculateJewelleryPrice({
-          silverRatePerGram: silverRate,
-          netWeightPerUnit: p.netWeight,
-          makingChargePerGram: p.makingCharge,
-          quantity: 1,
-        }).finalPrice
-      : first?.sellingPrice ?? p.sellingPrice
+    const price = perUnitLinePrice({
+      silverRate,
+      netWeight: p.netWeight,
+      makingCharge: p.makingCharge,
+      fallback: first?.sellingPrice ?? p.sellingPrice,
+    })
     setLineItems((prev) =>
       prev.map((li) => {
         if (li.key !== key) return li
@@ -968,14 +963,12 @@ export default function SalesOrdersPage() {
               variantId: v.id,
               title: `${p.name} — ${variantLabel(v)}`,
               sku: v.sku,
-              price: silverRate && p.netWeight > 0
-                ? calculateJewelleryPrice({
-                    silverRatePerGram: silverRate,
-                    netWeightPerUnit: p.netWeight,
-                    makingChargePerGram: p.makingCharge,
-                    quantity: row.qty,
-                  }).finalPrice
-                : v.sellingPrice ?? row.price,
+              price: perUnitLinePrice({
+                silverRate,
+                netWeight: p.netWeight,
+                makingCharge: p.makingCharge,
+                fallback: v.sellingPrice ?? row.price,
+              }) ?? row.price,
               netWeight: p.netWeight,
               makingCharge: p.makingCharge,
             }
@@ -984,14 +977,14 @@ export default function SalesOrdersPage() {
     )
   }
 
-  // Barcode scan: scanners type the code and press Enter instantly, so a plain
-  // input with an Enter handler works. Matches product barcode, then variant
-  // barcode, then product SKU, then variant SKU. Re-scanning the same
-  // product/variant pair bumps its quantity.
-  const handleBarcodeScan = () => {
-    const code = barcodeInput.trim()
+  // Label scan: scanners type the code and press Enter instantly, so a plain
+  // input with an Enter handler works. A label's QR encodes ONLY the SKU, so
+  // resolution is product SKU → variant SKU (exact, case-insensitive).
+  // Re-scanning the same product/variant pair bumps its quantity.
+  const handleScan = () => {
+    const code = scanInput.trim()
     const match = matchProductByCode(products, code)
-    setBarcodeInput('')
+    setScanInput('')
     if (!match) {
       setScanFeedback({ ok: false, text: `No product matches "${code}"` })
       return
@@ -999,30 +992,27 @@ export default function SalesOrdersPage() {
     const { product: p, variant } = match
     const title = variant ? `${p.name} — ${variantLabel(variant)}` : p.name
     const sku = variant ? variant.sku : p.sku
-    const price = silverRate && p.netWeight > 0
-      ? calculateJewelleryPrice({
-          silverRatePerGram: silverRate,
-          netWeightPerUnit: p.netWeight,
-          makingChargePerGram: p.makingCharge,
-          quantity: 1,
-        }).finalPrice
-      : variant?.sellingPrice ?? p.sellingPrice ?? 0
+    const price = perUnitLinePrice({
+      silverRate,
+      netWeight: p.netWeight,
+      makingCharge: p.makingCharge,
+      fallback: variant?.sellingPrice ?? p.sellingPrice,
+    }) ?? 0
     setScanFeedback({ ok: true, text: `Added ${title}${price ? ` · ₹${price.toFixed(2)}` : ''}` })
     setLineItems((prev) => {
       const existing = prev.find((li) => li.productId === p.id && (li.variantId ?? null) === (variant?.id ?? null))
       if (existing) {
-        // When incrementing qty, recalculate price for the new quantity
+        // Re-scanning bumps the quantity; the price stays PER-UNIT (refreshed
+        // at the current rate). Pricing the full new quantity here and then
+        // multiplying by quantity in the subtotal double-counted every rescan.
         const newQty = existing.qty + 1
-        let newPrice = existing.price
-        if (silverRate && existing.netWeight && existing.netWeight > 0) {
-          const result = calculateJewelleryPrice({
-            silverRatePerGram: silverRate,
-            netWeightPerUnit: existing.netWeight,
-            makingChargePerGram: existing.makingCharge ?? 0,
-            quantity: newQty,
-          })
-          newPrice = result.finalPrice
-        }
+        const newPrice =
+          perUnitLinePrice({
+            silverRate,
+            netWeight: existing.netWeight,
+            makingCharge: existing.makingCharge,
+            fallback: existing.price,
+          }) ?? existing.price
         return prev.map((li) => (li.key === existing.key ? { ...li, qty: newQty, price: newPrice } : li))
       }
       const fresh = {
@@ -1049,13 +1039,16 @@ export default function SalesOrdersPage() {
       prev.map((li) => {
         if (li.key !== key) return li
         const updated = { ...li, ...patch }
-        if (patch.qty !== undefined && patch.qty !== li.qty && silverRate && li.netWeight && li.netWeight > 0) {
-          updated.price = calculateJewelleryPrice({
-            silverRatePerGram: silverRate,
-            netWeightPerUnit: li.netWeight,
-            makingChargePerGram: li.makingCharge ?? 0,
-            quantity: patch.qty,
-          }).finalPrice
+        if (patch.qty !== undefined && patch.qty !== li.qty) {
+          // Refresh the PER-UNIT price at the current rate; the quantity must
+          // never scale it — the subtotal multiplies price × qty once.
+          const unit = perUnitLinePrice({
+            silverRate,
+            netWeight: li.netWeight,
+            makingCharge: li.makingCharge,
+            fallback: null,
+          })
+          if (unit !== undefined) updated.price = unit
         }
         return updated
       }),
@@ -1471,17 +1464,17 @@ export default function SalesOrdersPage() {
                   <div className="mb-3">
                     <div className="flex items-end gap-2">
                       <div className="min-w-0 flex-1">
-                        <Label className="text-xs text-muted-foreground">Scan barcode / SKU</Label>
+                        <Label className="text-xs text-muted-foreground">Scan QR / SKU</Label>
                         <Input
-                          value={barcodeInput}
-                          onChange={(e) => setBarcodeInput(e.target.value)}
-                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleBarcodeScan() } }}
-                          placeholder="Scan or type a barcode / SKU, then press Enter"
+                          value={scanInput}
+                          onChange={(e) => setScanInput(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleScan() } }}
+                          placeholder="Scan a label QR or type a SKU, then press Enter"
                           autoComplete="off"
                         />
                       </div>
-                      <Button variant="outline" size="sm" className="h-9" onClick={handleBarcodeScan} disabled={!barcodeInput.trim()}>
-                        <ScanBarcode className="h-3.5 w-3.5" /> Add
+                      <Button variant="outline" size="sm" className="h-9" onClick={handleScan} disabled={!scanInput.trim()}>
+                        <ScanQrCode className="h-3.5 w-3.5" /> Add
                       </Button>
                     </div>
                     {scanFeedback ? (
