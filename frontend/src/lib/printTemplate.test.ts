@@ -128,8 +128,13 @@ test('printed totals match the details response and add up to the grand total', 
     rupees(grand),
   )
 
-  // The items-table footer total agrees with the details screen's subtotal.
-  assert.ok(html.includes(`₹${invoice.subtotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`))
+  // The items-table footer total shows the SAME grand total the totals box
+  // shows — not the GST-exclusive subtotal sum of the Amount column.
+  const foot = html.slice(html.indexOf('<tfoot>'), html.indexOf('</tfoot>'))
+  const fmtIn = (n: number) => `₹${n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  assert.ok(foot.includes(fmtIn(invoice.grandTotal)), 'table footer must show the calculated grand total')
+  assert.ok(!foot.includes(fmtIn(invoice.subtotal)), 'table footer must not repeat the GST-exclusive subtotal')
+  assert.ok(html.includes(fmtIn(invoice.subtotal)), 'the subtotal must still print as the Taxable Value row')
 })
 
 test('per-line GST prints as money, never as a percentage, and unknown snapshots dash', () => {
@@ -163,7 +168,7 @@ test('every item row keeps its own product, quantity, HSN and amount', () => {
   assert.ok(ringRow.includes('SKU-RING-A'), 'ring row must carry the ring SKU')
   assert.ok(ringRow.includes('7113'), 'ring row must carry the ring HSN code')
   assert.ok(ringRow.includes('>2<'), 'ring row must carry the ring quantity')
-  assert.ok(ringRow.includes('₹1,000.00'), 'ring row must carry the ring amount')
+  assert.ok(ringRow.includes('₹1,030.00'), 'ring Amount cell = taxable ₹1,000.00 + its GST ₹30.00')
   assert.ok(ringRow.includes('₹30.00'), 'ring row must carry the ring GST')
   assert.ok(!ringRow.includes('1,350.50'), 'the pendant amount must not leak into the ring row')
 
@@ -171,7 +176,7 @@ test('every item row keeps its own product, quantity, HSN and amount', () => {
   assert.ok(pendantRow.includes('SKU-PENDANT-B'), 'pendant row must carry the pendant SKU')
   assert.ok(pendantRow.includes('7114'), 'pendant row must carry the pendant HSN code')
   assert.ok(pendantRow.includes('>1<'), 'pendant row must carry the pendant quantity')
-  assert.ok(pendantRow.includes('₹1,350.50'), 'pendant row must carry the pendant amount')
+  assert.ok(pendantRow.includes('₹1,391.02'), 'pendant Amount cell = taxable ₹1,350.50 + its GST ₹40.52')
   assert.ok(pendantRow.includes('₹40.52'), 'pendant row must carry the pendant GST')
   assert.ok(!pendantRow.includes('1,000.00'), 'the ring amount must not leak into the pendant row')
 })
@@ -240,4 +245,195 @@ test('quotations share the same totals block: the discount is subtracted exactly
   assert.equal(rupees(total), 1050)
   assert.equal(rupees(taxable) - rupees(discount), rupees(total), 'quoted rows must add up too')
   assert.ok(!html.includes('CGST'), 'a 0% document must not print GST split rows')
+})
+
+test('legacy rows with tax: 0 reconcile their GST column to the stored summary', () => {
+  // The SI202610243588 bug: invoice creation never wrote per-line tax (0 on
+  // every row) while gstAmount on the invoice row was real, so the printed
+  // GST column dashed every line even though the summary showed CGST/SGST.
+  const invoice = makeInvoice({
+    items: [
+      { product: 'Silver Ring', sku: 'SKU-RING-A', hsn: '7113', qty: 2, weight: 25, silverRate: 0, makingCharge: 0, tax: 0, amount: 1000 },
+      { product: 'Gold Pendant', sku: 'SKU-PENDANT-B', hsn: '7114', qty: 1, weight: 10, silverRate: 0, makingCharge: 45, tax: 0, amount: 1350.5 },
+    ],
+    gst: 3,
+    gstAmount: 70.52,
+    discount: 0,
+    subtotal: 2350.5,
+    grandTotal: 2421.02,
+  })
+  const before = JSON.stringify(invoice)
+  const html = printInvoice(invoice)
+  assert.equal(printInvoice(invoice), html, 'reconciliation must be deterministic')
+  assert.equal(JSON.stringify(invoice), before, 'reconciliation must not mutate the invoice')
+
+  // Both lines now carry money in the GST column (largest-remainder split of
+  // the STORED gstAmount, in proportion to the line amounts) …
+  const ringRow = itemRow(html, 'Silver Ring')
+  const pendantRow = itemRow(html, 'Gold Pendant')
+  assert.ok(ringRow.includes('₹30.00'), 'ring GST cell must show its share of the stored GST')
+  assert.ok(pendantRow.includes('₹40.52'), 'pendant GST cell must show its share of the stored GST')
+
+  // … and the printed column sums EXACTLY to the printed summary total.
+  // The GST cell is the right-aligned cell immediately before the bold amount.
+  const gstCell = (row: string): number => {
+    const m = row.match(/text-align:right;">₹([\d,]+\.\d{2})<\/td>\s*<td[^>]*font-weight:600/)
+    assert.ok(m, 'expected a GST cell before the amount cell')
+    return Number(m[1].replace(/,/g, ''))
+  }
+  const totalGst = rowValue(html, 'Total GST')
+  assert.equal(rupees(totalGst), invoice.gstAmount, 'summary Total GST must equal the stored amount')
+  const lineGstTotal = Math.round((gstCell(ringRow) + gstCell(pendantRow)) * 100) / 100
+  assert.equal(lineGstTotal, rupees(totalGst), 'line GST cells must add up to the summary')
+  assert.equal(lineGstTotal, invoice.gstAmount, 'line GST totals must match the invoice GST exactly')
+
+  // The Amount column stays the taxable line amount EXCLUDING GST, and the
+  // grand total follows the invoice calculation rule:
+  // taxable + GST − discount = printed grand total = stored grand total.
+  const printedDiscount = rowValue(html, 'Discount')
+  const taxable = rupees(rowValue(html, 'Taxable Value'))
+  const grand = rupees(rowValue(html, 'GRAND TOTAL'))
+  assert.equal(taxable, invoice.subtotal, 'Taxable Value must remain the GST-exclusive total of the line amounts')
+  assert.equal(
+    Math.round((taxable + invoice.gstAmount - (printedDiscount ? rupees(printedDiscount) : 0)) * 100) / 100,
+    grand,
+    'grand total must reconcile as taxable + GST − discount',
+  )
+  assert.equal(grand, invoice.grandTotal, 'printed grand total must equal the stored grand total')
+
+  // Intra-state defaults: supply line + split rows with the rate labels.
+  assert.ok(html.includes('Intra-state supply · GST @ 3%'))
+  assert.ok(html.includes('CGST @ 1.5%') && html.includes('SGST @ 1.5%'))
+  // The column shows a money amount, so it is named as a money column.
+  assert.ok(html.includes('>GST AMOUNT (₹)</th>'), 'the GST column must be named GST AMOUNT (₹)')
+})
+
+test('inter-state invoices (buyer GSTIN in another state) print IGST, not CGST/SGST', () => {
+  const invoice = makeInvoice({
+    customerState: 'Tamil Nadu',
+    buyerGstin: '33AABCU9603R1ZX', // TN buyer vs the business's 27… GSTIN
+  })
+  const html = printInvoice(invoice, { businessGstin: '27AAACO1234F1Z5' })
+
+  assert.ok(html.includes('Inter-state supply · IGST @ 3%'), 'supply line must declare the inter-state supply')
+  const igst = rowValue(html, 'IGST @ 3%')
+  assert.equal(rupees(igst), invoice.gstAmount, 'IGST must equal the stored GST money')
+  assert.equal(rowValue(html, 'CGST @ 1.5%'), null, 'inter-state summary must not split CGST')
+  assert.equal(rowValue(html, 'SGST @ 1.5%'), null, 'inter-state summary must not split SGST')
+  assert.ok(!html.includes('CGST') && !html.includes('SGST'), 'no CGST/SGST labels at all on an inter-state invoice')
+
+  // Reconciliation holds for the inter-state shape too.
+  const taxable = rupees(rowValue(html, 'Taxable Value'))
+  const discount = rupees(rowValue(html, 'Discount'))
+  const grand = rupees(rowValue(html, 'GRAND TOTAL'))
+  assert.equal(Math.round((taxable + invoice.gstAmount - discount) * 100) / 100, grand)
+})
+
+test('a different GST rate (12%) reconciles the same way', () => {
+  // GST rates are data (sales_invoices.gst), not a 3% constant — verify the
+  // line column, the summary rows and the header all follow a 12% invoice.
+  const invoice = makeInvoice({
+    items: [
+      { product: 'Silver Ring', sku: 'SKU-RING-A', hsn: '7113', qty: 2, weight: 25, silverRate: 0, makingCharge: 0, tax: 0, amount: 1000 },
+      { product: 'Gold Pendant', sku: 'SKU-PENDANT-B', hsn: '7114', qty: 1, weight: 10, silverRate: 0, makingCharge: 45, tax: 0, amount: 1350.5 },
+    ],
+    gst: 12,
+    gstAmount: 282.06, // 12% of 2,350.50
+    discount: 0,
+    subtotal: 2350.5,
+    grandTotal: 2632.56,
+  })
+  const html = printInvoice(invoice)
+
+  const ringRow = itemRow(html, 'Silver Ring')
+  const pendantRow = itemRow(html, 'Gold Pendant')
+  assert.ok(ringRow.includes('₹120.00'), '12% of ₹1,000.00 must land in the ring GST cell')
+  assert.ok(pendantRow.includes('₹162.06'), '12% of ₹1,350.50 must land in the pendant GST cell')
+  assert.equal(Math.round((120 + 162.06) * 100) / 100, invoice.gstAmount, 'line cells must sum to the stored GST')
+
+  assert.ok(html.includes('>GST AMOUNT (₹)</th>'), 'the GST column must be named GST AMOUNT (₹)')
+  const cgst = rowValue(html, 'CGST @ 6%')
+  const sgst = rowValue(html, 'SGST @ 6%')
+  assert.equal(rupees(cgst) + rupees(sgst), invoice.gstAmount, 'split rows must sum to the stored GST')
+  assert.equal(rupees(rowValue(html, 'GRAND TOTAL')), invoice.grandTotal)
+})
+
+test('same-state buyer GSTIN keeps the intra-state CGST/SGST split', () => {
+  const invoice = makeInvoice({ buyerGstin: '27AABCU9603R1ZX' })
+  const html = printInvoice(invoice, { businessGstin: '27AAACO1234F1Z5' })
+  assert.ok(html.includes('Intra-state supply · GST @ 3%'))
+  assert.ok(html.includes('CGST @ 1.5%'), 'same-state buyer must keep the CGST row')
+  assert.ok(html.includes('IGST @') === false, 'intra-state summary must not show IGST')
+})
+
+test('header and row cells stay in the same column order, with and without images', () => {
+  // Regression for SI202610246991.pdf: InvoiceDetail prints with showImages
+  // on, but a product WITHOUT an image skipped its <td> while the header
+  // still reserved the image <th> — shifting every later cell one column
+  // left, so Making Value showed under Rate, GST under MAKING VALUE and the
+  // Amount under GST AMOUNT. The row must emit exactly one cell per header.
+  const invoice = makeInvoice({
+    items: [
+      { product: 'Twisted Rope Chain 22 inch', sku: 'OL-CHN-003', hsn: '7113', qty: 1, weight: 50.2385, silverRate: 125, makingCharge: 20, tax: 0, amount: 7284.6 },
+    ],
+    gst: 3,
+    gstAmount: 218.54,
+    discount: 0,
+    subtotal: 7284.6,
+    grandTotal: 7503.14,
+  })
+
+  /** Cell texts of a <thead>/<tr> fragment, in DOM order. */
+  const colTexts = (fragment: string, tag: 'th' | 'td'): string[] =>
+    fragment.split(`<${tag}`).slice(1).map((chunk) => {
+      const inner = chunk.slice(chunk.indexOf('>') + 1)
+      return inner.slice(0, inner.indexOf(`</${tag}>`)).replace(/<br\s*\/?>/g, ' ').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()
+    })
+  const headerOf = (html: string): string[] => {
+    const start = html.indexOf('<thead>') + '<thead>'.length
+    return colTexts(html.slice(start, html.indexOf('</thead>')), 'th')
+  }
+
+  // 1) Image column reserved, product has NO image — the bug condition.
+  const noImageHtml = buildPrintHtml(
+    invoicePrintDoc(invoice, { imagesBySku: new Map() }),
+    CONFIG,
+    { docType: 'invoice', showImages: true },
+  )
+  const ths = headerOf(noImageHtml)
+  assert.deepEqual(
+    ths,
+    ['', 'Product', 'HSN', 'Qty', 'Weight (g)', 'Rate (₹/g)', 'Making Value (₹)', 'GST AMOUNT (₹)', 'Amount (₹)'],
+    'header column order must match the invoice table contract',
+  )
+  const tds = colTexts(itemRow(noImageHtml, 'Twisted Rope Chain 22 inch'), 'td')
+  assert.equal(tds.length, ths.length, `image-less row must still emit one cell per header (got ${tds.length} vs ${ths.length})`)
+
+  // Every value sits directly beneath its own heading.
+  const under = (label: string): string => {
+    const idx = ths.indexOf(label)
+    assert.ok(idx >= 0, `header must contain ${label}`)
+    return tds[idx]
+  }
+  assert.equal(under('Product'), 'Twisted Rope Chain 22 inch OL-CHN-003')
+  assert.equal(under('HSN'), '7113')
+  assert.equal(under('Qty'), '1')
+  assert.equal(under('Weight (g)'), '50.24')
+  assert.equal(under('Rate (₹/g)'), '₹125.00')
+  assert.equal(under('Making Value (₹)'), '₹1,004.77', 'Making Value must show weight × making charge')
+  assert.equal(under('GST AMOUNT (₹)'), '₹218.54', 'GST AMOUNT must show the allocated line GST')
+  assert.equal(under('Amount (₹)'), '₹7,503.14', 'Amount must show the gross line total: taxable ₹7,284.60 + GST ₹218.54')
+
+  // 2) Same invoice WITH an image: still one cell per header column.
+  const withImageHtml = buildPrintHtml(
+    invoicePrintDoc(invoice, { imagesBySku: new Map([['OL-CHN-003', 'data:image/png;base64,AAAA']]) }),
+    CONFIG,
+    { docType: 'invoice', showImages: true },
+  )
+  assert.equal(colTexts(itemRow(withImageHtml, 'Twisted Rope Chain 22 inch'), 'td').length, ths.length)
+
+  // 3) showImages off: header drops the column, rows must too.
+  const plainHtml = printInvoice(invoice)
+  const plainThs = headerOf(plainHtml)
+  assert.equal(colTexts(itemRow(plainHtml, 'Twisted Rope Chain 22 inch'), 'td').length, plainThs.length)
 })

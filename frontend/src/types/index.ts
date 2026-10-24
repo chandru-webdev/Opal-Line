@@ -38,14 +38,13 @@ export interface AppSettings {
   /**
    * Settings → Product codes: auto-generation rules consumed by
    * src/lib/productCodes.ts. Undefined/empty means the shipped house style
-   * (prefix SLV, template {PREFIX}-{CATEGORY}-{SEQ}, 5-digit sequence,
-   * EAN-13 barcode prefix 890).
+   * (prefix OL, template {PREFIX}-{CATEGORY}-{SEQ}, three-digit sequence,
+   * e.g. OL-RNG-001).
    */
   skuPrefix?: string | null
   skuSuffix?: string | null
   skuFormat?: string | null
   skuSeqLength?: number | null
-  barcodePrefix?: string | null
   updatedAt: string | null
   notificationSettings?: NotificationSettings
 }
@@ -499,7 +498,12 @@ export interface Product {
   id: string
   name: string
   sku: string
-  barcode: string
+  /**
+   * Legacy barcode column, kept only so existing rows and the Shopify sync
+   * keep their stored value. The barcode workflow is removed: no screen shows
+   * or edits it, and product identity is the SKU (labels carry a SKU QR code).
+   */
+  barcode?: string | null
   huid?: string | null
   category: string
   collection: string

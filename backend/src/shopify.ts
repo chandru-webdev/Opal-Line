@@ -175,7 +175,7 @@ async function shopifyRequest<T>(resource: string, query = '', _attempt = 0): Pr
       throw new ShopifyError('Shopify rejected the access token. Check SHOPIFY_ACCESS_TOKEN and app scopes.', 401)
     }
     if (res.status === 403) {
-      throw new ShopifyError('The access token is missing required scopes (read_orders, read_products, read_inventory, read_customers).', 403)
+      throw new ShopifyError(`The access token is missing required scopes (read_orders, read_products, read_inventory, read_customers). ${SCOPE_FIX_HINT}`, 403)
     }
     if (res.status === 429) {
       const retryAfter = res.headers.get('Retry-After')
@@ -235,6 +235,45 @@ async function adminFetch(input: RequestInfo | URL, init?: RequestInit): Promise
   throw new ShopifyError('Max retries exceeded for Shopify API', 503)
 }
 
+/**
+ * The Admin API scopes Opal Line's Shopify integration actually uses: reads
+ * for sync-in, writes for manual-order draft creation, order updates, and the
+ * product/inventory pushes. A custom-app token issued without a write scope
+ * passes a shop.json probe and then fails mid-flow ("Access denied for
+ * draftOrderCreate field. Required access: `write_draft_orders` …"), so the
+ * connection test names the gaps up front.
+ */
+export const REQUIRED_SHOPIFY_SCOPES = [
+  'read_products',
+  'read_orders',
+  'read_customers',
+  'read_inventory',
+  'write_draft_orders',
+  'write_orders',
+  'write_products',
+  'write_inventory',
+] as const
+
+const SCOPE_FIX_HINT =
+  'To fix: in the Shopify admin open Settings → Apps and sales channels → the app → Configuration → Admin API scopes, '
+  + 'tick the missing scopes and SAVE — then REGENERATE the Admin API access token, because an existing token keeps its '
+  + 'old scopes — and paste the new token under Settings → Connections in Opal Line (or SHOPIFY_ACCESS_TOKEN in .env).'
+
+/**
+ * Appends actionable fix-it guidance to Shopify's raw missing-scope error so
+ * the order toast says where to grant the scope, not just that it is missing.
+ * Returns the message unchanged when it is not a scope error.
+ */
+export function withScopeFixHint(message: string): string {
+  if (!/access denied|required access|missing .*scopes?|does not have the required scopes/i.test(message)) return message
+  const scopes = [...message.matchAll(/`([a-z0-9_]+)`/g)]
+    .map((m) => m[1])
+    .filter((s) => s.includes('_'))
+  const named =
+    scopes.length > 0 ? ` Missing scope${scopes.length > 1 ? 's' : ''}: ${[...new Set(scopes)].join(', ')}.` : ''
+  return `${message}${named} ${SCOPE_FIX_HINT}`
+}
+
 export async function testShopifyConnection(overrides?: {
   shop?: string
   accessToken?: string
@@ -259,12 +298,40 @@ export async function testShopifyConnection(overrides?: {
       return { ok: false, error: 'Shopify rejected the access token. Double-check the token value.' }
     }
     if (res.status === 403) {
-      return { ok: false, error: 'Access token is missing the required Shopify scopes (read_products, read_orders, read_customers, read_inventory).' }
+      return { ok: false, error: `Access token is missing the required Shopify scopes (read_products, read_orders, read_customers, read_inventory). ${SCOPE_FIX_HINT}` }
     }
     if (!res.ok) {
       return { ok: false, error: `Shopify API error ${res.status}: ${(await res.text()).slice(0, 200)}` }
     }
     const data = await res.json()
+    // Best-effort scope check: custom-app Admin API tokens can answer
+    // access_scopes.json. A token missing an outbound scope (e.g.
+    // write_draft_orders) passes the shop.json probe above and only fails
+    // mid-flow, so name the gaps here, at configuration time. Token types
+    // that cannot answer simply skip this check.
+    try {
+      const scopesRes = await fetch(
+        `https://${shop}.myshopify.com/admin/api/${config.apiVersion}/access_scopes.json`,
+        { headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json', Accept: 'application/json' } },
+      )
+      if (scopesRes.ok) {
+        const scopesJson = (await scopesRes.json().catch(() => null)) as
+          | { access_scopes?: Array<{ handle?: string }> }
+          | null
+        const granted = new Set(
+          (scopesJson?.access_scopes ?? []).map((s) => String(s.handle ?? '').trim()).filter(Boolean),
+        )
+        if (granted.size > 0) {
+          const missing = REQUIRED_SHOPIFY_SCOPES.filter((handle) => !granted.has(handle))
+          if (missing.length > 0) {
+            return {
+              ok: false,
+              error: `Access token is missing required Admin API scope${missing.length > 1 ? 's' : ''}: ${missing.join(', ')}. ${SCOPE_FIX_HINT}`,
+            }
+          }
+        }
+      }
+    } catch { /* scope probe is best-effort */ }
     logger.info({ ms: Date.now() - start }, 'Shopify connection verified')
     return { ok: true, shop: data.shop?.myshopify_domain ?? `${shop}.myshopify.com` }
   } catch (err) {
@@ -3073,7 +3140,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
     if (!res.ok) {
       const text = json?.errors?.map((e) => e.message).join(' ') || `Shopify API error ${res.status}`
       await persistLog({ entity: 'Order', direction: 'out', action: 'Draft Order Create', status: 'failed', error: text })
-      return { ok: false, errors: [text], message: 'Shopify rejected the request' }
+      return { ok: false, errors: [text], message: withScopeFixHint(text) }
     }
 
     const result = json?.data?.draftOrderCreate
@@ -3084,7 +3151,7 @@ export async function createShopifyDraftOrder(payload: DraftOrderPayload): Promi
         json?.errors?.map((e) => e.message).join(' ') ||
         (resText && resText.trim() ? resText.slice(0, 500) : 'Shopify returned an unexpected response')
       await persistLog({ entity: 'Order', direction: 'out', action: 'Draft Order Create', status: 'failed', error: msg })
-      return { ok: false, errors: [msg], message: msg }
+      return { ok: false, errors: [msg], message: withScopeFixHint(msg) }
     }
 
     const draftId = result.draftOrder.id
@@ -3286,7 +3353,8 @@ export async function updateShopifyOrder(payload: ShopifyOrderUpdateInput): Prom
       status: ok ? 'success' : 'failed',
       error: ok ? undefined : all.join(' ') || `Shopify API error ${res.status}`,
     })
-    return { ok, errors: all, message: ok ? undefined : all.join(' ') || `Shopify API error ${res.status}` }
+    const message = ok ? undefined : withScopeFixHint(all.join(' ') || `Shopify API error ${res.status}`)
+    return { ok, errors: all, message }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     return { ok: false, errors: [msg], message: 'Shopify order update failed' }

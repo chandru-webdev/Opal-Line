@@ -1,19 +1,16 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, isNotNull } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
 import {
-  barcodeFormatError,
-  duplicateBarcodeMessage,
   duplicateScanMessage,
   inactiveProductMessage,
-  makeBarcode,
-  newBarcodeSeed,
-  normalizeBarcode,
   normalizeScanCode,
   scanCodeError,
-} from '../barcode'
+} from '../scanCode'
+import { findProductsBySku, generateUniqueSku } from '../lib/skuIdentity'
+import { isGenericSku, migrationWarnings, planSkuMigration, type SkuReferences } from '../lib/skuMigration'
 import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
@@ -88,8 +85,10 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
     clampRule('lockoutDurationMinutes', 1, 1440)
     // Settings → Product codes: normalise rather than reject, so a scripted
     // PUT can never store a format template without {SEQ} (which would mint
-    // identical SKUs forever) or a non-digit barcode prefix. Mirrors
-    // normalizedCodeSettings in src/lib/productCodes.ts.
+    // identical SKUs forever) or a sequence shorter than the three digits the
+    // house style requires (OL-RNG-001). Mirrors normalizedCodeSettings in
+    // src/lib/productCodes.ts. The barcode prefix setting is gone: labels
+    // carry a QR code encoding the SKU, never an EAN barcode.
     if (out.skuPrefix !== undefined) out.skuPrefix = String(out.skuPrefix ?? '').trim().toUpperCase().slice(0, 12) || null
     if (out.skuSuffix !== undefined) out.skuSuffix = String(out.skuSuffix ?? '').trim().toUpperCase().slice(0, 12) || null
     if (out.skuFormat !== undefined) {
@@ -99,15 +98,14 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
     if (out.skuSeqLength !== undefined && out.skuSeqLength !== null) {
       const n = Number(out.skuSeqLength)
       if (!Number.isFinite(n)) throw new Error('skuSeqLength must be a number')
-      out.skuSeqLength = Math.min(8, Math.max(1, Math.round(n)))
+      out.skuSeqLength = Math.min(8, Math.max(3, Math.round(n)))
     } else if (out.skuSeqLength === null) {
       // NULL means "back to the shipped default" — never clamp it to 1.
       out.skuSeqLength = null
     }
-    if (out.barcodePrefix !== undefined) {
-      const digits = String(out.barcodePrefix ?? '').replace(/\D/g, '').slice(0, 11)
-      out.barcodePrefix = digits || null
-    }
+    // Legacy column: the barcode workflow is removed, so any attempt to write
+    // the old prefix setting is dropped instead of stored.
+    delete out.barcodePrefix
   }
   // Stock/price floors: the transactional order/invoice paths guard stock with
   // row locks, but direct product writes must never push stock or prices negative.
@@ -320,24 +318,15 @@ const s = schema
 // so the list opens on the latest creations (column headers still re-sort).
 dbRouter.get('/products', listOf(s.products, s.products.createdAt))
 
-// ─── Barcode identity helpers ──────────────────────────────────────
-// Generation is only ever applied to products that have NO barcode, so an
-// existing (legacy or manual) value is never silently replaced. Uniqueness is
-// enforced here with a transaction-scoped advisory lock, which serialises two
-// concurrent writers on the same code without needing the optional DB index.
+// ─── SKU identity helpers ─────────────────────────────────────────────
+// SKUs are the only product identifier: generated per category under an
+// advisory lock so two concurrent creates in the same category cannot mint the
+// same OL-{CODE}-{SEQ} code, and never rewritten implicitly on edit. Labels
+// encode the SKU in a QR code (see src/barcodeLabels.ts) — there are no
+// barcodes anywhere in the product workflow. The generation and scan-lookup
+// helpers live in src/lib/skuIdentity.ts so they can be unit-tested.
 
-async function generateUniqueBarcode(tx: any): Promise<string> {
-  for (let i = 0; i < 25; i++) {
-    const candidate = makeBarcode(newBarcodeSeed())
-    const [dup] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.barcode, candidate)).limit(1)
-    if (!dup) return candidate
-  }
-  throw new Error('Could not generate a unique barcode — please try again')
-}
-
-const missingBarcode = () => or(isNull(s.products.barcode), eq(s.products.barcode, ''))
-
-// Barcode / QR Code labels (must be before /products/:id to avoid param capture)
+// QR Code labels (must be before /products/:id to avoid param capture)
 dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), async (_req, res) => {
   const { LABEL_PRESET_LIST } = await import('../barcodeLabels')
   res.json(LABEL_PRESET_LIST)
@@ -450,11 +439,9 @@ dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), as
     if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
     const products = await fetchProductLabels(ids)
     if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
-    const symbology = req.body?.format === 'code128' ? 'code128' : 'qr'
     const brandName = typeof req.body?.brandName === 'string' ? req.body.brandName.trim() : ''
     const opts = zplOptionsForPreset(String(req.body?.preset || ''), {
       copies: req.body?.copies == null ? 1 : Number(req.body.copies),
-      symbology,
       showPrice: req.body?.showPrice !== false,
       showWeight: req.body?.showWeight !== false,
       showQR: req.body?.showQR !== false && req.body?.qr !== 'false',
@@ -474,71 +461,194 @@ dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), as
   }
 })
 
-// Counts for the Products / Barcode screens: how many products are missing a
-// barcode and whether any barcode is duplicated.
-dbRouter.get('/products/barcodes/summary', requirePermission('inventory', 'view'), async (_req, res) => {
+// ─── Safe SKU regeneration for generic SKUs ───────────────────────────
+// Legacy generic codes (SLV-GEN-001) carry no category information. This
+// utility plans OL-{CATEGORY}-{SEQ} replacements, REPORTS every reference it
+// found (invoices, orders, inventory, Shopify, labels) and only writes inside
+// one transaction guarded by an advisory lock. Dry-run by default: nothing
+// changes until apply is requested explicitly.
+
+async function collectSkuReferences(tx: any, skus: string[]): Promise<Map<string, SkuReferences>> {
+  const refs = new Map<string, SkuReferences>()
+  const fresh = (): SkuReferences => ({ invoiceItems: 0, orderItems: 0, stockMovements: 0, stockTransfers: 0, variants: 0, shopifyLinked: false })
+  for (const sku of skus) refs.set(sku.toUpperCase(), fresh())
+  const bucket = (sku: unknown) => refs.get(String(sku ?? '').trim().toUpperCase())
+
+  const invoiceRows = await tx
+    .select({ sku: s.salesInvoiceItems.sku })
+    .from(s.salesInvoiceItems)
+    .where(inArray(s.salesInvoiceItems.sku, skus))
+  for (const r of invoiceRows) { const b = bucket(r.sku); if (b) b.invoiceItems++ }
+
+  // Sales order lines live in a jsonb array — match both the parent SKU and
+  // any variant SKU derived from it (parent-SMA style).
+  const orderRows = await tx
+    .select({ id: s.salesOrders.id, lineItems: s.salesOrders.lineItems })
+    .from(s.salesOrders)
+    .where(sql`(${s.salesOrders.lineItems})::text ILIKE ANY(${sql`ARRAY[${sql.join(skus.map((k) => sql`%${k}%`), sql`, `)}]`})`)
+  for (const row of orderRows) {
+    const lines = Array.isArray(row.lineItems) ? (row.lineItems as Array<Record<string, unknown>>) : []
+    for (const line of lines) {
+      const key = String(line?.sku ?? '').trim().toUpperCase()
+      const parent = skus.find((k) => key === k.toUpperCase() || key.startsWith(`${k.toUpperCase()}-`))
+      const b = parent ? refs.get(parent.toUpperCase()) : undefined
+      if (b) b.orderItems++
+    }
+  }
+
+  const movementRows = await tx
+    .select({ sku: s.stockMovements.sku })
+    .from(s.stockMovements)
+    .where(inArray(s.stockMovements.sku, skus))
+  for (const r of movementRows) { const b = bucket(r.sku); if (b) b.stockMovements++ }
+
+  const transferRows = await tx
+    .select({ sku: s.stockTransfers.sku })
+    .from(s.stockTransfers)
+    .where(inArray(s.stockTransfers.sku, skus))
+  for (const r of transferRows) { const b = bucket(r.sku); if (b) b.stockTransfers++ }
+
+  const variantRows = await tx
+    .select({ sku: s.productVariants.sku })
+    .from(s.productVariants)
+    .where(sql`(${s.productVariants.sku}) = ANY(${sql`ARRAY[${sql.join(skus.map((k) => sql`${k} || '%'`), sql`, `)}]`})`)
+  void variantRows // counted per product below (prefix match, any variant tail)
+  for (const sku of skus) {
+    const b = refs.get(sku.toUpperCase())
+    if (!b) continue
+    const [cnt] = await tx
+      .select({ n: sql<number>`count(*)` })
+      .from(s.productVariants)
+      .where(sql`(${s.productVariants.sku}) = ${sku} OR (${s.productVariants.sku}) LIKE ${sku || '\u0000'} || '-%'`)
+    b.variants = Number(cnt?.n ?? 0)
+  }
+
+  const shopifyRows = await tx
+    .select({ sku: s.products.sku, shopifyId: s.products.shopifyId, shopifyStatus: s.products.shopifyStatus })
+    .from(s.products)
+    .where(inArray(s.products.sku, skus))
+  for (const r of shopifyRows) {
+    const b = bucket(r.sku)
+    if (b) {
+      const linked = String(r.shopifyId ?? '').trim() !== '' && !String(r.shopifyId ?? '').trim().startsWith('#')
+      b.shopifyLinked = linked && (r.shopifyStatus ?? '') === 'synced'
+    }
+  }
+  return refs
+}
+
+// Summary for the Products screen: how many products still carry a generic
+// SKU, so the migration action can surface only when it has work to do.
+dbRouter.get('/products/skus/summary', requirePermission('inventory', 'view'), async (_req, res) => {
   if (!requireDb(res)) return
   try {
-    const [row] = await db!
-      .select({
-        total: sql<number>`count(*)`,
-        missing: sql<number>`count(*) filter (where ${s.products.barcode} is null or ${s.products.barcode} = '')`,
-      })
-      .from(s.products)
-    const dupRows = await db!
-      .select({ barcode: s.products.barcode, cnt: sql<number>`count(*)` })
-      .from(s.products)
-      .where(and(isNotNull(s.products.barcode), ne(s.products.barcode, '')))
-      .groupBy(s.products.barcode)
-      .having(sql`count(*) > 1`)
-    res.json({
-      total: Number(row?.total ?? 0),
-      missing: Number(row?.missing ?? 0),
-      duplicates: dupRows.map((r) => ({ barcode: String(r.barcode), count: Number(r.cnt) })),
-    })
+    const rows = await db!.select({ sku: s.products.sku }).from(s.products)
+    res.json({ total: rows.length, generic: rows.filter((r) => isGenericSku(r.sku)).length })
   } catch (err) {
-    logger.error({ err }, 'barcode summary failed')
-    res.status(500).json({ error: 'Could not load barcode summary' })
+    logger.error({ err }, 'sku summary failed')
+    res.status(500).json({ error: 'Could not load SKU summary' })
   }
 })
 
-// Backfill missing barcodes. Supports a dry run so the operator can preview
-// exactly which products would change before anything is written.
-dbRouter.post('/products/barcodes/generate', requirePermission('inventory', 'edit'), async (req, res) => {
+// Regenerate generic SKUs. Body: { apply?: boolean, ids?: string[] }.
+// Default (apply absent/false) is a dry run returning the full plan plus the
+// references found; with apply: true the plan is executed in one transaction.
+dbRouter.post('/products/skus/regenerate', requirePermission('inventory', 'edit'), async (req, res) => {
   if (!requireDb(res)) return
   try {
+    const apply = req.body?.apply === true
     const ids: string[] = Array.isArray(req.body?.ids)
       ? req.body.ids.map((x: unknown) => String(x).trim()).filter(Boolean)
       : []
-    const dryRun = req.body?.dryRun === true
+    const [settingsRow] = await db!.select().from(s.settings).limit(1)
+    const codeSettings = {
+      skuPrefix: settingsRow?.skuPrefix ?? null,
+      skuSuffix: settingsRow?.skuSuffix ?? null,
+      skuFormat: settingsRow?.skuFormat ?? null,
+      skuSeqLength: settingsRow?.skuSeqLength ?? null,
+    }
+
     const result = await db!.transaction(async (tx) => {
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('bc:backfill'))`)
-      const condition = ids.length > 0 ? and(missingBarcode(), inArray(s.products.id, ids)) : missingBarcode()
-      const missing = await tx
-        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku })
+      // One writer at a time: sequences are computed from live rows, so a
+      // concurrent regeneration must not race the plan.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('sku:regenerate'))`)
+      const products = await tx
+        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku, category: s.products.category })
         .from(s.products)
-        .where(condition!)
-        .orderBy(s.products.name)
-      const assignments: Array<{ id: string; name: string; sku: string; barcode: string }> = []
-      if (!dryRun) {
-        for (const p of missing) {
-          const barcode = await generateUniqueBarcode(tx)
-          await tx
-            .update(s.products)
-            .set({ barcode })
-            .where(and(eq(s.products.id, p.id), missingBarcode()))
-          assignments.push({ id: p.id, name: p.name, sku: p.sku, barcode })
+      const variantSkus = await tx.select({ sku: s.productVariants.sku }).from(s.productVariants)
+      const scoped = ids.length > 0 ? products.filter((p) => ids.includes(p.id)) : products
+      const plan = planSkuMigration(scoped, [...products.map((p) => p.sku), ...variantSkus.map((v) => v.sku)], codeSettings)
+
+      const details: Array<{
+        id: string
+        name: string
+        oldSku: string
+        newSku: string
+        references: SkuReferences
+        warnings: string[]
+        applied: boolean
+        reason?: string
+      }> = []
+      const applied: Array<{ id: string; name: string; oldSku: string; newSku: string }> = []
+
+      for (const c of plan) {
+        const refsMap = await collectSkuReferences(tx, [c.oldSku])
+        const refs = refsMap.get(c.oldSku.toUpperCase()) ?? {
+          invoiceItems: 0, orderItems: 0, stockMovements: 0, stockTransfers: 0, variants: 0, shopifyLinked: false,
         }
+        const warnings = migrationWarnings(refs)
+        const entry = { id: c.id, name: c.name, oldSku: c.oldSku, newSku: c.newSku, references: refs, warnings, applied: false, reason: undefined as string | undefined }
+        if (!apply) {
+          details.push(entry)
+          continue
+        }
+        // The new SKU must still be free inside the lock (plan → write race
+        // with an ordinary create): re-check, bump by re-planning if taken.
+        const allNow = await tx.select({ sku: s.products.sku }).from(s.products)
+        const [clash] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(sql`upper(${s.products.sku}) = upper(${c.newSku})`)
+          .limit(1)
+        if (clash) {
+          entry.reason = `target SKU ${c.newSku} is already in use`
+          details.push(entry)
+          continue
+        }
+        void allNow
+        await tx.update(s.products).set({ sku: c.newSku }).where(and(eq(s.products.id, c.id), eq(s.products.sku, c.oldSku)))
+        // Live references follow the rename inside the same transaction so no
+        // ledger/variant row is left pointing at a SKU that no longer exists.
+        const variantRows = await tx
+          .select({ id: s.productVariants.id, sku: s.productVariants.sku })
+          .from(s.productVariants)
+          .where(sql`(${s.productVariants.sku}) = ${c.oldSku} OR (${s.productVariants.sku}) LIKE ${c.oldSku} || '-%'`)
+        for (const v of variantRows) {
+          const tail = v.sku === c.oldSku ? '' : v.sku.slice(c.oldSku.length)
+          await tx.update(s.productVariants).set({ sku: `${c.newSku}${tail}` }).where(eq(s.productVariants.id, v.id))
+        }
+        await tx
+          .update(s.stockMovements)
+          .set({ sku: c.newSku })
+          .where(eq(s.stockMovements.sku, c.oldSku))
+        await tx
+          .update(s.stockTransfers)
+          .set({ sku: c.newSku })
+          .where(eq(s.stockTransfers.sku, c.oldSku))
+        entry.applied = true
+        details.push(entry)
+        applied.push({ id: c.id, name: c.name, oldSku: c.oldSku, newSku: c.newSku })
       }
-      return { missing, assignments }
+      return { plan, details, applied }
     })
 
-    if (!dryRun && result.assignments.length > 0) {
+    if (apply && result.applied.length > 0) {
       const actor = actorFromRequest(req)
       void recordActivity({
-        action: 'Generated barcodes',
+        action: 'Regenerated generic SKUs',
         module: 'inventory',
-        entity: `Product barcodes (${result.assignments.length} assigned)`,
+        entity: `Product SKUs (${result.applied.length} regenerated)`,
+        details: result.applied.slice(0, 10).map((p) => `${p.oldSku}→${p.newSku}`).join(', '),
         userId: actor.userId,
         ip: actor.ip,
       })
@@ -546,107 +656,40 @@ dbRouter.post('/products/barcodes/generate', requirePermission('inventory', 'edi
 
     res.json({
       ok: true,
-      dryRun,
-      candidates: result.missing.length,
-      assigned: result.assignments.length,
-      samples: result.missing.slice(0, 50).map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
-      assignments: result.assignments.slice(0, 50),
+      apply,
+      candidates: result.plan.length,
+      applied: result.applied.length,
+      details: result.details.slice(0, 200),
+      // Labels are rendered live from the products table: printed sheets that
+      // encode an old SKU must be re-printed after regeneration.
+      note: 'Printed QR labels encode the SKU — re-print labels for regenerated products.',
     })
   } catch (err) {
-    logger.error({ err }, 'barcode backfill failed')
-    res.status(500).json({ error: 'Could not generate barcodes' })
+    logger.error({ err }, 'sku regeneration failed')
+    res.status(500).json({ error: 'Could not regenerate SKUs' })
   }
 })
 
-// Assign or generate a barcode for a single product.
-//  - body.barcode present  → validated manual assignment
-//  - body.barcode absent   → generate, but only when the product has none
-dbRouter.post('/products/:id/barcode', requirePermission('inventory', 'edit'), async (req, res) => {
-  if (!requireDb(res)) return
-  const id = routeParam(req.params.id)
-  const requested = normalizeBarcode(req.body?.barcode)
-  try {
-    const result = await db!.transaction(async (tx) => {
-      const [product] = await tx.select().from(s.products).where(eq(s.products.id, id)).limit(1)
-      if (!product) return null
-
-      if (requested) {
-        const fmtError = barcodeFormatError(requested)
-        if (fmtError) throw new Error(fmtError)
-        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`bc:${requested}`}))`)
-        const [dup] = await tx
-          .select({ id: s.products.id })
-          .from(s.products)
-          .where(and(eq(s.products.barcode, requested), ne(s.products.id, id)))
-          .limit(1)
-        if (dup) throw new Error(duplicateBarcodeMessage(requested))
-        if (normalizeBarcode(product.barcode) === requested) {
-          return { barcode: requested, created: false, changed: false }
-        }
-        await tx.update(s.products).set({ barcode: requested }).where(eq(s.products.id, id))
-        return { barcode: requested, created: false, changed: true }
-      }
-
-      // Generate — an existing valid barcode is returned untouched (idempotent).
-      if (normalizeBarcode(product.barcode)) {
-        return { barcode: normalizeBarcode(product.barcode), created: false, changed: false }
-      }
-      const barcode = await generateUniqueBarcode(tx)
-      await tx.update(s.products).set({ barcode }).where(eq(s.products.id, id))
-      return { barcode, created: true, changed: true }
-    })
-
-    if (!result) return res.status(404).json({ error: 'Not found' })
-    if (result.changed) {
-      const actor = actorFromRequest(req)
-      void recordActivity({
-        action: result.created ? 'Generated barcode' : 'Assigned barcode',
-        module: 'inventory',
-        entity: `Product ${id}`,
-        details: result.barcode,
-        userId: actor.userId,
-        ip: actor.ip,
-      })
-    }
-    res.json({ ok: true, id, barcode: result.barcode, created: result.created })
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
-    const known = msg.includes('Barcode')
-    res.status(known ? 400 : 500).json({ error: known ? msg : 'Could not assign barcode' })
-  }
-})
-
-// Scan-based stock count: look up a product by exact barcode or exact SKU (for
-// scanner guns). Input is normalised first so a keyboard-wedge scan and a typed
-// value resolve identically.
+// Scan-based stock count: look up a product by its EXACT SKU. Printed labels
+// carry a QR code that encodes only the SKU (e.g. OL-RNG-001), so scanning one
+// resolves the product here. Input is normalised first so a keyboard-wedge
+// scan and a typed value resolve identically.
 dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (req, res) => {
   if (!requireDb(res)) return
   try {
     const formatError = scanCodeError(req.query.code)
     if (formatError) return res.status(400).json({ error: formatError })
     const code = normalizeScanCode(req.query.code)
-    // Exact match only — no fuzzy/partial matching, so a scan can never resolve
-    // to the wrong product.
-    const rows = await db!
-      .select({
-        id: s.products.id,
-        name: s.products.name,
-        sku: s.products.sku,
-        barcode: s.products.barcode,
-        stock: s.products.stock,
-        category: s.products.category,
-        status: s.products.status,
-      })
-      .from(s.products)
-      .where(or(eq(s.products.barcode, code), eq(s.products.sku, code)))
-      .limit(2)
-    if (rows.length === 0) return res.status(404).json({ error: 'No product matches that barcode or SKU' })
+    // Exact SKU match only — no fuzzy/partial matching and no barcode lookup,
+    // so a scan can never resolve to the wrong product.
+    const rows = await findProductsBySku(db!, code)
+    if (rows.length === 0) return res.status(404).json({ error: 'No product matches that SKU' })
     if (rows.length > 1) return res.status(409).json({ error: duplicateScanMessage() })
     const row = rows[0]
     if (row.status && row.status !== 'active') {
       return res.status(409).json({ error: inactiveProductMessage(row.name, row.status) })
     }
-    res.json({ data: { id: row.id, name: row.name, sku: row.sku, barcode: row.barcode, stock: row.stock, category: row.category } })
+    res.json({ data: { id: row.id, name: row.name, sku: row.sku, stock: row.stock, category: row.category } })
   } catch (err) {
     logger.error({ err }, 'product scan lookup failed')
     res.status(500).json({ error: 'Scan lookup failed' })
@@ -812,7 +855,64 @@ dbRouter.get('/customers/duplicate-emails', requirePermission('sales', 'view'), 
   }
 })
 
+// ─── Type-ahead search ──────────────────────────────────────────────
+// Small, bounded lookups that back the comboboxes on the billing screens
+// (new-invoice product picker, customer autofetch). Kept off the paginated
+// list endpoints so a keystroke can never trigger a full-table scan, and
+// capped so a broad query stays cheap. Registered BEFORE the /:id routes so
+// "search" is never captured as an id.
+const SEARCH_LIMIT = 15
+const escapeLike = (v: string) => v.replace(/[\\%_]/g, (m) => `\\${m}`)
+
+dbRouter.get('/products/search', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const q = String(req.query.q ?? '').trim()
+    if (!q) return res.json({ data: [] })
+    const pattern = `%${escapeLike(q)}%`
+    const rows = await db!
+      .select()
+      .from(s.products)
+      .where(or(
+        ilike(s.products.name, pattern),
+        ilike(s.products.sku, pattern),
+      ))
+      .orderBy(s.products.name)
+      .limit(SEARCH_LIMIT)
+    res.json({ data: rows.map(stripHash) })
+  } catch (err) {
+    logger.error({ err }, 'product search failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
 dbRouter.get('/products/:id', oneOf(s.products, s.products.id))
+
+// Registered BEFORE /customers/:id so "search" is never treated as an id.
+dbRouter.get('/customers/search', async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const q = String(req.query.q ?? '').trim()
+    if (!q) return res.json({ data: [] })
+    const pattern = `%${escapeLike(q)}%`
+    const rows = await db!
+      .select()
+      .from(s.customers)
+      .where(or(
+        ilike(s.customers.name, pattern),
+        ilike(s.customers.phone, pattern),
+        ilike(s.customers.email, pattern),
+      ))
+      .orderBy(s.customers.name)
+      .limit(SEARCH_LIMIT)
+    // Same shape (and same router-level auth) as the /customers list, so the
+    // picker receives a full Customer row and can autofill phone/email/city.
+    res.json({ data: rows.map(stripHash) })
+  } catch (err) {
+    logger.error({ err }, 'customer search failed')
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
 
 dbRouter.get('/customers', listOf(s.customers, s.customers.name))
 dbRouter.get('/customers/:id', oneOf(s.customers, s.customers.id))
@@ -1083,9 +1183,15 @@ export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number):
       row.sku = String(item.sku ?? '').trim()
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
       row.weight = num(item.weight, 0)
-      // Use provided silverRate, or fall back to the defaultSilverRate from Silver Rate Management
+      // The rate from Silver Rate Management is AUTHORITATIVE whenever one is
+      // available: a client-supplied number is only used as a last-resort
+      // fallback so callers that predate rate management (order ingest,
+      // duplicates) can still price a line. This is the single choke point the
+      // invoice and patch routes share, so a stale or tampered payload can
+      // never override the shop's current rate.
+      const managedRate = num(defaultSilverRate, 0)
       const providedSilverRate = num(item.silverRate, 0)
-      const effectiveSilverRate = providedSilverRate > 0 ? providedSilverRate : (defaultSilverRate ?? 0)
+      const effectiveSilverRate = managedRate > 0 ? managedRate : providedSilverRate
       row.silverRate = effectiveSilverRate
       row.makingCharge = num(item.makingCharge, 0)
       row.tax = num(item.tax, 0)
@@ -1496,7 +1602,6 @@ dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('
 const PRODUCT_FIELD_ALIASES: Record<string, string> = {
   name: 'name', title: 'name', product: 'name', 'product name': 'name',
   sku: 'sku', 'item code': 'sku', code: 'sku',
-  barcode: 'barcode', 'bar code': 'barcode',
   category: 'category', type: 'category',
   collection: 'collection',
   purity: 'purity',
@@ -1577,7 +1682,6 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
       }
       const text = {
         name,
-        barcode: mapped.barcode ?? null,
         category: mapped.category ?? 'Imported',
         collection: mapped.collection ?? null,
         hsn: mapped.hsn ?? null,
@@ -1735,7 +1839,6 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
       }
       const text = {
         name,
-        barcode: mapped.barcode ?? null,
         category: mapped.category ?? 'Imported',
         collection: mapped.collection ?? null,
         hsn: mapped.hsn ?? null,
@@ -4097,6 +4200,11 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
   try {
     const body = sanitize(req.body ?? {}, s.products)
     delete body.id
+    // Product identifiers are immutable through a general edit: an existing
+    // SKU is never silently overwritten, and the barcode workflow is gone
+    // (legacy column — never written from here either).
+    delete body.sku
+    delete body.barcode
     if (body.stock != null) {
       return res.status(400).json({
         error: 'Stock is managed by the stock ledger. Use a stock count for the location, or a transfer.',
@@ -4197,11 +4305,13 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   try {
     const body = sanitize(req.body ?? {}, s.products)
     const name = String(body.name ?? '').trim()
-    const sku = String(body.sku ?? '').trim()
+    const requestedSku = String(body.sku ?? '').trim()
     if (!name) return res.status(400).json({ error: 'Product name is required' })
-    if (!sku) return res.status(400).json({ error: 'SKU is required' })
     body.name = name
-    body.sku = sku
+    // Barcodes are gone: never write the legacy column from a create.
+    delete body.barcode
+    if (requestedSku) body.sku = requestedSku
+    else delete body.sku
 
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
@@ -4211,38 +4321,31 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     // DESC sort.
     if (!body.createdAt) body.createdAt = new Date().toISOString()
 
-    // A create may state the barcode explicitly; validate it up front so a bad
-    // code is a clean 400 rather than a mid-transaction failure. Otherwise the
-    // product gets a generated code below.
-    const requested = normalizeBarcode(body.barcode)
-    if (requested) {
-      const fmtError = barcodeFormatError(requested)
-      if (fmtError) return res.status(400).json({ error: fmtError })
-    }
-    delete body.barcode
-
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
     if (openingQty > 0 && !locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
 
     const row = await db!.transaction(async (tx) => {
-      // Serialise barcode writers on the same code so two concurrent creates
-      // cannot mint an identical code before either row is visible.
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${requested ? `bc:${requested}` : 'bc:generate'}))`)
-      let barcode: string
-      if (requested) {
+      // Concurrency-safe identity: a stated SKU is checked for duplicates
+      // under a per-code advisory lock; an absent SKU is minted under the
+      // category's advisory lock (generateUniqueSku). Either way two
+      // concurrent creates can never commit the same identifier — the unique
+      // index on products.sku is the final backstop.
+      let sku: string
+      if (requestedSku) {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`sku:claim:${requestedSku.toUpperCase()}`}))`)
         const [dup] = await tx
           .select({ id: s.products.id })
           .from(s.products)
-          .where(eq(s.products.barcode, requested))
+          .where(sql`upper(${s.products.sku}) = upper(${requestedSku})`)
           .limit(1)
-        if (dup) throw new Error(duplicateBarcodeMessage(requested))
-        barcode = requested
+        if (dup) throw new Error(`A product with that SKU already exists`)
+        sku = requestedSku
       } else {
-        barcode = await generateUniqueBarcode(tx)
+        sku = await generateUniqueSku(tx, String(body.category ?? ''))
       }
 
-      const [created] = await tx.insert(s.products).values({ ...body, barcode } as never).returning()
+      const [created] = await tx.insert(s.products).values({ ...body, sku } as never).returning()
       if (openingQty > 0 && created.sku) {
         await applyStockMovement({
           sku: String(created.sku),
@@ -4262,6 +4365,7 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   } catch (err) {
     const msg = errorText(err)
     logger.error({ err }, 'product create failed')
+    if (msg.includes('SKU already exists')) return res.status(409).json({ error: msg })
     res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
   }
 })
@@ -4312,17 +4416,11 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
     // against variants of other products (the sku unique index would 500 on
     // a clash — answer with the conflicting code instead).
     const seenSku = new Set<string>()
-    const seenBarcode = new Set<string>()
     for (const v of variants) {
       const sku = v.sku.trim().toUpperCase()
-      const barcode = (v.barcode ?? '').trim()
       if (!sku) return res.status(400).json({ error: 'Every variant needs a SKU', field: 'sku' })
       if (seenSku.has(sku)) return res.status(400).json({ error: `Duplicate variant SKU: ${v.sku}`, field: 'sku' })
       seenSku.add(sku)
-      if (barcode) {
-        if (seenBarcode.has(barcode)) return res.status(400).json({ error: `Duplicate variant barcode: ${barcode}`, field: 'barcode' })
-        seenBarcode.add(barcode)
-      }
     }
     const skuList = variants.map((v) => v.sku.trim())
     const [skuClash] = await db!
@@ -4331,16 +4429,6 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       .where(and(ne(s.products.id, product.id), inArray(sql`upper(${s.products.sku})`, skuList.map((x) => x.toUpperCase()))))
       .limit(1)
     if (skuClash) return res.status(400).json({ error: `SKU ${skuClash.sku} is already used by another product`, field: 'sku' })
-    const barcodes = variants.map((v) => (v.barcode ?? '').trim()).filter(Boolean)
-    if (barcodes.length > 0) {
-      const [barClash] = await db!
-        .select({ sku: s.products.sku })
-        .from(s.products)
-        .where(and(ne(s.products.id, product.id), inArray(s.products.barcode, barcodes)))
-        .limit(1)
-      if (barClash) return res.status(400).json({ error: `Barcode is already used by product ${barClash.sku}`, field: 'barcode' })
-    }
-
     const newSum = variants.reduce((a, v) => a + Math.max(0, Math.floor(v.stock)), 0)
     const [oldAgg] = await db!
       .select({ sum: sql<number>`coalesce(sum(${s.productVariants.stock}), 0)` })
@@ -4348,26 +4436,45 @@ dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), a
       .where(eq(s.productVariants.productId, product.id))
     const oldSum = Math.floor(Number(oldAgg?.sum ?? 0))
 
+    // The barcode workflow is removed from the app, but the legacy column is
+    // still what the Shopify sync reads for existing variants. A replace-all
+    // save must not wipe it: keep each row's stored barcode, keyed by variant
+    // id first (stable across re-ordering) and by SKU as the fallback.
+    const prevVariants = await db!
+      .select({ id: s.productVariants.id, sku: s.productVariants.sku, barcode: s.productVariants.barcode })
+      .from(s.productVariants)
+      .where(eq(s.productVariants.productId, product.id))
+    const prevBarcodeById = new Map(prevVariants.map((r) => [r.id, r.barcode]))
+    const prevBarcodeBySku = new Map(
+      prevVariants.map((r) => [String(r.sku ?? '').trim().toUpperCase(), r.barcode]),
+    )
+
     await db!.transaction(async (tx) => {
       await tx.delete(s.productVariants).where(eq(s.productVariants.productId, product.id))
       if (variants.length > 0) {
         await tx.insert(s.productVariants).values(
-          variants.map((v) => ({
-            id: v.id?.trim() || randomUUID(),
-            productId: product.id,
-            title: v.title.trim(),
-            optionValues: v.optionValues,
-            sku: v.sku.trim(),
-            barcode: (v.barcode ?? '').trim() || null,
-            sellingPrice: v.sellingPrice ?? null,
-            compareAtPrice: v.compareAtPrice ?? null,
-            costPrice: v.costPrice ?? null,
-            grossWeight: v.grossWeight ?? null,
-            stock: Math.max(0, Math.floor(v.stock)),
-            reorderLevel: v.reorderLevel ?? null,
-            status: v.status ?? 'active',
-            createdAt: new Date().toISOString(),
-          })),
+          variants.map((v) => {
+            const keepBarcode =
+              (v.id?.trim() && prevBarcodeById.get(v.id.trim())) ||
+              prevBarcodeBySku.get(v.sku.trim().toUpperCase()) ||
+              null
+            return {
+              id: v.id?.trim() || randomUUID(),
+              productId: product.id,
+              title: v.title.trim(),
+              optionValues: v.optionValues,
+              sku: v.sku.trim(),
+              barcode: keepBarcode,
+              sellingPrice: v.sellingPrice ?? null,
+              compareAtPrice: v.compareAtPrice ?? null,
+              costPrice: v.costPrice ?? null,
+              grossWeight: v.grossWeight ?? null,
+              stock: Math.max(0, Math.floor(v.stock)),
+              reorderLevel: v.reorderLevel ?? null,
+              status: v.status ?? 'active',
+              createdAt: new Date().toISOString(),
+            }
+          }),
         )
       }
       await tx

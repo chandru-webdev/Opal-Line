@@ -83,6 +83,30 @@ describe('normalizeInvoiceItems (invoice line pricing)', () => {
     assert.equal(rows.length, 1)
     assert.equal(rows[0].amount, 100) // 2.5 x 40
   })
+
+  test('the managed silver rate overrides any client-supplied rate', () => {
+    // The whole point of Silver Rate Management: a stale/tampered payload
+    // carrying rate=290 must be repriced at the managed rate (300).
+    const rows = dbRoutes.normalizeInvoiceItems(
+      [{ product: 'Chain', sku: 'C9', weight: 2, silverRate: 290, makingCharge: 0 }],
+      300,
+    )
+    assert.equal(rows[0].silverRate, 300)
+    assert.equal(rows[0].amount, 600) // 2g x (300 + 0)
+  })
+
+  test('falls back to the provided rate only when no managed rate exists', () => {
+    const rows = dbRoutes.normalizeInvoiceItems([
+      { product: 'Ring', sku: 'R2', weight: 1, silverRate: 92.5, makingCharge: 0 },
+    ])
+    assert.equal(rows[0].silverRate, 92.5)
+    // A managed rate of 0 (unset) must not zero out pricing.
+    const zeroManaged = dbRoutes.normalizeInvoiceItems(
+      [{ product: 'Ring', sku: 'R3', weight: 1, silverRate: 92.5, makingCharge: 0 }],
+      0,
+    )
+    assert.equal(zeroManaged[0].silverRate, 92.5)
+  })
 })
 
 describe('quotation normalization and totals', () => {

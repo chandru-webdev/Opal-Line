@@ -156,7 +156,6 @@ export const updateInvoiceSchema = createInvoiceSchema.partial()
 export const createProductSchema = z.object({
   name: z.string().min(1, 'Product name is required').max(255),
   sku: z.string().min(1, 'SKU is required').max(100),
-  barcode: z.string().max(100).optional().or(z.literal('')),
   category: z.string().min(1, 'Category is required').max(100),
   collection: z.string().max(100).optional().or(z.literal('')),
   purity: z.number().min(0).max(100).optional(),
@@ -196,7 +195,6 @@ export const productVariantSchema = z.object({
   title: z.string().min(1, 'Variant title is required').max(255),
   optionValues: z.array(z.string().min(1).max(100)).min(1).max(3),
   sku: z.string().min(1, 'Variant SKU is required').max(100),
-  barcode: z.string().max(100).optional().or(z.literal('')),
   sellingPrice: z.number().min(0).optional(),
   compareAtPrice: z.number().min(0).optional(),
   costPrice: z.number().min(0).optional(),
