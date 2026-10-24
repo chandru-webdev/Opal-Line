@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNotNull, lt, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNotNull, lt } from 'drizzle-orm'
 import type { NextFunction, Request, Response } from 'express'
 import { randomUUID } from 'node:crypto'
 import { db } from '../db/client'
@@ -8,6 +8,7 @@ import { recordActivity } from '../activity'
 import { actorFromRequest } from '../activity'
 import { num, round2 } from './db'
 import { routeParam } from '../lib/routeParams'
+import { applyStockMovement, assertStockAvailable, InsufficientStockError } from '../stock'
 
 type Handler = (req: Request, res: Response, next: NextFunction) => unknown
 
@@ -117,11 +118,11 @@ export function normalizeQuotationItems(raw: unknown): Array<Record<string, unkn
       const item = it && typeof it === 'object' ? (it as Record<string, unknown>) : {}
       const weight = num(item.weight, 0)
       const silverRate = num(item.silverRate, 0)
-      const makingCharge = num(item.makingCharge, 0)
+      const makingChargePerGram = num(item.makingCharge, 0)
       const qty = Math.max(1, Math.floor(num(item.qty, 1)))
       const amount =
         weight > 0 && silverRate > 0
-          ? round2(weight * silverRate + makingCharge)
+          ? round2(weight * silverRate + weight * makingChargePerGram)
           : num(item.amount, 0)
       return {
         product: String(item.product ?? item.title ?? '').trim(),
@@ -129,7 +130,7 @@ export function normalizeQuotationItems(raw: unknown): Array<Record<string, unkn
         qty,
         weight,
         silverRate,
-        makingCharge,
+        makingCharge: makingChargePerGram,
         amount,
       }
     })
@@ -457,6 +458,12 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
 
       const invoiceId = crypto.randomUUID()
       await db.transaction(async (tx) => {
+        // Validate the full basket before writing the invoice: an over-request
+        // aborts here, so the quotation stays unconverted and no stock moves.
+        await assertStockAvailable(
+          tx,
+          invoiceItems.map((it) => ({ sku: String(it.sku ?? ''), qty: Number(it.qty ?? 0), name: String(it.product ?? '') })),
+        )
         await tx.insert(s.salesInvoices).values({
           id: invoiceId,
           number: invoiceNumber,
@@ -481,14 +488,19 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
         })
         for (const it of invoiceItems) {
           await tx.insert(s.salesInvoiceItems).values({ ...it, id: crypto.randomUUID(), invoiceId })
-          // Deduct stock, same rule as manual invoices (no deduction while it was only a quote)
+          // Deduct stock through the ledger, same as manual invoices — a raw
+          // column write left availability and the audit trail behind.
           const sku = String(it.sku ?? '')
           const qty = Number(it.qty ?? 0)
           if (sku && qty) {
-            await tx
-              .update(s.products)
-              .set({ stock: sql`${s.products.stock} - ${qty}` })
-              .where(eq(s.products.sku, sku))
+            await applyStockMovement({
+              sku,
+              qty: -Math.abs(Math.floor(qty)),
+              type: 'sale_out',
+              refType: 'invoice',
+              refId: invoiceId,
+              tx,
+            })
           }
         }
         await tx.update(s.quotations).set({
@@ -500,8 +512,15 @@ export function registerQuotationRoutes(router: RouteRegistrar) {
 
       res.status(201).json({ ok: true, invoiceNumber, invoiceId })
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Unknown error'
-      if (msg.includes('Insufficient stock')) { res.status(400).json({ error: msg }); return }
+      if (err instanceof InsufficientStockError) {
+        res.status(409).json({
+          error: 'Insufficient Stock',
+          code: 'INSUFFICIENT_STOCK',
+          message: err.message,
+          products: err.products,
+        })
+        return
+      }
       res.status(500).json({ error: 'Failed to convert quotation' })
     }
   })

@@ -1,4 +1,5 @@
 import { escapeHtml, numberToIndianWords } from '@/lib/utils'
+import type { Invoice } from '@/types'
 
 /**
  * Shared print-template builder — one source of truth for printable documents.
@@ -47,6 +48,54 @@ export interface PrintDesignerConfig {
   thankYouNote: string
   declaration: string
   watermark: string | null
+  /** Barcode-label only: physical label size preset (mm). */
+  labelPreset: '50x25' | '50x22' | '35x22' | '50x10' | 'custom'
+  /** Custom label width in mm (used when labelPreset === 'custom'). */
+  labelWidthMm: number
+  /** Custom label height in mm (used when labelPreset === 'custom'). */
+  labelHeightMm: number
+  /** Print the front side of the label. */
+  labelShowFront: boolean
+  /** Print the back side of the label (second sheet / duplex pass). */
+  labelShowBack: boolean
+  /** Front-side field toggles. */
+  labelFrontCompany: boolean
+  labelFrontName: boolean
+  labelFrontRate: boolean
+  /** Back-side field toggles. */
+  labelBackSku: boolean
+  labelBackBarcode: boolean
+  labelBackName: boolean
+  labelFrontSku?: boolean
+  labelBackCompany?: boolean
+  labelBackProduct?: boolean
+  labelFrontFontSizeMm?: number
+  labelFrontFontAlign?: 'left' | 'center' | 'right'
+  labelFrontTextPosition?: 'top' | 'center' | 'bottom'
+  labelBackFontSizeMm?: number
+  labelBackFontAlign?: 'left' | 'center' | 'right'
+  labelBackTextPosition?: 'top' | 'center' | 'bottom'
+  labelBorder?: boolean
+  labelBackgroundColor?: string
+  labelRadiusMm?: number
+}
+
+export const LABEL_PRESETS: Record<Exclude<PrintDesignerConfig['labelPreset'], 'custom'>, { width: number; height: number }> = {
+  '50x25': { width: 50, height: 25 },
+  '50x22': { width: 50, height: 22 },
+  '35x22': { width: 35, height: 22 },
+  '50x10': { width: 50, height: 10 },
+}
+
+/** Resolve the active label size in mm (custom values are clamped to sane bounds). */
+export function resolveLabelSize(config: PrintDesignerConfig): { width: number; height: number } {
+  if (config.labelPreset === 'custom') {
+    return {
+      width: Math.min(130, Math.max(15, Number(config.labelWidthMm) || 50)),
+      height: Math.min(60, Math.max(8, Number(config.labelHeightMm) || 25)),
+    }
+  }
+  return LABEL_PRESETS[config.labelPreset]
 }
 
 export const DEFAULT_PRINT_CONFIG: PrintDesignerConfig = {
@@ -86,6 +135,29 @@ export const DEFAULT_PRINT_CONFIG: PrintDesignerConfig = {
   declaration:
     'We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct. Goods once sold will only be exchanged as per store policy. This is a computer-generated invoice.',
   watermark: null,
+  labelPreset: '50x25',
+  labelWidthMm: 50,
+  labelHeightMm: 25,
+  labelShowFront: true,
+  labelShowBack: true,
+  labelFrontCompany: true,
+  labelFrontName: true,
+  labelFrontRate: true,
+  labelBackSku: true,
+  labelBackBarcode: true,
+  labelBackName: false,
+  labelFrontSku: true,
+  labelBackCompany: true,
+  labelBackProduct: true,
+  labelFrontFontSizeMm: 0,
+  labelFrontFontAlign: 'right',
+  labelFrontTextPosition: 'bottom',
+  labelBackFontSizeMm: 0,
+  labelBackFontAlign: 'left',
+  labelBackTextPosition: 'top',
+  labelBorder: true,
+  labelBackgroundColor: '#ffffff',
+  labelRadiusMm: 1,
 }
 
 const IMAGE_DATAURL = 'data:image/'
@@ -145,6 +217,29 @@ export function mergePrintConfig(saved: unknown): PrintDesignerConfig {
     thankYouNote: typeof s.thankYouNote === 'string' ? s.thankYouNote : d.thankYouNote,
     declaration: typeof s.declaration === 'string' ? s.declaration : d.declaration,
     watermark: typeof s.watermark === 'string' && s.watermark.trim() !== '' ? s.watermark.trim() : null,
+    labelPreset: ['50x22', '35x22', '50x10', 'custom'].includes(String(s.labelPreset)) ? (s.labelPreset as PrintDesignerConfig['labelPreset']) : '50x25',
+    labelWidthMm: num(s.labelWidthMm, 15, 130, 50),
+    labelHeightMm: num(s.labelHeightMm, 8, 60, 25),
+    labelShowFront: s.labelShowFront !== false,
+    labelShowBack: s.labelShowBack !== false,
+    labelFrontCompany: s.labelFrontCompany !== false,
+    labelFrontName: s.labelFrontName !== false,
+    labelFrontRate: s.labelFrontRate !== false,
+    labelBackSku: s.labelBackSku !== false,
+    labelBackBarcode: s.labelBackBarcode !== false,
+    labelBackName: s.labelBackName === true,
+    labelFrontSku: s.labelFrontSku !== false,
+    labelBackCompany: s.labelBackCompany !== false,
+    labelBackProduct: s.labelBackProduct !== false,
+    labelFrontFontSizeMm: num(s.labelFrontFontSizeMm, 1, 10, 0),
+    labelFrontFontAlign: ['center', 'right'].includes(String(s.labelFrontFontAlign)) ? (s.labelFrontFontAlign as 'center' | 'right') : 'right',
+    labelFrontTextPosition: ['center', 'top'].includes(String(s.labelFrontTextPosition)) ? (s.labelFrontTextPosition as 'center' | 'top') : 'bottom',
+    labelBackFontSizeMm: num(s.labelBackFontSizeMm, 1, 10, 0),
+    labelBackFontAlign: ['center', 'right'].includes(String(s.labelBackFontAlign)) ? (s.labelBackFontAlign as 'center' | 'right') : 'left',
+    labelBackTextPosition: ['center', 'bottom'].includes(String(s.labelBackTextPosition)) ? (s.labelBackTextPosition as 'center' | 'bottom') : 'top',
+    labelBorder: s.labelBorder !== false,
+    labelBackgroundColor: hex(s.labelBackgroundColor, '#ffffff'),
+    labelRadiusMm: num(s.labelRadiusMm, 0, 5, 1),
   }
 }
 
@@ -175,6 +270,60 @@ export interface PrintDoc {
   items?: Array<Record<string, unknown>>
 }
 
+/**
+ * Map a PERSISTED invoice onto the print document — the only path from an
+ * invoice to paper. The invoice screen and the printed page render the same
+ * saved values (subtotal, gst rate, gst amount, discount, grand total and the
+ * per-item snapshots); printing never recalculates business amounts.
+ *
+ * `business` lets the caller override with live Settings values (business
+ * name/GSTIN/address/phone/email), mirroring what the invoice detail screen
+ * does; `imagesBySku` supplies optional product thumbnails.
+ */
+export function invoicePrintDoc(
+  invoice: Invoice,
+  opts: { imagesBySku?: ReadonlyMap<string, string>; business?: Partial<PrintDoc> } = {},
+): PrintDoc {
+  const doc: PrintDoc = {
+    number: invoice.number,
+    shopifyOrder: invoice.shopifyOrder,
+    customer: invoice.customer,
+    customerEmail: invoice.customerEmail,
+    customerPhone: invoice.customerPhone ?? null,
+    customerAddress: invoice.customerAddress ?? null,
+    customerCity: invoice.customerCity ?? null,
+    customerState: invoice.customerState ?? null,
+    customerPincode: invoice.customerPincode ?? null,
+    businessName: invoice.businessName,
+    businessGstin: invoice.businessGstin ?? null,
+    businessAddress: invoice.businessAddress ?? null,
+    businessPhone: invoice.businessPhone ?? null,
+    businessEmail: invoice.businessEmail ?? null,
+    gst: invoice.gst,
+    gstAmount: invoice.gstAmount,
+    discount: invoice.discount,
+    subtotal: invoice.subtotal,
+    grandTotal: invoice.grandTotal,
+    paymentMethod: invoice.paymentMethod,
+    paymentStatus: invoice.paymentStatus,
+    date: invoice.date,
+    items: invoice.items.map((i) => ({
+      product: i.product,
+      sku: i.sku,
+      hsn: i.hsn,
+      qty: i.qty,
+      weight: i.weight,
+      silverRate: i.silverRate,
+      makingCharge: i.makingCharge,
+      tax: i.tax,
+      amount: i.amount,
+      image: opts.imagesBySku?.get(i.sku),
+    })),
+  }
+  if (opts.business) Object.assign(doc, opts.business)
+  return doc
+}
+
 /** Open one or more built documents in print windows (batch = one window per
  *  doc). The print chooser is shown ONCE for the whole batch, and a Cancel
  *  aborts every document — asking per-document would spam a dialog per order. */
@@ -187,7 +336,7 @@ export async function printDocuments(
 }
 
 export interface PrintDocExtras {
-  docType: 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list'
+  docType: 'invoice' | 'quotation' | 'order' | 'packing-slip' | 'pick-list' | 'barcode-label'
   /** Sub-line under the business name in the header. */
   tagline?: string
   /** Extra key/value box (e.g. "Valid Until" on quotations). */
@@ -211,6 +360,7 @@ const FONTS: Record<PrintDesignerConfig['font'], string> = {
 }
 
 const fmt = (n: number) => n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
 const fmtDate = (iso: string) => {
   try {
     return new Date(iso).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })
@@ -228,15 +378,115 @@ const lighten = (hex: string, amount: number): string => {
   return `#${mix(r)}${mix(g)}${mix(b)}`
 }
 
+interface LabelItem {
+  product: string
+  sku: string
+  barcode: string
+  rate: number
+  weight: number
+}
+
+function labelItemsFromDoc(doc: PrintDoc): LabelItem[] {
+  const raw = (doc.items ?? []) as Array<Record<string, unknown>>
+  const d = doc as any
+  const items = raw.map((i: any) => ({
+    product: String(i.product ?? i.name ?? i.description ?? d.productName ?? ''),
+    sku: String(i.sku ?? i.code ?? d.sku ?? ''),
+    barcode: String(i.barcode ?? d.barcode ?? ''),
+    rate: Number(i.sellingPrice ?? i.rate ?? i.amount ?? i.price ?? d.rate ?? 0),
+    weight: Number(i.weight ?? i.netWeight ?? 0),
+  }))
+  return items.length > 0
+    ? items
+    : [{
+        product: String(d.productName ?? '92.5 Sterling Silver Pendant'),
+        sku: String(d.sku ?? 'SL-PD-001'),
+        barcode: String(d.barcode ?? '8901234567890'),
+        rate: Number(d.rate ?? 3250),
+        weight: 2.8,
+      }]
+}
+
+/**
+ * Build an A4 sheet of barcode labels at true physical size.
+ *
+ * Every label is laid out in `mm` inside a CSS grid whose column/row count is
+ * derived from the real label dimensions, so 50×25, 50×22, 35×22, 50×10 and
+ * custom sizes all print at the exact size with no scaling. Front and back
+ * sides print as consecutive sheets so duplex printers can flip the stock.
+ */
+export function buildBarcodeLabelHtml(doc: PrintDoc, config: PrintDesignerConfig, _extras: PrintDocExtras): string {
+  const c = config
+  const { width: lw, height: lh } = resolveLabelSize(c)
+  const items = labelItemsFromDoc(doc)
+  const companyName = doc.businessName || 'OPAL LINE JEWELS LLP'
+  const fontStack = FONTS[c.font]
+  const accent2 = c.accent2
+  const radius = `${Math.max(0, (c.labelRadiusMm ?? 1))}mm`
+
+  // Font sizes derived from the physical label height so every preset fits.
+  const fsFront = (c.labelFrontFontSizeMm && c.labelFrontFontSizeMm > 0) ? c.labelFrontFontSizeMm : Math.max(2.4, Math.min(3.6, lh * 0.16))
+  const fsBack = (c.labelBackFontSizeMm && c.labelBackFontSizeMm > 0) ? c.labelBackFontSizeMm : Math.max(2.2, Math.min(3.4, lh * 0.15))
+
+  const frontLabel = (it: LabelItem) => `
+    <div class="lbl">
+      <div class="lbl-inner lbl-front">
+        ${c.labelFrontSku !== false ? `<div class="sku">${escapeHtml(it.sku || '')}</div>` : ''}
+        ${c.labelFrontRate ? `<div class="rate">₹${fmt(it.rate)}</div>` : ''}
+      </div>
+    </div>`
+
+  const backLabel = (it: LabelItem) => `
+    <div class="lbl">
+      <div class="lbl-inner lbl-back">
+        ${c.labelBackCompany !== false ? `<div class="company">${escapeHtml(companyName)}</div>` : ''}
+        ${c.labelBackProduct !== false ? `<div class="pname">${escapeHtml(it.product)}</div>` : ''}
+      </div>
+    </div>`
+
+  const sideSheet = (render: (it: LabelItem) => string) => `
+    <div class="sheet">
+      ${render(items[0])}
+    </div>`
+
+  const sheets =
+    (c.labelShowFront ? sideSheet(frontLabel) : '') +
+    (c.labelShowBack ? sideSheet(backLabel) : '')
+
+  return `<!doctype html><html><head><title>Barcode Labels</title><style>
+      @page{margin:0;}
+      *{margin:0;padding:0;box-sizing:border-box;}
+      body{font-family:${fontStack};color:#232733;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;margin:0;padding:0;}
+      .sheet{width:${lw}mm;height:${lh}mm;padding:0;margin:0;page-break-after:avoid;display:flex;align-items:flex-start;justify-content:flex-start;}
+      .sheet:last-child{page-break-after:avoid;}
+      .lbl{width:${lw}mm;height:${lh}mm;${c.labelBorder !== false ? `border:0.15mm solid #00000055;` : 'border:none;'}border-radius:${radius};overflow:hidden;background:${c.labelBackgroundColor || '#ffffff'};flex:none;box-sizing:border-box;margin:0;}
+      .lbl-inner{width:100%;height:100%;display:flex;flex-direction:column;gap:0.3mm;box-sizing:border-box;padding:0.4mm 0.5mm;justify-content:center;align-items:center;}
+      .lbl-front{justify-content:center;align-items:center;}
+      .lbl-back{justify-content:center;align-items:center;}
+      .sku{font-size:${fsFront}mm;font-weight:800;color:${accent2};letter-spacing:.01em;text-align:center;line-height:1.1;word-break:break-word;}
+      .rate{font-size:${fsFront}mm;font-weight:900;color:${accent2};text-align:center;line-height:1.1;}
+      .company{font-size:${fsBack}mm;font-weight:800;color:${accent2};white-space:normal;overflow:visible;text-overflow:clip;letter-spacing:.01em;text-align:center;line-height:1.08;word-break:break-word;}
+      .pname{font-size:${fsBack}mm;font-weight:700;color:#1f2937;line-height:1.05;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;text-align:center;word-break:break-word;}
+      @media print{body{background:#fff;margin:0;padding:0;} .sheet{padding:0;margin:0;} .lbl{border-color:#000;}}
+      @media screen{body{display:flex;flex-wrap:wrap;gap:4mm;justify-content:center;align-items:flex-start;padding:6mm;background:#eef0f4;} .sheet{margin:0;}}
+    </style></head><body>${sheets}</body></html>`
+
+}
+
 /**
  * Build the complete printable HTML document (A4/Letter, print-CSS ready).
  * The returned string is opened in a print window or embedded in an iframe.
  */
 export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extras: PrintDocExtras): string {
+  if (extras.docType === 'barcode-label') return buildBarcodeLabelHtml(doc, config, extras)
   const c = config
   const items = doc.items ?? []
   const gstRate = Number(doc.gst) || 0
-  const taxable = Math.max(0, Number(doc.subtotal) - Number(doc.discount))
+  // GST is charged on the subtotal (the sum of the printed line amounts), so
+  // the printed "Taxable Value" IS the subtotal — the discount gets its own
+  // row further down and must not be subtracted twice. With this base the
+  // printed rows add up to the persisted grand total (subtotal + GST − discount).
+  const taxable = Math.max(0, Number(doc.subtotal) || 0)
   const totalTax = Number(doc.gstAmount) || 0
   const halfTax = Math.round((totalTax / 2) * 100) / 100
   const hsnCodes = [...new Set(items.map((i) => String(i.hsn ?? '')).filter(Boolean))]
@@ -296,20 +546,27 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     `<th>Product</th><th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '')
 
+  // 0 in the rate/making/tax snapshot columns means "unknown" (order-raised
+  // items carry no rate or making snapshot) — dash it exactly like the
+  // invoice screen does, instead of printing a misleading ₹0.00 / 0%.
+  // `tax` holds a MONEY amount (the per-line GST), never a percentage.
+  const money = (v: unknown) => (Number(v) > 0 ? `₹${fmt(Number(v))}` : '—')
+
   const itemRows = items
     .map((i, idx) => {
       const imgSrc = typeof i.image === 'string' && i.image ? i.image : ''
       const imgCell = extras.showImages && imgSrc
         ? `<td style="padding:6px 8px;${cellBorder}width:56px;"><img src="${escapeHtml(imgSrc)}" alt="" style="width:48px;height:48px;object-fit:cover;border-radius:4px;border:1px solid #e5e7eb;" onerror="this.style.display='none'"/></td>`
         : ''
+      const lineMakingValue = (Number(i.weight) || 0) * (Number(i.makingCharge) || 0)
       return `<tr style="${zebra(idx)}">
           ${imgCell}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;">${escapeHtml(String(i.product ?? ''))}<br/><span style="color:#8a8fa3;font-size:9px;">${escapeHtml(String(i.sku ?? ''))}</span></td>
           ${c.showHsn ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:center;">${escapeHtml(String(i.hsn ?? hsnDisplay))}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.qty) || 0}</td>
           ${c.showWeight ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${(Number(i.weight) || 0).toFixed(2)}</td>` : ''}
-          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.silverRate) || 0)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">₹${fmt(Number(i.makingCharge) || 0)}</td>` : ''}
-          ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${Number(i.tax) || 0}%</td>` : ''}
+          ${c.showRate ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.silverRate)}</td><td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(lineMakingValue)}</td>` : ''}
+          ${c.showTax ? `<td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;">${money(i.tax)}</td>` : ''}
           <td style="padding:9px 10px;${cellBorder}font-size:11px;text-align:right;font-weight:600;">₹${fmt(Number(i.amount) || 0)}</td>
         </tr>`
     })
@@ -321,7 +578,7 @@ export function buildPrintHtml(doc: PrintDoc, config: PrintDesignerConfig, extra
     (c.showHsn ? `<th style="text-align:center;">HSN</th>` : '') +
     `<th style="text-align:right;">Qty</th>` +
     (c.showWeight ? `<th style="text-align:right;">Weight (g)</th>` : '') +
-    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making (₹)</th>` : '') +
+    (c.showRate ? `<th style="text-align:right;">Rate (₹/g)</th><th style="text-align:right;">Making Value (₹)</th>` : '') +
     (c.showTax ? `<th style="text-align:right;">GST</th>` : '') +
     `<th style="text-align:right;">Amount (₹)</th>`
   const footSpans =

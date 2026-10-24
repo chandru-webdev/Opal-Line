@@ -83,3 +83,12 @@ backend/pgsql/
 .pre-scrub-backup.bundle
 refs-before-scrub.txt
 rules.txt
+
+# Scratch / debug dumps (merge snapshots, check output, tsc logs) — local only
+/_*
+_tsc_*.txt
+
+# Stray media dropped at the repo root (label-test exports, photos)
+/*.jpg
+/*.jpeg
+/*.png

@@ -53,8 +53,8 @@
  * honored without touching the file).
  */
 import { execFileSync, execSync, spawnSync } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { join, dirname, resolve, sep } from 'node:path'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -85,6 +85,27 @@ const PGDATA = join(APP_DATA, 'pgdata')
 const DATA_DIR = join(APP_DATA, 'data')
 const LOG_DIR = join(APP_DATA, 'logs')
 const PG_PASSWORD_FILE = join(APP_DATA, '.pg-password')
+
+/** The installed desktop app's cluster directory — dev must NEVER touch it. */
+function desktopPgDataDir() {
+  return join(appDataDir(), 'pgdata')
+}
+
+/**
+ * Safety net: the dev cluster must live in its own folder. If a future edit
+ * ever pointed PGDATA at the installed desktop app's cluster, refuse to run
+ * rather than start/migrate/overwrite the user's live database.
+ */
+function assertDevDataDirSeparate(pgData = PGDATA) {
+  const dev = resolve(pgData).toLowerCase()
+  const desktop = resolve(desktopPgDataDir()).toLowerCase()
+  if (dev === desktop || dev.startsWith(desktop + sep) || desktop.startsWith(dev + sep)) {
+    throw new Error(
+      `refusing to use the desktop app's data directory for dev: ${pgData}\n` +
+      `    The dev cluster must stay in ${join(appDataDir('Opal Line Billing Dev'), 'pgdata')}.`,
+    )
+  }
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -167,26 +188,164 @@ async function tcpOpen(host, port, ms = 3000) {
   })
 }
 
-/** Locate the PostgreSQL binaries: portable checkout → system → PATH. */
-function findPgBinDir() {
-  const candidates = [join(ROOT, 'backend', 'pgsql', 'bin')]
-  if (process.platform === 'win32') {
-    for (const v of ['17', '16', '15']) {
-      candidates.push(`C:\\Program Files\\PostgreSQL\\${v}\\bin`)
+// ── PostgreSQL discovery ──────────────────────────────────
+// Supported majors (documented 15+), newest first so a machine with several
+// installs prefers the newest when there is no cluster yet.
+const PG_SUPPORTED_MAJORS = [18, 17, 16, 15]
+
+/** `18` from "pg_ctl (PostgreSQL) 18.4", else null. */
+function parsePgMajor(text) {
+  const m = /PostgreSQL\)?\s*(\d+)(?:\.\d+)?/.exec(text ?? '')
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
+/** Major recorded in a cluster's PG_VERSION, or null when it is absent. */
+function readDataDirMajor(dir) {
+  try {
+    const n = Number.parseInt(readFileSync(join(dir, 'PG_VERSION'), 'utf8').trim(), 10)
+    return Number.isInteger(n) && n > 0 ? n : null
+  } catch { return null }
+}
+
+/** Major a pg_ctl binary reports, or null when it cannot be run. */
+function readPgCtlMajor(pgCtl) {
+  try {
+    return parsePgMajor(execFileSync(pgCtl, ['--version'], {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+    }))
+  } catch { return null }
+}
+
+/**
+ * Installed system PostgreSQL `bin` dirs under `<root>\PostgreSQL\<major>\bin`,
+ * newest first. The folder is scanned rather than a hardcoded 15-17 list so a
+ * PostgreSQL 18 install (C:\Program Files\PostgreSQL\18\bin — the only install
+ * on the machines where `npm run dev` said "No PostgreSQL found") is found.
+ */
+function systemPgBinDirs(programFiles) {
+  const roots = programFiles
+    ? [programFiles]
+    : process.platform === 'win32'
+      ? [
+          process.env.ProgramFiles,
+          process.env['ProgramFiles(x86)'],
+          'C:\Program Files',
+          'C:\Program Files (x86)',
+        ].filter(Boolean)
+      : []
+  const found = new Map()
+  for (const root of new Set(roots)) {
+    let entries = []
+    try { entries = readdirSync(join(root, 'PostgreSQL')) } catch { continue }
+    for (const name of entries) {
+      if (!/^\d+$/.test(name)) continue
+      const bin = join(root, 'PostgreSQL', name, 'bin')
+      if (!existsSync(join(bin, `pg_ctl${EXE}`))) continue
+      const major = Number(name)
+      if (!found.has(major)) found.set(major, bin)
     }
   }
-  for (const dir of candidates) {
-    if (existsSync(join(dir, `pg_ctl${EXE}`))) return dir
-  }
+  return [...found.entries()].map(([major, bin]) => ({ major, bin })).sort((a, b) => b.major - a.major)
+}
+
+
+
+/** pg_ctl found on PATH, or null. */
+function pgBinOnPath() {
   try {
     const out = execSync(
       process.platform === 'win32' ? 'where pg_ctl' : 'command -v pg_ctl',
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, windowsHide: true },
     )
     const found = out.split(/\r?\n/).map((s) => s.trim()).find(Boolean)
-    if (found && existsSync(found)) return dirname(found)
+    if (found && existsSync(found)) return { dir: dirname(found), major: readPgCtlMajor(found), source: 'path' }
   } catch { /* not on PATH */ }
   return null
+}
+
+/**
+ * Every PostgreSQL `bin` dir on this machine, best first: the portable
+ * checkout, then system installs newest→oldest, then PATH. Each entry carries
+ * the major its binary reports so callers can match an existing cluster.
+ */
+function findPgBinCandidates() {
+  const out = []
+  const portable = join(ROOT, 'backend', 'pgsql', 'bin')
+  if (existsSync(join(portable, `pg_ctl${EXE}`))) {
+    out.push({ dir: portable, major: readPgCtlMajor(join(portable, `pg_ctl${EXE}`)), source: 'portable' })
+  }
+  for (const s of systemPgBinDirs()) out.push({ dir: s.bin, major: s.major, source: 'system' })
+  const onPath = pgBinOnPath()
+  if (onPath) out.push(onPath)
+  return out
+}
+
+/**
+ * Pure selection over a candidate list (newest-first ordering is the caller's
+ * job for `findPgBinCandidates`). With `requiredMajor` only an exact match may
+ * be returned — a mismatched major can never open an existing cluster.
+ */
+function pickPgBinDir(candidates, requiredMajor = null) {
+  if (requiredMajor != null) return candidates.find((c) => c.major === requiredMajor) ?? null
+  return candidates[0] ?? null
+}
+
+/**
+ * Pick the binaries to run the dev cluster with.
+ *
+ *   - `requiredMajor` set (cluster already exists): only a matching major may
+ *     open it — PostgreSQL refuses a mismatched data directory.
+ *   - No cluster yet: portable first, else the newest system install.
+ * Returns null when nothing suitable exists.
+ */
+function selectPgBinDir(requiredMajor = null) {
+  return pickPgBinDir(findPgBinCandidates(), requiredMajor)
+}
+
+/** Where PostgreSQL was looked for — shown when discovery fails. */
+function pgSearchSummary() {
+  const portable = join(ROOT, 'backend', 'pgsql', 'bin')
+  const lines = [`portable: ${portable} (${existsSync(join(portable, `pg_ctl${EXE}`)) ? 'found' : 'missing'})`]
+  if (process.platform === 'win32') {
+    const sys = systemPgBinDirs()
+    lines.push(sys.length
+      ? `system: ${sys.map((s) => `${s.bin} (v${s.major})`).join(', ')}`
+      : 'system: none under Program Files\\PostgreSQL')
+  }
+  const path = pgBinOnPath()
+  lines.push(`PATH: ${path ? `${path.dir} (v${path.major ?? '?'})` : 'pg_ctl not found'}`)
+  return lines.map((l) => '      ' + l).join('\n')
+}
+
+/** Process name listening on a TCP port, or null when unknown. */
+function listenerNameOnPort(port) {
+  if (process.platform !== 'win32') return null
+  try {
+    const out = execSync(`netstat -ano | findstr :${port} | findstr LISTENING`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, shell: 'cmd.exe', windowsHide: true })
+    const line = out.split(/\r?\n/).map((s) => s.trim()).find(Boolean)
+    if (!line) return null
+    const pid = line.split(/\s+/).pop()
+    const tl = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, shell: 'cmd.exe', windowsHide: true })
+    const first = tl.split(/\r?\n/).find((l) => l.trim().startsWith('"'))
+    return first ? first.split('","')[0].replace(/^"/, '') : null
+  } catch { return null }
+}
+
+/** Last useful lines of a PostgreSQL log (FATAL/ERROR first) for diagnostics. */
+function logDiagnostics(file, max = 8) {
+  try {
+    const lines = readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .map((l) => l.trimEnd())
+      .filter((l) => l.trim().length > 0)
+    if (!lines.length) return ''
+    const fatal = lines.filter((l) => /\b(FATAL|PANIC|ERROR):/.test(l)).slice(-max)
+    return (fatal.length ? fatal : lines.slice(-max)).join('\n      ')
+  } catch { return '' }
 }
 
 function pgPassword() {
@@ -215,45 +374,60 @@ async function startPostgres(pgCtl) {
   mkdirSync(LOG_DIR, { recursive: true })
   const pgctlLog = join(LOG_DIR, 'pgctl.log')
   const serverLog = join(LOG_DIR, 'postgres.log')
-  const portOpen = () => tcpOpen('127.0.0.1', PG_PORT, 1500)
 
+  // Already listening on the dev port? Reuse it only when it really is
+  // PostgreSQL; a stray process must be reported, not silently accepted.
+  if (await tcpOpen('127.0.0.1', PG_PORT)) {
+    const holder = listenerNameOnPort(PG_PORT)
+    if (holder && !/^postgres(?:\.exe)?$/i.test(holder)) {
+      throw new Error(
+        `Port ${PG_PORT} is already in use by "${holder}" (not PostgreSQL).\n` +
+        `    Stop that program, or point DATABASE_URL in backend/.env at another server.`,
+      )
+    }
+    return // our own cluster is already up
+  }
+
+  let lastFailure = null
   for (let attempt = 1; attempt <= 3; attempt++) {
-    if (await portOpen()) return
     const fd = openSync(pgctlLog, 'a')
-    let spawnOk = false
+    let started = false
     try {
       execFileSync(pgCtl, [
         '-D', PGDATA,
         '-o', `-p ${PG_PORT}`,
         '-l', serverLog,
         'start', '-w', '-t', '15',
-      ], { stdio: ['ignore', fd, fd], timeout: 45000, windowsHide: true })
-      spawnOk = true
+      ], { stdio: ['ignore', fd, fd], timeout: 30000, windowsHide: true })
+      started = true
     } catch (err) {
+      lastFailure = err
       // Clear stale pid/crash state before retrying.
       try {
         execFileSync(pgCtl, ['-D', PGDATA, 'stop', '-m', 'immediate'],
           { stdio: 'ignore', timeout: 5000, windowsHide: true })
       } catch { /* not running — expected */ }
-      if (attempt === 3) {
-        throw new Error(
-          `pg_ctl start failed after 3 attempts: ${err.message}\n` +
-          `    See ${serverLog} and ${pgctlLog}`,
-        )
-      }
     } finally {
       closeSync(fd)
     }
-    if (spawnOk) {
+
+    if (started) {
       for (let i = 0; i < 20; i++) {
-        if (await portOpen()) return
+        if (await tcpOpen('127.0.0.1', PG_PORT)) return
         await sleep(250)
       }
     }
     if (attempt < 3) await sleep(1500)
   }
-  if (await portOpen()) return
-  throw new Error(`PostgreSQL is not listening on 127.0.0.1:${PG_PORT} — see ${join(LOG_DIR, 'postgres.log')}`)
+
+  const diag = logDiagnostics(serverLog) || logDiagnostics(pgctlLog)
+  throw new Error(
+    `PostgreSQL failed to start after 3 attempts` +
+    (lastFailure ? `: ${lastFailure.message}` : ' (pg_ctl returned but nothing is listening)') + '\n' +
+    (diag ? `    Server reported:\n      ${diag}\n` : '    The server left no error in its log.\n') +
+    `    Data directory: ${PGDATA}\n` +
+    `    Logs: ${serverLog} and ${pgctlLog}`,
+  )
 }
 
 /** Real connection check with the backend's own driver (postgres.js). */
@@ -405,22 +579,45 @@ async function ensurePortablePostgresOnce() {
 }
 
 async function provisionDatabase() {
-  let binDir = findPgBinDir()
-  if (!binDir && (await ensurePortablePostgresOnce())) {
-    binDir = findPgBinDir()
+  // Guard first: never point dev at the installed desktop app's cluster.
+  assertDevDataDirSeparate()
+
+  // Match the binaries to the cluster's major (set when it already exists).
+  // A mismatch can never start: PostgreSQL refuses a data dir from another
+  // major, and an older binary rejects newer-only config (PG 18 writes
+  // autovacuum_worker_slots, which PG 16/17 refuse with a FATAL config error).
+  const requiredMajor = readDataDirMajor(PGDATA)
+  let chosen = selectPgBinDir(requiredMajor)
+  if (!chosen && (await ensurePortablePostgresOnce())) {
+    chosen = selectPgBinDir(requiredMajor)
   }
-  if (!binDir) {
+
+  if (!chosen) {
+    const available = [...new Set(findPgBinCandidates().map((c) => c.major).filter(Boolean))].sort((a, b) => b - a)
+    if (requiredMajor != null) {
+      die(
+        `The dev cluster at ${PGDATA} was created by PostgreSQL ${requiredMajor}, but no PostgreSQL ` +
+        `${requiredMajor} binaries were found — starting it with another major would fail.\n` +
+        `    Found: ${available.length ? available.map((m) => 'PostgreSQL ' + m).join(', ') : 'nothing'}\n` +
+        `    Install PostgreSQL ${requiredMajor} (https://www.postgresql.org/download/windows/)\n` +
+        `    and re-run npm run dev. Looked in:\n${pgSearchSummary()}`,
+      )
+    }
     die(
       'No PostgreSQL found.\n' +
-      '    Install PostgreSQL 15+ (https://www.postgresql.org/download/), or put the\n' +
+      '    Install PostgreSQL 15+ (https://www.postgresql.org/download/windows/), or put the\n' +
       '    portable server in backend/pgsql/bin, or set DATABASE_URL in backend/.env,\n' +
-      '    then re-run npm run dev.' +
+      '    then re-run npm run dev. Looked in:\n' +
+      pgSearchSummary() +
       (process.platform === 'win32'
         ? '\n    (If the automatic portable-server download just failed, check the internet\n     connection and re-run npm run dev.)'
         : ''),
     )
   }
+
+  const binDir = chosen.dir
   const bin = (name) => join(binDir, `${name}${EXE}`)
+  if (chosen.major) console.log(`[dev] Using PostgreSQL ${chosen.major} (${chosen.source}) at ${binDir}`)
 
   for (const d of [APP_DATA, DATA_DIR, LOG_DIR]) mkdirSync(d, { recursive: true })
 
@@ -487,8 +684,17 @@ async function main() {
       }
       // Our own line: never die on the URL this script wrote. If the cluster
       // is up, use it as-is; if not (reboot / stopped session), fall through
-      // so provisionDatabase() starts it again.
+      // so provisionDatabase() starts it again. A non-PostgreSQL process on
+      // the dev port is a real conflict and must be reported, not reused.
       if (await tcpOpen('127.0.0.1', PG_PORT)) {
+        const holder = listenerNameOnPort(PG_PORT)
+        if (holder && !/^postgres(?:\.exe)?$/i.test(holder)) {
+          die(
+            `Port ${PG_PORT} is already in use by "${holder}" (not PostgreSQL).\n` +
+            '    Stop that program, or point DATABASE_URL in backend/.env at another\n' +
+            '    server, then re-run npm run dev.',
+          )
+        }
         console.log(`[dev] Using DATABASE_URL from backend/.env (127.0.0.1:${PG_PORT})`)
         return
       }
@@ -511,7 +717,13 @@ async function main() {
 }
 
 // Small self-check used by scripts/dev.test.mjs — keeps the file import-safe.
-export { envFileValue, upsertEnvValue, parseDbUrl, appDataDir, isLegacySharedDbUrl, isOwnDevDbUrl }
+export {
+  envFileValue, upsertEnvValue, parseDbUrl, appDataDir, isLegacySharedDbUrl, isOwnDevDbUrl,
+  // PostgreSQL discovery / version matching (regression-tested):
+  PG_PORT, DB_NAME, PGDATA, DATA_DIR, LOG_DIR, APP_DATA, PG_SUPPORTED_MAJORS,
+  parsePgMajor, readDataDirMajor, systemPgBinDirs, findPgBinCandidates, selectPgBinDir, pickPgBinDir,
+  logDiagnostics, desktopPgDataDir, assertDevDataDirSeparate,
+}
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err) => die(err?.message ?? String(err)))

@@ -1,15 +1,27 @@
 import { randomUUID } from 'node:crypto'
 import { Router, type Request, type Response, json as expressJson } from 'express'
 import argon2 from 'argon2'
-import { desc, eq, ilike, inArray, ne, or, sql, and, gte, lte } from 'drizzle-orm'
+import { desc, eq, ilike, inArray, or, sql, and, gte, lte, ne, isNull, isNotNull } from 'drizzle-orm'
 import { db, schema, checkDbHealth } from '../db/client'
-import { DEFAULT_LOCATION_ID, applyStockMovement,  ensureDefaultLocation, resolveMovementLocation } from '../stock'
+import {
+  barcodeFormatError,
+  duplicateBarcodeMessage,
+  duplicateScanMessage,
+  inactiveProductMessage,
+  makeBarcode,
+  newBarcodeSeed,
+  normalizeBarcode,
+  normalizeScanCode,
+  scanCodeError,
+} from '../barcode'
+import { DEFAULT_LOCATION_ID, applyStockMovement,  assertStockAvailable, ensureDefaultLocation, InsufficientStockError, resolveMovementLocation } from '../stock'
 import { computeUserPermissions, isSuperAdminUser, requirePermission, roleGrantsAnyModule } from '../rbac'
 import {
   validate,
   recoveryPasswordSchema,
   normalizeGstin,
   normalizeEmail,
+  saveProductVariantsSchema,
   validateSupplierInput,
 } from '../validation'
 import { clearRecoveryPassword, getRecoveryPasswordSource, isRecoveryRole, RECOVERY_PASSWORD_HASH_KEY, RECOVERY_PASSWORD_KEY, setRecoveryPassword } from '../recoveryPassword'
@@ -19,8 +31,9 @@ import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
 import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
 import { upsertEnvVar } from '../lib/envfile'
 import { logger } from '../logger'
+import { invoiceTotals } from '../invoiceTotals'
 import { buildStockCountRows, stockCountDelta, stockAtLocation } from '../stockCount'
-import { pushInventoryToShopify } from '../shopify'
+import { pushInventoryToShopify, getLatestSilverRate } from '../shopify'
 import { escapeHtml } from '../htmlEscape'
 import { routeParam } from '../lib/routeParams'
 
@@ -41,6 +54,20 @@ function columnsOf(table: any): string[] {
   return Object.keys(cols)
 }
 
+/**
+ * Full text of an error, including the wrapped driver cause. Drizzle wraps the
+ * underlying Postgres error in a DrizzleQueryError whose own `message` is just
+ * "Failed query: ...", so a unique-violation check that only reads `message`
+ * would miss the driver's "duplicate key value violates unique constraint".
+ */
+function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return typeof err === 'string' ? err : 'Unknown error'
+  const cause = (err as { cause?: unknown }).cause
+  const causeText =
+    cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : ''
+  return `${err.message} ${causeText}`.trim()
+}
+
 function sanitize(body: Record<string, unknown>, table: any): Record<string, unknown> {
   const allowed = new Set(columnsOf(table))
   const out: Record<string, unknown> = {}
@@ -59,6 +86,28 @@ function sanitize(body: Record<string, unknown>, table: any): Record<string, unk
     }
     clampRule('lockoutThreshold', 1, 50)
     clampRule('lockoutDurationMinutes', 1, 1440)
+    // Settings → Product codes: normalise rather than reject, so a scripted
+    // PUT can never store a format template without {SEQ} (which would mint
+    // identical SKUs forever) or a non-digit barcode prefix. Mirrors
+    // normalizedCodeSettings in src/lib/productCodes.ts.
+    if (out.skuPrefix !== undefined) out.skuPrefix = String(out.skuPrefix ?? '').trim().toUpperCase().slice(0, 12) || null
+    if (out.skuSuffix !== undefined) out.skuSuffix = String(out.skuSuffix ?? '').trim().toUpperCase().slice(0, 12) || null
+    if (out.skuFormat !== undefined) {
+      const fmt = String(out.skuFormat ?? '').trim().slice(0, 80)
+      out.skuFormat = fmt.includes('{SEQ}') ? fmt : null
+    }
+    if (out.skuSeqLength !== undefined && out.skuSeqLength !== null) {
+      const n = Number(out.skuSeqLength)
+      if (!Number.isFinite(n)) throw new Error('skuSeqLength must be a number')
+      out.skuSeqLength = Math.min(8, Math.max(1, Math.round(n)))
+    } else if (out.skuSeqLength === null) {
+      // NULL means "back to the shipped default" — never clamp it to 1.
+      out.skuSeqLength = null
+    }
+    if (out.barcodePrefix !== undefined) {
+      const digits = String(out.barcodePrefix ?? '').replace(/\D/g, '').slice(0, 11)
+      out.barcodePrefix = digits || null
+    }
   }
   // Stock/price floors: the transactional order/invoice paths guard stock with
   // row locks, but direct product writes must never push stock or prices negative.
@@ -221,7 +270,10 @@ function orderedColumn(orderCol: any): any {
   if (!orderCol) return undefined
   if (orderCol.direction) return orderCol
   const colName = String(orderCol.name ?? '')
-  return /(date|time|timestamp|created|updated|_at)$/i.test(colName) ? desc(orderCol) : orderCol
+  // NULLS LAST: Postgres defaults DESC to NULLS FIRST, which floats rows
+  // with no date to the top of the list (every legacy row above the newest
+  // data). drizzle 0.45 has no descNullsLast helper, so spell it out.
+  return /(date|time|timestamp|created|updated|_at)$/i.test(colName) ? sql`${orderCol} DESC NULLS LAST` : orderCol
 }
 
 async function paginate(table: any, query: any, orderCol: any, req: Request) {
@@ -264,65 +316,318 @@ const oneOf = (table: any, idCol: any) =>
 
 const s = schema
 
-dbRouter.get('/products', listOf(s.products, s.products.name))
+// Newest products first: orderedColumn descends *_at columns automatically,
+// so the list opens on the latest creations (column headers still re-sort).
+dbRouter.get('/products', listOf(s.products, s.products.createdAt))
+
+// ─── Barcode identity helpers ──────────────────────────────────────
+// Generation is only ever applied to products that have NO barcode, so an
+// existing (legacy or manual) value is never silently replaced. Uniqueness is
+// enforced here with a transaction-scoped advisory lock, which serialises two
+// concurrent writers on the same code without needing the optional DB index.
+
+async function generateUniqueBarcode(tx: any): Promise<string> {
+  for (let i = 0; i < 25; i++) {
+    const candidate = makeBarcode(newBarcodeSeed())
+    const [dup] = await tx.select({ id: s.products.id }).from(s.products).where(eq(s.products.barcode, candidate)).limit(1)
+    if (!dup) return candidate
+  }
+  throw new Error('Could not generate a unique barcode — please try again')
+}
+
+const missingBarcode = () => or(isNull(s.products.barcode), eq(s.products.barcode, ''))
 
 // Barcode / QR Code labels (must be before /products/:id to avoid param capture)
-dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), (_req, res) => {
-  const { LABEL_PRESETS } = require('../barcodeLabels')
-  res.json(Object.entries(LABEL_PRESETS).map(([key, val]) => ({ key, ...(val as any) })))
+dbRouter.get('/products/labels/presets', requirePermission('inventory', 'view'), async (_req, res) => {
+  const { LABEL_PRESET_LIST } = await import('../barcodeLabels')
+  res.json(LABEL_PRESET_LIST)
 })
+
+// Parses optional custom label geometry from query/body. Values are clamped to
+// sane physical ranges so a bad request can never produce a broken PDF.
+function labelSizeOverride(src: Record<string, unknown>): Partial<{
+  width: number
+  height: number
+  columns: number
+  rows: number
+  margin: number
+  gap: number
+}> {
+  const num = (v: unknown, min: number, max: number): number | undefined => {
+    const n = Number(v)
+    if (!Number.isFinite(n)) return undefined
+    return Math.min(Math.max(n, min), max)
+  }
+  const out: ReturnType<typeof labelSizeOverride> = {}
+  const width = num(src.w ?? src.width, 10, 150)
+  const height = num(src.h ?? src.height, 5, 150)
+  const columns = num(src.cols ?? src.columns, 1, 12)
+  const rows = num(src.rows, 1, 60)
+  const margin = num(src.margin, 0, 40)
+  const gap = num(src.gap, 0, 20)
+  if (width !== undefined) out.width = width
+  if (height !== undefined) out.height = height
+  if (columns !== undefined) out.columns = Math.floor(columns)
+  if (rows !== undefined) out.rows = Math.floor(rows)
+  if (margin !== undefined) out.margin = margin
+  if (gap !== undefined) out.gap = gap
+  return out
+}
+
+async function labelRequestOptions(source: Record<string, unknown>) {
+  const { resolveLabelPreset } = await import('../barcodeLabels')
+  const preset = String(source.preset || '')
+  const copiesRaw = source.copies
+  const opts = resolveLabelPreset(preset, {
+    showPrice: source.price !== 'false' && source.showPrice !== false,
+    showWeight: source.weight !== 'false' && source.showWeight !== false,
+    showQR: source.qr !== 'false' && source.showQR !== false,
+    showBrand: source.brand !== 'false' && source.showBrand !== false,
+    copies: copiesRaw == null ? 1 : Number(copiesRaw),
+  })
+  const brand = source.brandName
+  if (typeof brand === 'string' && brand.trim()) opts.brand = brand.trim()
+  return opts
+}
+
+function unknownLabelPresetMessage(error: unknown): string | null {
+  return error instanceof Error && error.message.startsWith('Unknown label preset:')
+    ? error.message
+    : null
+}
 
 dbRouter.get('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
-    const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
-    const preset = String(req.query.preset || 'zlabel-50x30')
-    const showPrice = req.query.price !== 'false'
-    const showWeight = req.query.weight !== 'false'
-    const showQR = req.query.qr !== 'false'
+    const { fetchAllProductLabels, fetchProductLabels, generateLabelsPDF } = await import('../barcodeLabels')
     // Optional `ids` query (comma-separated product IDs) → labels for selected products only
     const idsParam = String(req.query.ids ?? '').split(',').map((x) => x.trim()).filter(Boolean)
     const products = idsParam.length > 0 ? await fetchProductLabels(idsParam) : await fetchAllProductLabels()
     if (products.length === 0) return res.status(404).json({ error: 'No products found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
-    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    const baseOpts = await labelRequestOptions(req.query as Record<string, unknown>)
+    const sizeOpts = labelSizeOverride(req.query as Record<string, unknown>)
+    const pdf = await generateLabelsPDF(products, { ...baseOpts, ...sizeOpts })
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
     res.send(pdf)
-  } catch {
+  } catch (err) {
+    logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
 
 dbRouter.post('/products/labels', requirePermission('inventory', 'view'), async (req, res) => {
   try {
-    const { fetchProductLabels, generateLabelsPDF, LABEL_PRESETS } = await import('../barcodeLabels')
-    const ids: string[] = req.body?.productIds ?? []
-    const preset = String(req.body?.preset || 'zlabel-50x30')
-    const showPrice = req.body?.showPrice !== false
-    const showWeight = req.body?.showWeight !== false
-    const showQR = req.body?.showQR !== false
+    const { fetchProductLabels, generateLabelsPDF } = await import('../barcodeLabels')
+    const ids: string[] = Array.isArray(req.body?.productIds) ? req.body.productIds : []
     if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
     const products = await fetchProductLabels(ids)
     if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
-    const opts = LABEL_PRESETS[preset] ?? {}
-    const pdf = await generateLabelsPDF(products, { ...opts, showPrice, showWeight, showQR, businessName: 'Opal Line' })
+    const baseOpts = await labelRequestOptions(req.body ?? {})
+    const sizeOpts = labelSizeOverride((req.body ?? {}) as Record<string, unknown>)
+    const pdf = await generateLabelsPDF(products, { ...baseOpts, ...sizeOpts })
     if (!pdf) return res.status(500).json({ error: 'Label generation failed' })
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.pdf"`)
     res.send(pdf)
-  } catch {
+  } catch (err) {
+    logger.error({ err }, 'label PDF generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
     res.status(500).json({ error: 'Label generation failed' })
   }
 })
 
-// Scan-based stock count: look up a product by barcode or exact SKU (for scanner guns)
+// Raw ZPL output for a ZPL-capable label printer / print server. Returns text
+// only — it is never written to a raw socket from the server.
+dbRouter.post('/products/labels/zpl', requirePermission('inventory', 'view'), async (req, res) => {
+  try {
+    const { fetchProductLabels } = await import('../barcodeLabels')
+    const { renderZpl, zplOptionsForPreset } = await import('../zpl')
+    const ids: string[] = Array.isArray(req.body?.productIds) ? req.body.productIds : []
+    if (ids.length === 0) return res.status(400).json({ error: 'productIds is required' })
+    const products = await fetchProductLabels(ids)
+    if (products.length === 0) return res.status(404).json({ error: 'Products not found' })
+    const symbology = req.body?.format === 'code128' ? 'code128' : 'qr'
+    const brandName = typeof req.body?.brandName === 'string' ? req.body.brandName.trim() : ''
+    const opts = zplOptionsForPreset(String(req.body?.preset || ''), {
+      copies: req.body?.copies == null ? 1 : Number(req.body.copies),
+      symbology,
+      showPrice: req.body?.showPrice !== false,
+      showWeight: req.body?.showWeight !== false,
+      showQR: req.body?.showQR !== false && req.body?.qr !== 'false',
+      showBrand: req.body?.showBrand !== false,
+      ...(brandName ? { brand: brandName } : {}),
+    })
+    const zpl = renderZpl(products, opts)
+    if (!zpl) return res.status(400).json({ error: 'Invalid label dimensions' })
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="product-labels-${Date.now()}.zpl"`)
+    res.send(zpl)
+  } catch (err) {
+    logger.error({ err }, 'label ZPL generation failed')
+    const presetError = unknownLabelPresetMessage(err)
+    if (presetError) return res.status(400).json({ error: presetError })
+    res.status(500).json({ error: 'Label generation failed' })
+  }
+})
+
+// Counts for the Products / Barcode screens: how many products are missing a
+// barcode and whether any barcode is duplicated.
+dbRouter.get('/products/barcodes/summary', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [row] = await db!
+      .select({
+        total: sql<number>`count(*)`,
+        missing: sql<number>`count(*) filter (where ${s.products.barcode} is null or ${s.products.barcode} = '')`,
+      })
+      .from(s.products)
+    const dupRows = await db!
+      .select({ barcode: s.products.barcode, cnt: sql<number>`count(*)` })
+      .from(s.products)
+      .where(and(isNotNull(s.products.barcode), ne(s.products.barcode, '')))
+      .groupBy(s.products.barcode)
+      .having(sql`count(*) > 1`)
+    res.json({
+      total: Number(row?.total ?? 0),
+      missing: Number(row?.missing ?? 0),
+      duplicates: dupRows.map((r) => ({ barcode: String(r.barcode), count: Number(r.cnt) })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'barcode summary failed')
+    res.status(500).json({ error: 'Could not load barcode summary' })
+  }
+})
+
+// Backfill missing barcodes. Supports a dry run so the operator can preview
+// exactly which products would change before anything is written.
+dbRouter.post('/products/barcodes/generate', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const ids: string[] = Array.isArray(req.body?.ids)
+      ? req.body.ids.map((x: unknown) => String(x).trim()).filter(Boolean)
+      : []
+    const dryRun = req.body?.dryRun === true
+    const result = await db!.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('bc:backfill'))`)
+      const condition = ids.length > 0 ? and(missingBarcode(), inArray(s.products.id, ids)) : missingBarcode()
+      const missing = await tx
+        .select({ id: s.products.id, name: s.products.name, sku: s.products.sku })
+        .from(s.products)
+        .where(condition!)
+        .orderBy(s.products.name)
+      const assignments: Array<{ id: string; name: string; sku: string; barcode: string }> = []
+      if (!dryRun) {
+        for (const p of missing) {
+          const barcode = await generateUniqueBarcode(tx)
+          await tx
+            .update(s.products)
+            .set({ barcode })
+            .where(and(eq(s.products.id, p.id), missingBarcode()))
+          assignments.push({ id: p.id, name: p.name, sku: p.sku, barcode })
+        }
+      }
+      return { missing, assignments }
+    })
+
+    if (!dryRun && result.assignments.length > 0) {
+      const actor = actorFromRequest(req)
+      void recordActivity({
+        action: 'Generated barcodes',
+        module: 'inventory',
+        entity: `Product barcodes (${result.assignments.length} assigned)`,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+
+    res.json({
+      ok: true,
+      dryRun,
+      candidates: result.missing.length,
+      assigned: result.assignments.length,
+      samples: result.missing.slice(0, 50).map((p) => ({ id: p.id, name: p.name, sku: p.sku })),
+      assignments: result.assignments.slice(0, 50),
+    })
+  } catch (err) {
+    logger.error({ err }, 'barcode backfill failed')
+    res.status(500).json({ error: 'Could not generate barcodes' })
+  }
+})
+
+// Assign or generate a barcode for a single product.
+//  - body.barcode present  → validated manual assignment
+//  - body.barcode absent   → generate, but only when the product has none
+dbRouter.post('/products/:id/barcode', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  const id = routeParam(req.params.id)
+  const requested = normalizeBarcode(req.body?.barcode)
+  try {
+    const result = await db!.transaction(async (tx) => {
+      const [product] = await tx.select().from(s.products).where(eq(s.products.id, id)).limit(1)
+      if (!product) return null
+
+      if (requested) {
+        const fmtError = barcodeFormatError(requested)
+        if (fmtError) throw new Error(fmtError)
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`bc:${requested}`}))`)
+        const [dup] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(and(eq(s.products.barcode, requested), ne(s.products.id, id)))
+          .limit(1)
+        if (dup) throw new Error(duplicateBarcodeMessage(requested))
+        if (normalizeBarcode(product.barcode) === requested) {
+          return { barcode: requested, created: false, changed: false }
+        }
+        await tx.update(s.products).set({ barcode: requested }).where(eq(s.products.id, id))
+        return { barcode: requested, created: false, changed: true }
+      }
+
+      // Generate — an existing valid barcode is returned untouched (idempotent).
+      if (normalizeBarcode(product.barcode)) {
+        return { barcode: normalizeBarcode(product.barcode), created: false, changed: false }
+      }
+      const barcode = await generateUniqueBarcode(tx)
+      await tx.update(s.products).set({ barcode }).where(eq(s.products.id, id))
+      return { barcode, created: true, changed: true }
+    })
+
+    if (!result) return res.status(404).json({ error: 'Not found' })
+    if (result.changed) {
+      const actor = actorFromRequest(req)
+      void recordActivity({
+        action: result.created ? 'Generated barcode' : 'Assigned barcode',
+        module: 'inventory',
+        entity: `Product ${id}`,
+        details: result.barcode,
+        userId: actor.userId,
+        ip: actor.ip,
+      })
+    }
+    res.json({ ok: true, id, barcode: result.barcode, created: result.created })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const known = msg.includes('Barcode')
+    res.status(known ? 400 : 500).json({ error: known ? msg : 'Could not assign barcode' })
+  }
+})
+
+// Scan-based stock count: look up a product by exact barcode or exact SKU (for
+// scanner guns). Input is normalised first so a keyboard-wedge scan and a typed
+// value resolve identically.
 dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const code = String(req.query.code ?? '').trim()
-    if (!code) return res.status(400).json({ error: 'code is required' })
-    const [row] = await db!
+    const formatError = scanCodeError(req.query.code)
+    if (formatError) return res.status(400).json({ error: formatError })
+    const code = normalizeScanCode(req.query.code)
+    // Exact match only — no fuzzy/partial matching, so a scan can never resolve
+    // to the wrong product.
+    const rows = await db!
       .select({
         id: s.products.id,
         name: s.products.name,
@@ -330,12 +635,18 @@ dbRouter.get('/products/scan', requirePermission('inventory', 'view'), async (re
         barcode: s.products.barcode,
         stock: s.products.stock,
         category: s.products.category,
+        status: s.products.status,
       })
       .from(s.products)
       .where(or(eq(s.products.barcode, code), eq(s.products.sku, code)))
-      .limit(1)
-    if (!row) return res.status(404).json({ error: 'No product with that barcode/SKU' })
-    res.json({ data: row })
+      .limit(2)
+    if (rows.length === 0) return res.status(404).json({ error: 'No product matches that barcode or SKU' })
+    if (rows.length > 1) return res.status(409).json({ error: duplicateScanMessage() })
+    const row = rows[0]
+    if (row.status && row.status !== 'active') {
+      return res.status(409).json({ error: inactiveProductMessage(row.name, row.status) })
+    }
+    res.json({ data: { id: row.id, name: row.name, sku: row.sku, barcode: row.barcode, stock: row.stock, category: row.category } })
   } catch (err) {
     logger.error({ err }, 'product scan lookup failed')
     res.status(500).json({ error: 'Scan lookup failed' })
@@ -710,7 +1021,8 @@ dbRouter.post('/einvoice/:invoiceId/cancel', requirePermission('sales', 'edit'),
 })
 
 export function round2(value: number): number {
-  return Math.round(value * 100) / 100
+  // Add Number.EPSILON to handle floating-point precision issues (e.g., 1.005 * 100 = 100.4999...)
+  return Math.round((value + Number.EPSILON) * 100) / 100
 }
 
 /**
@@ -727,12 +1039,10 @@ export function round2(value: number): number {
 async function applyStockDelta(tx: any, sku: string, delta: number): Promise<void> {
   if (!sku || !delta) return
   if (delta < 0) {
-    const [row] = await tx.select({ stock: s.products.stock }).from(s.products).where(eq(s.products.sku, sku)).limit(1).for('update')
-    if (!row) return
-    const current = Number(row.stock ?? 0)
-    if (current + delta < 0) {
-      throw new Error(`Insufficient stock for SKU ${sku}: available ${current}, requested ${Math.abs(delta)}`)
-    }
+    // Centralised guard: one code path owns the "would this go negative?"
+    // decision, so manual create/update and the duplicate/convert relays all
+    // surface the same structured error the UI highlights.
+    await assertStockAvailable(tx, [{ sku, qty: Math.abs(delta) }])
   }
   await applyStockMovement({
     sku,
@@ -743,7 +1053,25 @@ async function applyStockDelta(tx: any, sku: string, delta: number): Promise<voi
   })
 }
 
-export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknown>> {
+/**
+ * Turns an InsufficientStockError into the API's 409 response.
+ *
+ * Returns true when it handled the error, so callers can `catch` and fall
+ * through to their generic 400/500 only for anything else. The payload carries
+ * the per-product detail the client uses to highlight the offending lines.
+ */
+function respondInsufficientStock(res: Response, err: unknown): boolean {
+  if (!(err instanceof InsufficientStockError)) return false
+  res.status(409).json({
+    error: 'Insufficient Stock',
+    code: 'INSUFFICIENT_STOCK',
+    message: err.message,
+    products: err.products,
+  })
+  return true
+}
+
+export function normalizeInvoiceItems(raw: unknown, defaultSilverRate?: number): Array<Record<string, unknown>> {
   if (!Array.isArray(raw)) return []
   return raw
     .map((it) => {
@@ -755,15 +1083,20 @@ export function normalizeInvoiceItems(raw: unknown): Array<Record<string, unknow
       row.sku = String(item.sku ?? '').trim()
       row.qty = Math.max(1, Math.floor(num(item.qty, 1)))
       row.weight = num(item.weight, 0)
-      row.silverRate = num(item.silverRate, 0)
+      // Use provided silverRate, or fall back to the defaultSilverRate from Silver Rate Management
+      const providedSilverRate = num(item.silverRate, 0)
+      const effectiveSilverRate = providedSilverRate > 0 ? providedSilverRate : (defaultSilverRate ?? 0)
+      row.silverRate = effectiveSilverRate
       row.makingCharge = num(item.makingCharge, 0)
       row.tax = num(item.tax, 0)
       const weight = num(item.weight, 0)
-      const silverRate = num(item.silverRate, 0)
-      const makingCharge = num(item.makingCharge, 0)
-      if (weight > 0 && silverRate > 0) {
-        const silverValue = round2(weight * silverRate)
-        row.amount = round2(silverValue + makingCharge)
+      const makingChargePerGram = num(item.makingCharge, 0)
+      if (weight > 0 && effectiveSilverRate > 0) {
+        // Correct formula: amount = (silverRate + makingChargePerGram) × weight
+        // This matches computeSellingPrice: (rate + makingCharge) × netWeight × 1.03 (without GST)
+        const silverValue = round2(weight * effectiveSilverRate)
+        const makingValue = round2(weight * makingChargePerGram)
+        row.amount = round2(silverValue + makingValue)
       } else {
         row.amount = num(item.amount, 0)
       }
@@ -831,15 +1164,42 @@ dbRouter.post('/invoices/:id/duplicate', requirePermission('sales', 'create'), a
   }
 })
 
+// Next free sales-invoice number: the settings prefix plus a date stamp and a
+// random run, retried against the unique index (same shape the order-raised
+// invoices in orderEmailIngest.ts mint, kept in sync via the shared settings row).
+async function nextSalesInvoiceNumber(): Promise<string> {
+  const [settingsRow] = await db!.select().from(s.settings).where(eq(s.settings.id, 'app')).limit(1)
+  const prefix = settingsRow?.invoicePrefix?.trim() || 'INV-'
+  const now = new Date()
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = `${prefix}${stamp}${Math.floor(1000 + Math.random() * 9000)}`
+    const [clash] = await db!.select({ id: s.salesInvoices.id }).from(s.salesInvoices).where(eq(s.salesInvoices.number, candidate)).limit(1)
+    if (!clash) return candidate
+  }
+  return `${prefix}${stamp}${Date.now().toString().slice(-6)}`
+}
+
 dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
     const body = req.body ?? {}
-    const items = normalizeInvoiceItems(body.items)
+
+    // Fetch the authoritative silver rate from Silver Rate Management for new pricing.
+    const latestRate = await getLatestSilverRate()
+    if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+      return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before creating invoices.' })
+    }
+    const silverRate = latestRate.rate
+
+    const items = normalizeInvoiceItems(body.items, silverRate)
     const clean = sanitize(body, s.salesInvoices)
     delete clean.id
     delete clean.items
-    if (!clean.number) return res.status(400).json({ error: 'Invoice number is required' })
+    // Manual (dialog-raised) invoices carry no number — mint one on the server
+    // using the same settings-driven prefix and stamp as order-raised invoices,
+    // so both flows share one numbering scheme and the client never invents it.
+    if (!clean.number) clean.number = await nextSalesInvoiceNumber()
     // Every dated report (dashboard, GST, HSN, statements, day book) filters on
     // this column — an invoice without one is invisible in all of them.
     if (!clean.date) clean.date = new Date().toISOString()
@@ -848,13 +1208,23 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
     const gst = num(body.gst, 3)
     const subtotal = hasItems ? round2(items.reduce((a, it) => a + num(it.amount, 0), 0)) : num(clean.subtotal, 0)
     const discount = num(body.discount, 0)
-    const gstAmount = hasItems ? round2(subtotal * gst / 100) : num(clean.gstAmount, round2(subtotal * gst / 100))
-    const grandTotal = hasItems ? round2(subtotal + gstAmount - discount) : num(clean.grandTotal, round2(subtotal + gstAmount - discount))
+    // Canonical totals: GST on the subtotal, discount off the grand total.
+    const totals = invoiceTotals(subtotal, gst, discount)
+    const gstAmount = hasItems ? totals.gstAmount : num(clean.gstAmount, totals.gstAmount)
+    const grandTotal = hasItems ? totals.grandTotal : num(clean.grandTotal, totals.grandTotal)
     const silverValue = hasItems ? round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0)) : num(clean.silverValue, 0)
-    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0)) : num(clean.makingCharge, 0)
+    // makingCharge in items is per-gram; header total must multiply by weight
+    const makingCharge = hasItems ? round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0)) : num(clean.makingCharge, 0)
 
     const id = randomUUID()
     const row = await db!.transaction(async (tx) => {
+      // Validate the WHOLE basket before writing anything, so two lines of the
+      // same SKU are checked against their combined demand and a shortfall
+      // aborts the transaction without saving the invoice or deducting stock.
+      await assertStockAvailable(
+        tx,
+        items.map((it) => ({ sku: String(it.sku ?? ''), qty: num(it.qty, 0), name: String(it.product ?? '') })),
+      )
       const [invoice] = await tx
         .insert(s.salesInvoices)
         .values({
@@ -891,7 +1261,9 @@ dbRouter.post('/invoices', requirePermission('sales', 'create'), async (req, res
       })
       .catch(() => undefined)
     res.status(201).json(stripHash(row))
-  } catch {
+  } catch (err) {
+    if (respondInsufficientStock(res, err)) return
+    logger.error({ err }, 'invoice creation failed')
     res.status(400).json({ error: 'Failed to create invoice' })
   }
 })
@@ -904,16 +1276,35 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     delete clean.id
     delete clean.items
 
+    // Fetch the authoritative silver rate for any new/replaced items.
+    // If items are provided without explicit silverRate, use the current managed rate.
+    let silverRate: number | undefined
+    if (body.items && Array.isArray(body.items) && body.items.length > 0) {
+      const latestRate = await getLatestSilverRate()
+      if (!latestRate || !latestRate.rate || latestRate.rate <= 0) {
+        return res.status(400).json({ error: 'Current silver rate is not available. Please update the rate in Silver Rate Management before updating invoice items.' })
+      }
+      silverRate = latestRate.rate
+    }
+
     const row = await db!.transaction(async (tx) => {
       const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.id, routeParam(req.params.id))).limit(1)
       if (!existing) return null
-      const items = normalizeInvoiceItems(body.items)
+      const items = normalizeInvoiceItems(body.items, silverRate)
       if (items.length > 0) {
         // First, restore old stock
         const oldItems = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
         for (const oi of oldItems) {
           await applyStockDelta(tx, String(oi.sku ?? ''), num(oi.qty, 0))
         }
+        // Old stock is back, so the new basket is validated against the
+        // restored headroom — as a whole, so duplicate lines cannot oversell.
+        // A shortfall aborts the transaction and the restore rolls back too,
+        // leaving the invoice and its stock exactly as they were.
+        await assertStockAvailable(
+          tx,
+          items.map((it) => ({ sku: String(it.sku ?? ''), qty: num(it.qty, 0), name: String(it.product ?? '') })),
+        )
         // Delete old items
         await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, routeParam(req.params.id)))
         // Insert new items and deduct stock
@@ -924,10 +1315,10 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         const gst = num(body.gst, num(existing.gst, 3))
         const subtotal = round2(items.reduce((a, it) => a + num(it.amount, 0), 0))
         const discount = num(body.discount, num(existing.discount, 0))
-        const gstAmount = round2(subtotal * gst / 100)
-        const grandTotal = round2(subtotal + gstAmount - discount)
+        const { gstAmount, grandTotal } = invoiceTotals(subtotal, gst, discount)
         const silverValue = round2(items.reduce((a, it) => a + num(it.weight, 0) * num(it.silverRate, 0), 0))
-        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0), 0))
+        // makingCharge in items is per-gram; header total must multiply by weight
+        const makingCharge = round2(items.reduce((a, it) => a + num(it.makingCharge, 0) * num(it.weight, 0), 0))
         clean.subtotal = subtotal
         clean.gst = gst
         clean.gstAmount = gstAmount
@@ -942,9 +1333,9 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
         const subtotal = num(existing.subtotal, 0)
         const gst = num(clean.gst ?? existing.gst, 3)
         const discount = num(clean.discount ?? existing.discount, 0)
-        const gstAmount = round2(subtotal * gst / 100)
+        const { gstAmount, grandTotal } = invoiceTotals(subtotal, gst, discount)
         clean.gstAmount = gstAmount
-        clean.grandTotal = round2(subtotal + gstAmount - discount)
+        clean.grandTotal = grandTotal
       }
       if (Object.keys(clean).length === 0) return existing
       const [updated] = await tx.update(s.salesInvoices).set(clean).where(eq(s.salesInvoices.id, routeParam(req.params.id))).returning()
@@ -971,7 +1362,8 @@ dbRouter.patch('/invoices/:id', requirePermission('sales', 'edit'), async (req, 
     }
 
     res.json(stripHash(row))
-  } catch {
+  } catch (err) {
+    if (respondInsufficientStock(res, err)) return
     res.status(400).json({ error: 'Failed to update invoice' })
   }
 })
@@ -1034,6 +1426,69 @@ dbRouter.post('/sales-orders/:id/create-invoice', requirePermission('sales', 'cr
   } catch (err) {
     logger.error({ err }, 'create-invoice for order failed')
     res.status(500).json({ error: 'Failed to create invoice from order' })
+  }
+})
+
+/**
+ * Cancel an order's current invoice and raise a fresh one from the order's
+ * line items. Cancel reverses everything the invoice granted — the stock it
+ * sold goes back into inventory and the loyalty points it earned are
+ * reversed — then the order is re-invoiced from scratch (new number, items
+ * rebuilt from the order, stock deducted again). The order stays linked via
+ * its `invoice` column, which is rewritten to the new number.
+ */
+dbRouter.post('/sales-orders/by-invoice/:invoice/reinvoice', requirePermission('sales', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    // Resolve the order by the invoice number it is currently linked to —
+    // that is the number the invoices screen is looking at.
+    const invoiceKey = routeParam(req.params.invoice)
+    const [order] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.invoice, invoiceKey)).limit(1)
+    if (!order) return res.status(404).json({ error: 'No order is linked to that invoice' })
+    if (!order.invoice) return res.status(400).json({ error: 'This order has no invoice to replace' })
+    const lineItems = Array.isArray(order.lineItems) ? order.lineItems : []
+    if (lineItems.length === 0) return res.status(400).json({ error: 'This order has no line items to re-invoice' })
+
+    // Cancel the current invoice: reverse the stock its lines sold, then
+    // remove it. Loyalty reversal runs after, keyed off the removed invoice.
+    const cancelledNumber = String(order.invoice)
+    const removed = await db!.transaction(async (tx) => {
+      const [existing] = await tx.select().from(s.salesInvoices).where(eq(s.salesInvoices.number, cancelledNumber)).limit(1)
+      if (!existing) return null
+      const items = await tx.select().from(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, existing.id))
+      for (const it of items) {
+        await applyStockDelta(tx, String(it.sku ?? ''), num(it.qty, 0))
+      }
+      await tx.delete(s.salesInvoiceItems).where(eq(s.salesInvoiceItems.invoiceId, existing.id))
+      await tx.delete(s.salesInvoices).where(eq(s.salesInvoices.id, existing.id))
+      // Unlink so createInvoiceForOrderRow will raise the fresh one.
+      await tx.update(s.salesOrders).set({ invoice: null }).where(eq(s.salesOrders.id, order.id))
+      return existing
+    })
+    if (!removed) return res.status(404).json({ error: `Invoice ${cancelledNumber} not found` })
+    recordCrud('invoices', 'Deleted', req, removed)
+    void import('../loyalty')
+      .then(({ reverseEarnedForInvoice }) =>
+        reverseEarnedForInvoice({
+          id: removed.id,
+          number: String(removed.number ?? ''),
+          customer: String(removed.customer ?? ''),
+          reason: `Reversed — invoice ${removed.number} cancelled for re-issue`,
+        }),
+      )
+      .catch(() => undefined)
+
+    // Re-raise from the order's line items (same pipeline as first raise).
+    const [freshOrder] = await db!.select().from(s.salesOrders).where(eq(s.salesOrders.id, order.id)).limit(1)
+    const { createInvoiceForOrderRow } = await import('../orderEmailIngest')
+    const invoiceNumber = await createInvoiceForOrderRow(freshOrder!)
+    if (!invoiceNumber) return res.status(500).json({ error: 'Re-invoice failed: no new invoice was created' })
+    recordCrud('sales-orders', 'Updated', req, { id: order.id, invoice: invoiceNumber })
+    await insertOrderEvent(order.id, 'Invoice Reissued', `Invoice ${cancelledNumber} cancelled and reissued as ${invoiceNumber}`, actorFromRequest(req).userId ?? 'system')
+    res.json({ ok: true, cancelled: cancelledNumber, invoiceNumber })
+  } catch (err) {
+    logger.error({ err }, 'reinvoice for order failed')
+    res.status(500).json({ error: 'Failed to cancel and reissue invoice' })
   }
 })
 
@@ -1148,7 +1603,9 @@ dbRouter.post('/products/bulk-import', requirePermission('inventory', 'edit'), a
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
             chargeOnTax: true,
-            createdAt: new Date().toISOString().slice(0, 10),
+            // Full timestamp: the products list orders newest-first and
+            // same-day products must not tie.
+            createdAt: new Date().toISOString(),
           }
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
           bySku.set(skuKey, { id: row.id, sku })
@@ -1304,7 +1761,9 @@ dbRouter.post('/products/import-csv', requirePermission('inventory', 'edit'), as
             purity: numeric.purity ?? 92.5,
             trackInventory: true,
             chargeOnTax: true,
-            createdAt: new Date().toISOString().slice(0, 10),
+            // Full timestamp: the products list orders newest-first and
+            // same-day products must not tie.
+            createdAt: new Date().toISOString(),
           }
           const [row] = await db!.insert(s.products).values(values as typeof s.products.$inferInsert).returning()
           bySku.set(skuKey, { id: row.id, sku })
@@ -2084,72 +2543,87 @@ dbRouter.get('/purchase-invoices/:id/with-items', requirePermission('purchase', 
 
 // Create a purchase invoice with line items. Each line adds its quantity to
 // stock — purchases were previously totals-only, so nothing ever arrived.
+/**
+ * Write a purchase invoice row and its line items, applying stock once.
+ * Shared by the manual create route and the recreate (cancel + reissue)
+ * route so totals, GST split, TCS and stock movement stay identical.
+ */
+async function insertPurchaseInvoice(input: Record<string, unknown>) {
+  const {
+    normalizePurchaseItems, purchaseTotals, saveInvoiceItems,
+    splitInputGst, getBusinessState, computeTcs,
+  } = await import('../purchases')
+  const body = input
+  const number = String(body.number ?? '').trim()
+  const supplier = String(body.supplier ?? '').trim()
+  if (!number) throw new Error('Supplier invoice number is required')
+  if (!supplier) throw new Error('supplier is required')
+
+  const items = normalizePurchaseItems(body.items)
+  if (items.length === 0) {
+    throw new Error('At least one line item is required so stock can be updated')
+  }
+  const totals = purchaseTotals(items)
+  const supplierGstin = String(body.supplierGstin ?? '').trim() || null
+  const gstSplit = splitInputGst(totals.tax, supplierGstin, await getBusinessState())
+  const tcs = computeTcs(totals.cost, body.tcsRate as number | null | undefined)
+  const date = body.date ? String(body.date) : new Date().toISOString()
+  const id = randomUUID()
+  // Where the goods are being received. Absent means the default store.
+  const locationId = await resolveMovementLocation(body.locationId as string | undefined)
+
+  const result = await db!.transaction(async (tx) => {
+    const [row] = await tx
+      .insert(s.purchaseInvoices)
+      .values({
+        id,
+        number,
+        supplier,
+        items: totals.qty,
+        qty: totals.qty,
+        weight: totals.weight,
+        rate: totals.rate,
+        cost: totals.cost,
+        tax: totals.tax,
+        total: totals.total,
+        paidAmount: 0,
+        supplierGstin,
+        supplierState: gstSplit.supplierState || null,
+        cgst: gstSplit.cgst,
+        sgst: gstSplit.sgst,
+        igst: gstSplit.igst,
+        tcsRate: tcs.tcsRate,
+        tcsAmount: tcs.tcsAmount,
+        // Link back to the PO this received, so ordered-vs-received works.
+        orderId: body.orderId ? String(body.orderId) : null,
+        status: String(body.status ?? 'pending'),
+        date,
+        // Goods can be delivered to a branch rather than the main store.
+        locationId,
+      } as any)
+      .returning()
+    const saved = await saveInvoiceItems(tx as never, id, items, { addStock: true, locationId })
+    return { row, saved }
+  })
+  return { row: result.row, saved: result.saved, items, totals }
+}
+
 dbRouter.post('/purchase-invoices', requirePermission('purchase', 'create'), async (req, res) => {
   if (!requireDb(res)) return
   try {
-    const {
-      normalizePurchaseItems, purchaseTotals, saveInvoiceItems,
-      splitInputGst, getBusinessState, computeTcs,
-    } = await import('../purchases')
     const body = (req.body ?? {}) as Record<string, unknown>
     const number = String(body.number ?? '').trim()
-    const supplier = String(body.supplier ?? '').trim()
     if (!number) return res.status(400).json({ error: 'Supplier invoice number is required' })
-    if (!supplier) return res.status(400).json({ error: 'supplier is required' })
+    if (!String(body.supplier ?? '').trim()) return res.status(400).json({ error: 'supplier is required' })
 
-    const items = normalizePurchaseItems(body.items)
-    if (items.length === 0) {
-      return res.status(400).json({ error: 'At least one line item is required so stock can be updated' })
-    }
-    const totals = purchaseTotals(items)
-    const supplierGstin = String(body.supplierGstin ?? '').trim() || null
-    const gstSplit = splitInputGst(totals.tax, supplierGstin, await getBusinessState())
-    const tcs = computeTcs(totals.cost, body.tcsRate as number | null | undefined)
-    const date = body.date ? String(body.date) : new Date().toISOString()
-    const id = randomUUID()
-    // Where the goods are being received. Absent means the default store.
-    const locationId = await resolveMovementLocation(body.locationId as string | undefined)
-
-    const result = await db!.transaction(async (tx) => {
-      const [row] = await tx
-        .insert(s.purchaseInvoices)
-        .values({
-          id,
-          number,
-          supplier,
-          items: totals.qty,
-          qty: totals.qty,
-          weight: totals.weight,
-          rate: totals.rate,
-          cost: totals.cost,
-          tax: totals.tax,
-          total: totals.total,
-          paidAmount: 0,
-          supplierGstin,
-          supplierState: gstSplit.supplierState || null,
-          cgst: gstSplit.cgst,
-          sgst: gstSplit.sgst,
-          igst: gstSplit.igst,
-          tcsRate: tcs.tcsRate,
-          tcsAmount: tcs.tcsAmount,
-          // Link back to the PO this received, so ordered-vs-received works.
-          orderId: body.orderId ? String(body.orderId) : null,
-          status: String(body.status ?? 'pending'),
-          date,
-          // Goods can be delivered to a branch rather than the main store.
-          locationId,
-        } as any)
-        .returning()
-      const saved = await saveInvoiceItems(tx as never, id, items, { addStock: true, locationId })
-      return { row, saved }
-    })
+    const result = await insertPurchaseInvoice(body)
 
     recordCrud('purchase-invoices', 'Created', req, result.row)
     logger.info(
-      { number, supplier, lines: result.saved.lines, stocked: result.saved.stocked, total: totals.total },
+      { number, supplier: result.row.supplier, lines: result.saved.lines, stocked: result.saved.stocked, total: result.totals.total },
       'Purchase invoice received — stock updated',
     )
-    res.status(201).json({ ...stripHash(result.row), items, lines: result.saved.lines, stockedSkus: result.saved.stocked })
+    res.status(201).json({ ...stripHash(result.row), items: result.items, lines: result.saved.lines, stockedSkus: result.saved.stocked })
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     logger.error({ err }, 'purchase invoice create failed')
@@ -2284,6 +2758,91 @@ dbRouter.delete('/purchase-invoices/:id', requirePermission('purchase', 'delete'
   } catch (err) {
     logger.error({ err }, 'purchase invoice delete failed')
     res.status(500).json({ error: 'Failed to delete purchase invoice' })
+  }
+})
+
+/**
+ * Cancel a purchase invoice and recreate it from scratch. Cancel reverses
+ * the stock the lines added (unless it was already cancelled), then a fresh
+ * invoice is written with a new supplier invoice number carrying the same
+ * lines and metadata. Payments are not carried over — record them against
+ * the new invoice.
+ */
+dbRouter.post('/purchase-invoices/:id/recreate', requirePermission('purchase', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const { normalizePurchaseItems, bumpPurchaseInvoiceNumber } = await import('../purchases')
+    const [existing] = await db!.select().from(s.purchaseInvoices).where(eq(s.purchaseInvoices.id, routeParam(req.params.id))).limit(1)
+    if (!existing) return res.status(404).json({ error: 'Purchase invoice not found' })
+
+    // Load the current line items before cancelling.
+    const currentItems = await db!.select().from(s.purchaseInvoiceItems).where(eq(s.purchaseInvoiceItems.invoiceId, existing.id))
+    const lines = normalizePurchaseItems(
+      currentItems.map((it) => ({
+        product: it.product,
+        sku: it.sku,
+        qty: it.qty,
+        weight: it.weight,
+        rate: it.rate,
+        cost: it.cost,
+        tax: it.tax,
+        amount: it.amount,
+      })),
+    )
+    if (lines.length === 0) return res.status(400).json({ error: 'This invoice has no line items to recreate' })
+
+    const wasCancelled = String(existing.status ?? '').toLowerCase() === 'cancelled'
+    // New supplier invoice number: bump the run number (INV-005 → INV-006,
+    // PI-2026-0041 → PI-2026-0042); the helper falls back to a date suffix
+    // when the number has no digits. Shared with the pure unit tests in
+    // purchases.test.ts so the multi-digit-run case stays pinned.
+    const number = String(existing.number ?? '').trim()
+    let newNumber = bumpPurchaseInvoiceNumber(number)
+    // Avoid a unique-number clash.
+    for (let attempt = 1; attempt <= 20; attempt++) {
+      const [clash] = await db!.select({ id: s.purchaseInvoices.id }).from(s.purchaseInvoices).where(eq(s.purchaseInvoices.number, newNumber)).limit(1)
+      if (!clash) break
+      newNumber = bumpPurchaseInvoiceNumber(number, 1 + attempt)
+    }
+
+    // Cancel the old invoice: take back the stock it added (once), then
+    // remove the old rows. Fire the stock reversal inside the transaction so
+    // the books stay consistent if the recreate fails.
+    const removed = await db!.transaction(async (tx) => {
+      if (!wasCancelled) {
+        const { reversePurchaseStock } = await import('../purchases')
+        await reversePurchaseStock(existing.id, tx as never)
+      }
+      await tx.delete(s.purchaseInvoiceItems).where(eq(s.purchaseInvoiceItems.invoiceId, existing.id))
+      await tx.delete(s.purchaseInvoices).where(eq(s.purchaseInvoices.id, existing.id))
+      return existing
+    })
+    recordCrud('purchase-invoices', 'Deleted', req, removed)
+
+    // Reuse the create helper so stock is applied exactly once and totals,
+    // GST split and TCS are computed the same way as a manual entry.
+    const created = await insertPurchaseInvoice({
+      number: newNumber,
+      supplier: existing.supplier,
+      items: lines,
+      supplierGstin: existing.supplierGstin,
+      date: new Date().toISOString(),
+      orderId: existing.orderId,
+      status: 'pending',
+      locationId: existing.locationId,
+    })
+    recordCrud('purchase-invoices', 'Created', req, created.row)
+    res.status(201).json({
+      ok: true,
+      cancelled: number,
+      invoice: newNumber,
+      ...stripHash(created.row),
+      lines: created.saved.lines,
+      stockedSkus: created.saved.stocked,
+    })
+  } catch (err) {
+    logger.error({ err }, 'purchase invoice recreate failed')
+    res.status(500).json({ error: 'Failed to recreate purchase invoice' })
   }
 })
 
@@ -3544,34 +4103,13 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
       })
     }
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
-    // Same duplicate guard as create, ignoring the product being updated.
-    if (body.sku != null) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(and(sql`lower(${s.products.sku}) = lower(${String(body.sku).trim()})`, ne(s.products.id, routeParam(req.params.id))))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
-    }
-    if (body.barcode != null) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(and(eq(s.products.barcode, String(body.barcode).trim()), ne(s.products.id, routeParam(req.params.id))))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
-    }
     const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
     if (body.sellingPrice !== undefined) await recordProductPrice(row.id, row.sellingPrice)
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : ''
     logger.error({ err }, 'product update failed')
-    if (msg.includes('duplicate')) {
-      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
-    }
     res.status(400).json({ error: 'Failed to update product' })
   }
 })
@@ -3658,39 +4196,53 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
   if (!requireDb(res)) return
   try {
     const body = sanitize(req.body ?? {}, s.products)
+    const name = String(body.name ?? '').trim()
+    const sku = String(body.sku ?? '').trim()
+    if (!name) return res.status(400).json({ error: 'Product name is required' })
+    if (!sku) return res.status(400).json({ error: 'SKU is required' })
+    body.name = name
+    body.sku = sku
+
     const openingQty = Math.floor(Number(body.stock ?? 0))
     delete body.stock
-    if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     if (!body.id) body.id = randomUUID()
+    // Every creation path stamps the time — the products list is ordered
+    // newest-first down to the second, and NULLs would float to the top of a
+    // DESC sort.
+    if (!body.createdAt) body.createdAt = new Date().toISOString()
 
-    // Identifier uniqueness: sku also has a DB unique index; barcode only has
-    // this check. Either way, respond with the conflicting product so the UI
-    // can offer "edit existing" or fresh codes instead of a blind failure.
-    const skuStr = body.sku != null ? String(body.sku).trim() : ''
-    const barcodeStr = body.barcode != null ? String(body.barcode).trim() : ''
-    if (skuStr) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(sql`lower(${s.products.sku}) = lower(${skuStr})`)
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku', existingId: hit.id, existingName: hit.name })
+    // A create may state the barcode explicitly; validate it up front so a bad
+    // code is a clean 400 rather than a mid-transaction failure. Otherwise the
+    // product gets a generated code below.
+    const requested = normalizeBarcode(body.barcode)
+    if (requested) {
+      const fmtError = barcodeFormatError(requested)
+      if (fmtError) return res.status(400).json({ error: fmtError })
     }
-    if (barcodeStr) {
-      const [hit] = await db!
-        .select({ id: s.products.id, name: s.products.name })
-        .from(s.products)
-        .where(eq(s.products.barcode, barcodeStr))
-        .limit(1)
-      if (hit) return res.status(400).json({ error: 'A product with that barcode already exists', code: 'DUPLICATE', field: 'barcode', existingId: hit.id, existingName: hit.name })
-    }
+    delete body.barcode
 
     const locationRaw = String((req.body as { locationId?: unknown })?.locationId ?? '').trim()
     const locationId = openingQty > 0 ? (locationRaw ? await resolveLocation(locationRaw) : await ensureDefaultLocation()) : null
     if (openingQty > 0 && !locationId) return res.status(400).json({ error: `Unknown location "${locationRaw}"` })
 
     const row = await db!.transaction(async (tx) => {
-      const [created] = await tx.insert(s.products).values(body as never).returning()
+      // Serialise barcode writers on the same code so two concurrent creates
+      // cannot mint an identical code before either row is visible.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${requested ? `bc:${requested}` : 'bc:generate'}))`)
+      let barcode: string
+      if (requested) {
+        const [dup] = await tx
+          .select({ id: s.products.id })
+          .from(s.products)
+          .where(eq(s.products.barcode, requested))
+          .limit(1)
+        if (dup) throw new Error(duplicateBarcodeMessage(requested))
+        barcode = requested
+      } else {
+        barcode = await generateUniqueBarcode(tx)
+      }
+
+      const [created] = await tx.insert(s.products).values({ ...body, barcode } as never).returning()
       if (openingQty > 0 && created.sku) {
         await applyStockMovement({
           sku: String(created.sku),
@@ -3708,13 +4260,149 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
     recordCrud('products', 'Created', req, row)
     res.status(201).json(row)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error'
+    const msg = errorText(err)
     logger.error({ err }, 'product create failed')
-    if (msg.includes('duplicate')) {
-      // Unique-index race (two saves at once) — same shape as the pre-check.
-      return res.status(400).json({ error: 'A product with that SKU already exists', code: 'DUPLICATE', field: 'sku' })
+    res.status(400).json({ error: msg.includes('duplicate') ? 'A product with that SKU already exists' : 'Failed to create product' })
+  }
+})
+
+// ─── Shopify-style product variants ────────────────────────────────────────
+// Option definitions live on the parent (products.options: [{ name, values }]);
+// each option-value combination is a product_variants row with its own SKU,
+// barcode, price and stock. products.stock is kept as the SUM of the variant
+// stocks (via a count_adjust ledger movement, never a silent overwrite), so
+// every existing sale, report and ledger flow keeps working on the parent.
+
+dbRouter.get('/products/:id/variants', requirePermission('inventory', 'view'), async (req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, options: s.products.options })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+    const variants = await db!.select().from(s.productVariants).where(eq(s.productVariants.productId, product.id))
+    res.json({ options: Array.isArray(product.options) ? product.options : [], variants })
+  } catch (err) {
+    logger.error({ err }, 'product variants read failed')
+    res.status(500).json({ error: 'Failed to load variants' })
+  }
+})
+
+// Replace-all save (the dialog owns the whole option/variant set, exactly
+// like Shopify's editor): validate, then swap the variant rows in one
+// transaction and roll the stock difference into the parent ledger.
+dbRouter.put('/products/:id/variants', requirePermission('inventory', 'edit'), async (req, res) => {
+  if (!requireDb(res)) return
+  const parsed = saveProductVariantsSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten().fieldErrors })
+  }
+  const { options, variants } = parsed.data
+  try {
+    const [product] = await db!
+      .select({ id: s.products.id, sku: s.products.sku, stock: s.products.stock })
+      .from(s.products)
+      .where(eq(s.products.id, routeParam(req.params.id)))
+      .limit(1)
+    if (!product) return res.status(404).json({ error: 'Product not found' })
+
+    // Identifier uniqueness: within the set, against sibling products, and
+    // against variants of other products (the sku unique index would 500 on
+    // a clash — answer with the conflicting code instead).
+    const seenSku = new Set<string>()
+    const seenBarcode = new Set<string>()
+    for (const v of variants) {
+      const sku = v.sku.trim().toUpperCase()
+      const barcode = (v.barcode ?? '').trim()
+      if (!sku) return res.status(400).json({ error: 'Every variant needs a SKU', field: 'sku' })
+      if (seenSku.has(sku)) return res.status(400).json({ error: `Duplicate variant SKU: ${v.sku}`, field: 'sku' })
+      seenSku.add(sku)
+      if (barcode) {
+        if (seenBarcode.has(barcode)) return res.status(400).json({ error: `Duplicate variant barcode: ${barcode}`, field: 'barcode' })
+        seenBarcode.add(barcode)
+      }
     }
-    res.status(400).json({ error: 'Failed to create product' })
+    const skuList = variants.map((v) => v.sku.trim())
+    const [skuClash] = await db!
+      .select({ sku: s.products.sku })
+      .from(s.products)
+      .where(and(ne(s.products.id, product.id), inArray(sql`upper(${s.products.sku})`, skuList.map((x) => x.toUpperCase()))))
+      .limit(1)
+    if (skuClash) return res.status(400).json({ error: `SKU ${skuClash.sku} is already used by another product`, field: 'sku' })
+    const barcodes = variants.map((v) => (v.barcode ?? '').trim()).filter(Boolean)
+    if (barcodes.length > 0) {
+      const [barClash] = await db!
+        .select({ sku: s.products.sku })
+        .from(s.products)
+        .where(and(ne(s.products.id, product.id), inArray(s.products.barcode, barcodes)))
+        .limit(1)
+      if (barClash) return res.status(400).json({ error: `Barcode is already used by product ${barClash.sku}`, field: 'barcode' })
+    }
+
+    const newSum = variants.reduce((a, v) => a + Math.max(0, Math.floor(v.stock)), 0)
+    const [oldAgg] = await db!
+      .select({ sum: sql<number>`coalesce(sum(${s.productVariants.stock}), 0)` })
+      .from(s.productVariants)
+      .where(eq(s.productVariants.productId, product.id))
+    const oldSum = Math.floor(Number(oldAgg?.sum ?? 0))
+
+    await db!.transaction(async (tx) => {
+      await tx.delete(s.productVariants).where(eq(s.productVariants.productId, product.id))
+      if (variants.length > 0) {
+        await tx.insert(s.productVariants).values(
+          variants.map((v) => ({
+            id: v.id?.trim() || randomUUID(),
+            productId: product.id,
+            title: v.title.trim(),
+            optionValues: v.optionValues,
+            sku: v.sku.trim(),
+            barcode: (v.barcode ?? '').trim() || null,
+            sellingPrice: v.sellingPrice ?? null,
+            compareAtPrice: v.compareAtPrice ?? null,
+            costPrice: v.costPrice ?? null,
+            grossWeight: v.grossWeight ?? null,
+            stock: Math.max(0, Math.floor(v.stock)),
+            reorderLevel: v.reorderLevel ?? null,
+            status: v.status ?? 'active',
+            createdAt: new Date().toISOString(),
+          })),
+        )
+      }
+      await tx
+        .update(s.products)
+        .set({ options })
+        .where(eq(s.products.id, product.id))
+      // Roll the variant-stock difference into the parent's ledger as a
+      // count correction — visible in stock history, never a silent overwrite.
+      const delta = newSum - oldSum
+      const sku = String(product.sku ?? '').trim()
+      if (delta !== 0 && sku) {
+        await applyStockMovement({
+          sku,
+          qty: delta,
+          type: 'count_adjust',
+          locationId: await ensureDefaultLocation(),
+          refType: 'product_edit',
+          note: `variant stock ${oldSum} → ${newSum} (${delta > 0 ? '+' : ''}${delta})`,
+          createdBy: actorFromRequest(req).userId ?? 'system',
+          tx,
+        })
+      }
+    })
+
+    recordCrud('products', 'Updated', req, { ...product, name: `variants of ${product.sku}` })
+    const saved = await db!.select().from(s.productVariants).where(eq(s.productVariants.productId, product.id))
+    const [parent] = await db!
+      .select({ stock: s.products.stock, options: s.products.options })
+      .from(s.products)
+      .where(eq(s.products.id, product.id))
+      .limit(1)
+    res.json({ options: parent?.options ?? options, variants: saved, stock: parent?.stock ?? newSum })
+  } catch (err) {
+    logger.error({ err }, 'product variants save failed')
+    res.status(400).json({ error: 'Failed to save variants' })
   }
 })
 
