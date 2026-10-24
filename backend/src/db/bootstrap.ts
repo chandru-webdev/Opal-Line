@@ -1769,6 +1769,20 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       `UPDATE purchase_orders SET gst_amount = round(coalesce(value, 0) * 0.03, 2) WHERE gst_amount IS NULL`,
       `UPDATE purchase_orders SET discount = 0 WHERE discount IS NULL`,
       `UPDATE purchase_orders SET grand_total = round(coalesce(value, 0) + coalesce(gst_amount, 0) - coalesce(discount, 0), 2) WHERE grand_total IS NULL`,
+      `CREATE INDEX IF NOT EXISTS audit_logs_timestamp_id_idx ON audit_logs (timestamp DESC, id DESC)`,
+      `CREATE INDEX IF NOT EXISTS activity_logs_timestamp_id_idx ON activity_logs (timestamp DESC, id DESC)`,
+      `CREATE TABLE IF NOT EXISTS product_price_history (
+        id text PRIMARY KEY,
+        product_id text NOT NULL,
+        selling_price numeric NOT NULL,
+        recorded_at timestamp NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS product_price_history_product_recorded_idx ON product_price_history (product_id, recorded_at)`,
+      `INSERT INTO product_price_history (id, product_id, selling_price, recorded_at)
+       SELECT 'pph-' || id, id, selling_price, COALESCE(created_at::timestamp, now() - interval '1 day')
+       FROM products
+       WHERE selling_price IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM product_price_history h WHERE h.id = 'pph-' || products.id)`,
     ]
     for (const stmt of upgrades) {
       await sql.unsafe(stmt).catch(() => undefined)

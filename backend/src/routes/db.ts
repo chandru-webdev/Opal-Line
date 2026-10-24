@@ -26,6 +26,7 @@ import {
 } from '../validation'
 import { clearRecoveryPassword, getRecoveryPasswordSource, isRecoveryRole, RECOVERY_PASSWORD_HASH_KEY, RECOVERY_PASSWORD_KEY, setRecoveryPassword } from '../recoveryPassword'
 import { actorFromRequest,  recordActivity } from '../activity'
+import { recordProductPrice } from '../lib/productPriceHistory'
 import { encrypt, decrypt,  encryptSecret } from '../lib/crypto'
 import { isConfigured as isShopifyConfigured, config as shopifyConfig, normalizeShopDomain } from '../config'
 import { upsertEnvVar } from '../lib/envfile'
@@ -760,6 +761,32 @@ dbRouter.get('/products/duplicates', requirePermission('inventory', 'view'), asy
   } catch (err) {
     logger.error({ err }, 'duplicate check failed')
     res.status(500).json({ error: 'Duplicate check failed' })
+  }
+})
+
+/** Last selling price recorded before local midnight, one row per product. */
+dbRouter.get('/products/last-day-prices', requirePermission('inventory', 'view'), async (_req, res) => {
+  if (!requireDb(res)) return
+  try {
+    const start = new Date()
+    start.setHours(0, 0, 0, 0)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const todayStart = `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}T00:00:00`
+    const rows = await db!.execute<{ product_id: string; selling_price: string | number }>(sql`
+      SELECT DISTINCT ON (product_id) product_id, selling_price
+      FROM product_price_history
+      WHERE recorded_at < ${todayStart}
+      ORDER BY product_id, recorded_at DESC
+    `)
+    res.json({
+      data: [...rows].map((r) => ({
+        productId: r.product_id,
+        sellingPrice: Number(r.selling_price),
+      })),
+    })
+  } catch (err) {
+    logger.error({ err }, 'last-day prices failed')
+    res.status(500).json({ error: 'Could not load last-day prices' })
   }
 })
 
@@ -4078,6 +4105,7 @@ dbRouter.patch('/products/:id', requirePermission('inventory', 'edit'), async (r
     if (Object.keys(body).length === 0) return res.status(400).json({ error: 'No valid fields provided' })
     const [row] = await db!.update(s.products).set(body).where(eq(s.products.id, routeParam(req.params.id))).returning()
     if (!row) return res.status(404).json({ error: 'Not found' })
+    if (body.sellingPrice !== undefined) await recordProductPrice(row.id, row.sellingPrice)
     recordCrud('products', 'Updated', req, row)
     res.json(row)
   } catch (err) {
@@ -4228,6 +4256,7 @@ dbRouter.post('/products', requirePermission('inventory', 'create'), async (req,
       }
       return created
     })
+    if (row) await recordProductPrice(row.id, row.sellingPrice)
     recordCrud('products', 'Created', req, row)
     res.status(201).json(row)
   } catch (err) {
