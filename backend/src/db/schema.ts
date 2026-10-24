@@ -99,6 +99,16 @@ export const products = pgTable('products', {
   nameSearchIdx: index('products_name_search_idx').using('gin', sql`to_tsvector('english', ${table.name})`),
 }))
 
+/** Snapshot of a product's selling price whenever it is written. */
+export const productPriceHistory = pgTable('product_price_history', {
+  id: text('id').primaryKey(),
+  productId: text('product_id').notNull(),
+  sellingPrice: numericNumber('selling_price').notNull(),
+  recordedAt: ts('recorded_at').notNull(),
+}, (table) => ({
+  productRecordedIdx: index('product_price_history_product_recorded_idx').on(table.productId, table.recordedAt),
+}))
+
 /**
  * Shopify-style variants: one row per option-value combination of the parent
  * product (products.options holds the option definitions). products.stock is

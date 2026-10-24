@@ -2764,8 +2764,21 @@ export async function applySilverRate(
   }
 
   const rows = await db
-    .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge })
+    .select({ id: schema.products.id, netWeight: schema.products.netWeight, makingCharge: schema.products.makingCharge, sellingPrice: schema.products.sellingPrice })
     .from(schema.products)
+
+  const snapshotAt = previous?.updatedAt ?? now
+  for (const row of rows) {
+    if (row.sellingPrice == null) continue
+    try {
+      await db.insert(schema.productPriceHistory).values({
+        id: randomUUID(),
+        productId: row.id,
+        sellingPrice: Number(row.sellingPrice),
+        recordedAt: snapshotAt,
+      })
+    } catch { /* history must not block a rate change */ }
+  }
 
   let recomputed = 0
   setSilverRateProgress({ phase: 'repricing', label: `Repricing ${rows.length} product(s) from the new rate`, done: 0, total: rows.length })
@@ -2775,6 +2788,14 @@ export async function applySilverRate(
     if (!netWeight || netWeight <= 0) continue
     const sellingPrice = computeSellingPrice(rate, netWeight, makingCharge)
     await db.update(schema.products).set({ sellingPrice, silverRate: rate }).where(eq(schema.products.id, row.id))
+    try {
+      await db.insert(schema.productPriceHistory).values({
+        id: randomUUID(),
+        productId: row.id,
+        sellingPrice,
+        recordedAt: now,
+      })
+    } catch { /* history must not block a rate change */ }
     recomputed++
     setSilverRateProgress({ done: recomputed })
   }

@@ -36,6 +36,7 @@ function localDayStart(offsetDays = 0) {
 }
 
 const num = (v: unknown): number => Number(v ?? 0) || 0
+const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, n))
 
 // SQL aggregation note: dates are stored as local-naive 'YYYY-MM-DD HH:MM:SS'
 // timestamps (drizzle timestamp mode:'string'). The dashboard page endpoints
@@ -599,48 +600,115 @@ dashboardRouter.get('/dashboard/activities', async (req, res) => {
   const range = rangeFromQuery(req, res)
   if (!range) return
   try {
-    // Every activity in the selected period, newest first (no fixed cap).
-    // Two sources feed the feed: activity_logs (recordActivity — auth, sales,
-    // system, backup and RBAC operations) and audit_logs (recordAudit — the
-    // Shopify sync events plus legacy seeded rows), merged newest-first.
-    const [activityRows, auditRows] = await Promise.all([
+    const q = req.query as Record<string, unknown>
+    const limit = clamp(Number(q.limit ?? 8) || 8, 1, 100)
+    const cursor = typeof q.cursor === 'string' ? q.cursor.trim() : ''
+    let cursorTs: string | null = null
+    let cursorId: string | null = null
+    if (cursor) {
+      try {
+        const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as {
+          t: string
+          i: string
+        }
+        if (parsed?.t && parsed?.i) {
+          cursorTs = parsed.t
+          cursorId = parsed.i
+        }
+      } catch {
+        cursorTs = null
+        cursorId = null
+      }
+    }
+
+    // Merge activity_logs and audit_logs by (timestamp, id) desc using UNION ALL
+    // for stable cursor pagination.
+    const actWhere = and(
+      gte(schema.activityLogs.timestamp, range.from),
+      sql`${schema.activityLogs.timestamp} < ${range.to}`,
+      cursorTs && cursorId
+        ? sql`(${schema.activityLogs.timestamp} < ${cursorTs} OR (${schema.activityLogs.timestamp} = ${cursorTs} AND ${schema.activityLogs.id} < ${cursorId}))`
+        : sql`true`,
+    )
+    const audWhere = and(
+      gte(schema.auditLogs.timestamp, range.from),
+      sql`${schema.auditLogs.timestamp} < ${range.to}`,
+      cursorTs && cursorId
+        ? sql`(${schema.auditLogs.timestamp} < ${cursorTs} OR (${schema.auditLogs.timestamp} = ${cursorTs} AND ${schema.auditLogs.id} < ${cursorId}))`
+        : sql`true`,
+    )
+
+    // Count total in range (for "Showing X of total")
+    const [totalAct, totalAud] = await Promise.all([
       db!
-        .select({
-          id: schema.activityLogs.id,
-          timestamp: schema.activityLogs.timestamp,
-          user: schema.activityLogs.user,
-          action: schema.activityLogs.action,
-          module: schema.activityLogs.module,
-          entity: schema.activityLogs.entity,
-          detail: schema.activityLogs.details,
-        })
+        .select({ n: sql<number>`count(*)` })
         .from(schema.activityLogs)
         .where(and(gte(schema.activityLogs.timestamp, range.from), sql`${schema.activityLogs.timestamp} < ${range.to}`)),
       db!
-        .select({
-          id: schema.auditLogs.id,
-          timestamp: schema.auditLogs.timestamp,
-          user: schema.auditLogs.user,
-          action: schema.auditLogs.action,
-          module: schema.auditLogs.module,
-          entity: schema.auditLogs.entity,
-          detail: schema.auditLogs.changes,
-        })
+        .select({ n: sql<number>`count(*)` })
         .from(schema.auditLogs)
         .where(and(gte(schema.auditLogs.timestamp, range.from), sql`${schema.auditLogs.timestamp} < ${range.to}`)),
     ])
-    const logs = [...activityRows, ...auditRows].sort(newestFirst)
-    res.json(
-      logs.map((l) => ({
-        id: l.id,
-        type: activityType(l.module, l.action),
-        title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
-        detail: l.detail ?? undefined,
-        actor: l.user ?? 'System',
-        time: friendlyTime(l.timestamp),
-      })),
+    const total = Number(totalAct[0]?.n ?? 0) + Number(totalAud[0]?.n ?? 0)
+
+    const actSelect = db!
+      .select({
+        id: schema.activityLogs.id,
+        timestamp: schema.activityLogs.timestamp,
+        user: schema.activityLogs.user,
+        action: schema.activityLogs.action,
+        module: schema.activityLogs.module,
+        entity: schema.activityLogs.entity,
+        detail: schema.activityLogs.details,
+      })
+      .from(schema.activityLogs)
+      .where(actWhere)
+    const audSelect = db!
+      .select({
+        id: schema.auditLogs.id,
+        timestamp: schema.auditLogs.timestamp,
+        user: schema.auditLogs.user,
+        action: schema.auditLogs.action,
+        module: schema.auditLogs.module,
+        entity: schema.auditLogs.entity,
+        detail: schema.auditLogs.changes,
+      })
+      .from(schema.auditLogs)
+      .where(audWhere)
+
+    const rows = await db!.execute<{
+      id: string
+      timestamp: string | null
+      user: string | null
+      action: string | null
+      module: string | null
+      entity: string | null
+      detail: string | null
+    }>(
+      sql`(${actSelect}) UNION ALL (${audSelect}) ORDER BY timestamp DESC, id DESC LIMIT ${limit + 1}`,
     )
-  } catch {
+    const hasNext = rows.length > limit
+    const pageRows = hasNext ? rows.slice(0, limit) : rows
+    let nextCursor: string | null = null
+    if (hasNext && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1]
+      if (last.timestamp && last.id) {
+        const payload = { t: last.timestamp, i: last.id }
+        nextCursor = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+      }
+    }
+    const items = pageRows.map((l) => ({
+      id: l.id,
+      type: activityType(l.module, l.action),
+      title: `${l.action ?? 'Activity'}${l.entity && !String(l.action ?? '').includes(l.entity) ? ` · ${l.entity}` : ''}`,
+      detail: l.detail ?? undefined,
+      actor: l.user ?? 'System',
+      time: friendlyTime(l.timestamp),
+      timestamp: l.timestamp,
+    }))
+    res.json({ items, total, nextCursor })
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : 'Unknown error' }, 'dashboard activities failed')
     res.status(500).json({ error: 'Internal server error' })
   }
 })
