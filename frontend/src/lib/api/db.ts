@@ -307,6 +307,8 @@ export const dbApi = {
     }),
 
   getProducts: () => list<Product>('/db/products', PAGED),
+  getProductLastDayPrices: () =>
+    request<{ data: Array<{ productId: string; sellingPrice: number }> }>('/db/products/last-day-prices'),
   getProductById: (id: string) => maybe<Product>(`/db/products/${id}`),
   bulkImportProducts: (rows: Array<Record<string, string>>) =>
     request<{ created: number; updated: number; errors: string[] }>('/db/products/bulk-import', {

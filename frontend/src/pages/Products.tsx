@@ -82,6 +82,7 @@ const productTints: Record<string, { bg: string; text: string }> = {
 export default function ProductsPage() {
   const navigate = useNavigate()
   const [products, setProducts] = useState<Product[]>([])
+  const [lastDayById, setLastDayById] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [pushing, setPushing] = useState(false)
@@ -120,10 +121,17 @@ export default function ProductsPage() {
   const load = useCallback(() => {
     setLoading(true)
     setError('')
-    dbApi
-      .getProducts()
-      .then((p) => {
+    Promise.all([
+      dbApi.getProducts(),
+      dbApi.getProductLastDayPrices().catch(() => ({ data: [] as Array<{ productId: string; sellingPrice: number }> })),
+    ])
+      .then(([p, hist]) => {
         setProducts(p)
+        const map: Record<string, number> = {}
+        for (const row of hist.data ?? []) {
+          if (Number.isFinite(row.sellingPrice)) map[row.productId] = row.sellingPrice
+        }
+        setLastDayById(map)
         setLoading(false)
       })
       .catch((e) => {
@@ -282,6 +290,31 @@ export default function ProductsPage() {
       { accessorKey: 'silverRate', header: 'Silver Rate', cell: ({ row }) => <span className="tabular-nums text-muted-foreground">₹{row.original.silverRate?.toFixed(2) ?? '—'}/g</span>, meta: { align: 'right' as const } },
       { accessorKey: 'sellingPrice', header: 'Selling Price', cell: ({ row }) => <span className="font-semibold tabular-nums text-foreground">{formatCurrency(row.original.sellingPrice)}</span>, meta: { align: 'right' as const } },
       {
+        id: 'lastDayPrice',
+        header: 'Last Day Price',
+        meta: { align: 'right' as const },
+        cell: ({ row }) => {
+          const last = lastDayById[row.original.id]
+          const today = row.original.sellingPrice
+          if (last == null || !Number.isFinite(last)) {
+            return <span className="text-muted-foreground">—</span>
+          }
+          const lastLabel = formatCurrency(last, { decimals: true })
+          if (today == null || !Number.isFinite(today) || Math.round(today * 100) === Math.round(last * 100)) {
+            return <span className="tabular-nums text-muted-foreground">{lastLabel} —</span>
+          }
+          const down = today < last
+          return (
+            <span className="inline-flex items-baseline justify-end gap-1.5 tabular-nums">
+              <span className="font-medium text-foreground">{lastLabel}</span>
+              <span className={down ? 'text-red-600 dark:text-red-400' : 'text-success-700 dark:text-emerald-400'}>
+                {down ? '▼' : '▲'} {formatCurrency(Math.abs(today - last), { decimals: true })}
+              </span>
+            </span>
+          )
+        },
+      },
+      {
         id: 'cost',
         header: 'Cost',
         meta: { align: 'right' as const },
@@ -291,24 +324,6 @@ export default function ProductsPage() {
             return <span className="text-[11px] text-muted-foreground">not set</span>
           }
           return <span className="tabular-nums text-muted-foreground">{formatCurrency(cost)}</span>
-        },
-      },
-      {
-        id: 'margin',
-        header: 'Margin',
-        meta: { align: 'right' as const },
-        cell: ({ row }) => {
-          const cost = row.original.costPrice
-          const sell = row.original.sellingPrice
-          if (cost == null || !Number.isFinite(cost) || cost <= 0 || !sell) {
-            return <span className="text-[11px] text-muted-foreground">—</span>
-          }
-          const pct = ((sell - cost) / sell) * 100
-          return (
-            <span className={cn('tabular-nums', pct < 10 ? 'text-warning-600' : 'text-success-600')}>
-              {pct.toFixed(1)}%
-            </span>
-          )
         },
       },
       { accessorKey: 'stock', header: 'Stock', cell: ({ row }) => {
@@ -414,11 +429,12 @@ export default function ProductsPage() {
         ),
       },
     ],
-    [pushProducts, pushing, toggleStatus, duplicateProduct],
+    [pushProducts, pushing, toggleStatus, duplicateProduct, lastDayById],
   )
 
   return (
-    <div className="mx-auto w-full max-w-[1600px] space-y-4 px-4 py-4 sm:space-y-5 sm:py-6 lg:px-6">
+    <div className="w-full space-y-4 py-4 sm:space-y-5 sm:py-6">
+      <div className="px-4 lg:px-6">
       <PageHeader
         title="Products"
         subtitle="Manage jewellery products, pricing, inventory and Shopify synchronization."
@@ -453,9 +469,10 @@ export default function ProductsPage() {
           </div>
         }
       />
+      </div>
 
       {duplicates.length > 0 && (
-        <Card>
+        <Card className="mx-4 lg:mx-6">
           <CardContent className="flex flex-col gap-2 border border-amber-300 bg-amber-50 p-4 dark:border-amber-500/40 dark:bg-amber-950/30">
             <div className="flex items-center gap-2">
               <Search className="h-4 w-4 text-amber-600 dark:text-amber-400 dark:text-amber-400" />
@@ -598,22 +615,22 @@ export default function ProductsPage() {
       </Dialog>
 
       {error ? (
-        <div className="flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700">
+        <div className="mx-4 flex items-start gap-2.5 rounded-lg border border-red-200 bg-red-50/60 px-4 py-3 text-sm text-red-700 lg:mx-6">
           <span className="mt-0.5 block h-2 w-2 shrink-0 rounded-full bg-red-600" />
           <p>{error}. Start the backend with <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs">npm run dev --prefix backend</code>.</p>
         </div>
       ) : null}
 
       {pushMessage ? (
-        <div className={cn('flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700')}>
+        <div className={cn('mx-4 flex items-start gap-2.5 rounded-lg border px-4 py-3 text-sm lg:mx-6', pushMessage.ok ? 'border-success-100 bg-success-50/60 text-success-700' : 'border-red-200 bg-red-50/60 text-red-700')}>
           <span className={cn('mt-0.5 block h-2 w-2 shrink-0 rounded-full', pushMessage.ok ? 'bg-success-600' : 'bg-red-600')} />
           <p>{pushMessage.text}</p>
         </div>
       ) : null}
 
-      <Card>
-        <CardContent className="space-y-4 p-3 sm:p-4">
-          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
+      <Card className="rounded-none border-x-0 shadow-none">
+        <CardContent className="space-y-4 p-0">
+          <div className="flex flex-col gap-2 px-4 pt-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2.5">
             <div className="relative min-w-0 flex-1 sm:min-w-[240px]">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <Input
@@ -669,6 +686,7 @@ export default function ProductsPage() {
           </div>
 
           <DataTable
+            className="min-w-0"
             onRowDoubleClick={openProduct}
             onRowClick={setViewProduct}
             onSelectionChange={setSelectedProducts}
@@ -682,7 +700,7 @@ export default function ProductsPage() {
         </CardContent>
       </Card>
 
-      <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground sm:gap-4">
+      <div className="mx-4 flex flex-wrap items-center gap-3 rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground sm:gap-4 lg:mx-6">
         <LegendSwatch color={GREEN} label="Shopify synced" />
         <LegendSwatch color={ORANGE} label="Pending approval" />
         <LegendSwatch color={RED} label="Sync error" />

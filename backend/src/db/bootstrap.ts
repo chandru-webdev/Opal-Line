@@ -301,6 +301,15 @@ async function createSchema(sql: postgres.Sql): Promise<void> {
     await tx.unsafe(`CREATE INDEX IF NOT EXISTS products_name_search_idx ON products USING gin (to_tsvector('english', name))`)
 
     await tx.unsafe(`
+      CREATE TABLE IF NOT EXISTS product_price_history (
+        id text PRIMARY KEY,
+        product_id text NOT NULL,
+        selling_price numeric NOT NULL,
+        recorded_at timestamp NOT NULL
+      )`)
+    await tx.unsafe(`CREATE INDEX IF NOT EXISTS product_price_history_product_recorded_idx ON product_price_history (product_id, recorded_at)`)
+
+    await tx.unsafe(`
       CREATE TABLE IF NOT EXISTS customers (
         id text PRIMARY KEY,
         name text NOT NULL,
@@ -1717,6 +1726,18 @@ async function applyUpgrades(sql: postgres.Sql): Promise<void> {
       // Linking products / purchase orders to a real supplier record.
       `ALTER TABLE products ADD COLUMN IF NOT EXISTS supplier_id text`,
       `CREATE INDEX IF NOT EXISTS products_supplier_id_idx ON products (supplier_id)`,
+      `CREATE TABLE IF NOT EXISTS product_price_history (
+        id text PRIMARY KEY,
+        product_id text NOT NULL,
+        selling_price numeric NOT NULL,
+        recorded_at timestamp NOT NULL
+      )`,
+      `CREATE INDEX IF NOT EXISTS product_price_history_product_recorded_idx ON product_price_history (product_id, recorded_at)`,
+      `INSERT INTO product_price_history (id, product_id, selling_price, recorded_at)
+       SELECT 'pph-' || id, id, selling_price, COALESCE(created_at::timestamp, now() - interval '1 day')
+       FROM products
+       WHERE selling_price IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM product_price_history h WHERE h.id = 'pph-' || products.id)`,
       `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS supplier_id text`,
       // Purchase order detail page: GST breakdown (3% default), discount,
       // grand total, notes and expected delivery date. Existing rows get the
